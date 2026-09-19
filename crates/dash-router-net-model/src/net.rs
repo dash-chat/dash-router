@@ -33,7 +33,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{anyhow, ensure};
+use anyhow::ensure;
 use dash_router_core::{
     Effect, MessageEnvelope, RouterAction, RouterConfig, RouterMachine, RouterState,
 };
@@ -108,40 +108,36 @@ pub enum NetAction<N, L: Ord, T, const K: usize> {
 }
 
 impl<N: Id, L: Id, T: TimeInterval, const K: usize> NetMachine<N, L, T, K> {
-    /// Run one router action on one node, expanding its `Send`s into
-    /// flights and passing every other effect through, tagged.
+    /// Run one router action on one node. `Send` effects are absorbed
+    /// into in-flight state, one [`Flight`] per neighbour of the sender;
+    /// everything else passes through, tagged with the node.
     fn apply(
         &self,
         s: &mut NetState<N, L, T>,
-        fx: &mut Vec<(N, Effect<N, L>)>,
         id: N,
         action: RouterAction<N, L, T>,
-    ) -> anyhow::Result<()> {
-        let node = s
+    ) -> anyhow::Result<Vec<(N, Effect<N, L>)>> {
+        let node_fx = s
             .nodes
-            .get(&id)
-            .ok_or_else(|| anyhow!("no node {id:?}"))?
-            .clone();
-        let (node, node_fx) = self.router.transition(node, action)?;
-        s.nodes.insert(id, node);
-        for effect in node_fx {
-            match effect {
-                Effect::Send(envelope) => {
-                    for to in self.topology.neighbors(&id) {
-                        ensure!(s.inflight.len() < K, "in-flight cap {K} reached");
-                        insert_sorted(
-                            &mut s.inflight,
-                            Flight {
-                                to,
-                                envelope: envelope.clone(),
-                            },
-                        );
-                    }
+            .owned_update(id, |_, node| self.router.transition(node, action))?;
+        let inflight = &mut s.inflight;
+
+        absorb_fx(node_fx, |effect| match effect {
+            Effect::Send(envelope) => {
+                for to in self.topology.neighbors(&id) {
+                    ensure!(inflight.len() < K, "in-flight cap {K} reached");
+                    insert_sorted(
+                        inflight,
+                        Flight {
+                            to,
+                            envelope: envelope.clone(),
+                        },
+                    );
                 }
-                other => fx.push((id, other)),
+                Ok(None)
             }
-        }
-        Ok(())
+            other => Ok(Some((id, other))),
+        })
     }
 }
 
@@ -164,17 +160,12 @@ impl<N: Id, L: Id, T: TimeInterval, const K: usize> Machine for NetMachine<N, L,
                     !matches!(action, RouterAction::Recv(_)),
                     "messages arrive via Deliver, not Node"
                 );
-                self.apply(&mut s, &mut fx, id, action)?;
+                fx.extend(self.apply(&mut s, id, action)?);
             }
 
             NetAction::Deliver(i) => {
                 let flight = s.take_flight(*i)?;
-                self.apply(
-                    &mut s,
-                    &mut fx,
-                    flight.to,
-                    RouterAction::Recv(flight.envelope),
-                )?;
+                fx.extend(self.apply(&mut s, flight.to, RouterAction::Recv(flight.envelope))?);
             }
 
             NetAction::Drop(i) => {
