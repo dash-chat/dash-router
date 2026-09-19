@@ -2,7 +2,7 @@
 //! Messages are passed between nodes explicitly here; a network model with
 //! in-flight messages, loss and reordering is a separate crate's job.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use dash_router_core::{
     Effect, LogRanges, Message, MessageEnvelope, Op, Ranges, RouterAction as A, RouterConfig,
@@ -80,12 +80,13 @@ fn want(from: N, log: L, ranges: Ranges) -> MessageEnvelope<N, L> {
 
 #[test]
 fn fresh_have_is_relayed_exactly_once_per_hop() {
-    let m = machine();
-    let mut a = State::new(n(0), [l(0)]);
+    let m = Arc::new(machine());
+    let mut a = m.state_machine(State::new(n(0), [l(0)]));
     let mut b = State::new(n(1), []); // pure relay
     let mut c = State::new(n(2), [l(0)]);
 
-    let fx = step(&m, &mut a, A::Append(l(0), op(7)));
+    let fx = a.step(A::Append(l(0), op(7))).unwrap();
+    // let fx = step(&m, &mut a, A::Append(l(0), op(7)));
     let [fresh] = sends(&fx).try_into().unwrap();
     assert!(matches!(fresh.message, Message::Have { fresh: true, .. }));
 
@@ -110,6 +111,52 @@ fn fresh_have_is_relayed_exactly_once_per_hop() {
     assert_eq!(sends(&fx), vec![]);
     let fx = step(&m, &mut b, A::Recv(fresh));
     assert_eq!(sends(&fx), vec![]);
+}
+
+/// The flood must not stop at a node that happens to already hold the data:
+/// its neighbours may not, and only this node can reach them.
+#[test]
+fn a_fresh_have_is_relayed_even_when_nothing_in_it_is_new() {
+    let m = machine();
+    let mut b = State::new(n(1), [l(0)]);
+
+    // B learns op 0 the slow way, from a Have answering someone's Want.
+    let fx = step(
+        &m,
+        &mut b,
+        A::Recv(MessageEnvelope::have(
+            n(0),
+            BTreeMap::from([(l(0), BTreeMap::from([(0, op(5))]))]),
+            false,
+        )),
+    );
+    assert_eq!(delivered(&fx), vec![(l(0), 0)]);
+    assert_eq!(sends(&fx), vec![], "non-fresh Haves are not relayed");
+
+    // The author's flood reaches B late. B has nothing to learn, but must
+    // still pass it on.
+    let fresh = MessageEnvelope::have(
+        n(2),
+        BTreeMap::from([(l(0), BTreeMap::from([(0, op(5))]))]),
+        true,
+    );
+    let fx = step(&m, &mut b, A::Recv(fresh.clone()));
+    assert_eq!(delivered(&fx), vec![], "nothing new to deliver");
+    let [forwarded] = sends(&fx).try_into().unwrap();
+    assert_eq!(forwarded, MessageEnvelope::have(n(1), fresh_ops(), true));
+
+    // But only once: the seen-set, not novelty, is what ends the flood.
+    let fx = step(&m, &mut b, A::Recv(fresh.clone()));
+    assert_eq!(sends(&fx), vec![]);
+
+    // Once the seen-set expires, B would flood it again.
+    step(&m, &mut b, A::Tick(t(2)));
+    let fx = step(&m, &mut b, A::Recv(fresh));
+    assert_eq!(sends(&fx).len(), 1);
+}
+
+fn fresh_ops() -> BTreeMap<L, BTreeMap<u32, Op>> {
+    BTreeMap::from([(l(0), BTreeMap::from([(0, op(5))]))])
 }
 
 #[test]
