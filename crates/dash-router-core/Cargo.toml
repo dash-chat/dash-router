@@ -1,0 +1,12 @@
+[package]
+name = "dash-router-core"
+description = "The Dash Router protocol as a pure state machine, with no I/O"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+polestar = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

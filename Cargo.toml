@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+polestar = { git = "https://github.com/maackle/polestar-rs.git", branch = "main" }
+anyhow = "1"
+proptest = "1"
+
+# Uncomment to develop against a local polestar checkout.
+# [patch."https://github.com/maackle/polestar-rs.git"]
+# polestar = { path = "/home/michael/proj/polestar-rs/polestar" }
