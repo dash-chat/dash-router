@@ -226,7 +226,6 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "polestar"
 version = "0.1.0"
-source = "git+https://github.com/maackle/polestar-rs.git?branch=main#b169b1aa5825a73366478d866f9277d5a61bcf36"
 dependencies = [
  "polestar-core",
 ]
@@ -234,7 +233,6 @@ dependencies = [
 [[package]]
 name = "polestar-core"
 version = "0.1.0"
-source = "git+https://github.com/maackle/polestar-rs.git?branch=main#b169b1aa5825a73366478d866f9277d5a61bcf36"
 dependencies = [
  "anyhow",
  "derive_more",

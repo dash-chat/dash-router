@@ -17,6 +17,9 @@
 //! - The relay cap is measured in units (2 per op with payload, 1 per
 //!   header-only op) rather than bytes.
 //! - GC "oldest" means lowest `(log, seq)`; recency-of-mention is not tracked.
+//! - The relay seen-set (`RouterState::relayed`) carries one TTL for the whole
+//!   accumulated range set rather than one per range, so a later flood extends
+//!   the life of earlier entries. That only ever suppresses more relaying.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -85,6 +88,13 @@ pub struct RouterState<N: Ord, L: Ord, T> {
     /// Recent Haves from other nodes, and this node's own last non-fresh Have
     /// (keyed by its own id) so it does not repeat itself.
     pub haves: BTreeMap<N, Record<L, T>>,
+    /// Ranges this node has already flooded onward as part of a fresh Have.
+    /// This is the seen-set that terminates the flood: a node relays any given
+    /// range at most once per `have_ttl`. It is deliberately separate from
+    /// `haves`, which governs responses to Wants — a node that has just
+    /// flooded an op must still answer a Want for it, since the Want is
+    /// evidence the flood did not reach everyone.
+    pub relayed: Option<Record<L, T>>,
     pub want_timer: Option<Timer<T>>,
     pub have_timer: Option<Timer<T>>,
 }
@@ -97,6 +107,7 @@ impl<N: Id, L: Id, T: TimeInterval> RouterState<N, L, T> {
             store: BTreeMap::new(),
             wants: BTreeMap::new(),
             haves: BTreeMap::new(),
+            relayed: None,
             want_timer: None,
             have_timer: None,
         }
@@ -172,6 +183,41 @@ impl<N: Id, L: Id, T: TimeInterval> RouterState<N, L, T> {
                     .map(|(seq, op)| (*seq, op.clone()))
                     .collect();
                 (!ops.is_empty()).then_some((*log, ops))
+            })
+            .collect()
+    }
+
+    /// Ranges already flooded onward, if the record has not expired.
+    pub fn relayed_ranges(&self) -> LogRanges<L> {
+        self.relayed
+            .as_ref()
+            .map(|r| r.ranges.clone())
+            .unwrap_or_default()
+    }
+
+    /// Note that `ranges` have been flooded onward. Ranges accumulate and the
+    /// TTL is reset, which is coarse — refreshing extends the life of earlier
+    /// ranges — but errs towards relaying less, never towards a cycle.
+    fn note_relayed(&mut self, ranges: LogRanges<L>, ttl: T) {
+        let record = self.relayed.get_or_insert_with(|| Record {
+            ranges: LogRanges::empty(),
+            ttl_left: ttl,
+        });
+        record.ranges = record.ranges.union(&ranges);
+        record.ttl_left = ttl;
+    }
+
+    /// The subset of `ops` not yet flooded onward by this node.
+    fn unrelayed(&self, ops: &HaveOps<L>) -> HaveOps<L> {
+        let relayed = self.relayed_ranges();
+        ops.iter()
+            .filter_map(|(log, seqs)| {
+                let picked: BTreeMap<Seq, Op> = seqs
+                    .iter()
+                    .filter(|(seq, _)| !relayed.contains(log, **seq))
+                    .map(|(seq, op)| (*seq, op.clone()))
+                    .collect();
+                (!picked.is_empty()).then_some((*log, picked))
             })
             .collect()
     }
@@ -279,6 +325,10 @@ impl<N: Id, L: Id, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                         r.ttl_left = r.ttl_left - dur;
                     }
                 }
+                match &mut s.relayed {
+                    Some(r) if dur < r.ttl_left => r.ttl_left = r.ttl_left - dur,
+                    _ => s.relayed = None,
+                }
             }
 
             RouterAction::ArmWantTimer(interval) => {
@@ -343,6 +393,7 @@ impl<N: Id, L: Id, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                 s.store.entry(log).or_default().insert(seq, op.clone());
                 fx.push(Effect::Store(log, seq, op.clone()));
                 let ops = HaveOps::from([(log, BTreeMap::from([(seq, op)]))]);
+                s.note_relayed(have_ops_ranges(&ops), self.config.have_ttl);
                 fx.push(Effect::Send(MessageEnvelope::have(s.id, ops, true)));
             }
 
@@ -359,6 +410,17 @@ impl<N: Id, L: Id, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                         );
                     }
                     Message::Have { ops, fresh } => {
+                        // A fresh Have is relayed by everyone who receives it,
+                        // whether or not its ops are new to this node: a peer
+                        // out of the sender's earshot may still need them. The
+                        // flood terminates on the seen-set, not on novelty.
+                        if fresh {
+                            let relay = s.unrelayed(&ops);
+                            if !relay.is_empty() {
+                                s.note_relayed(have_ops_ranges(&relay), self.config.have_ttl);
+                                fx.push(Effect::Send(MessageEnvelope::have(s.id, relay, true)));
+                            }
+                        }
                         s.haves.insert(
                             from,
                             Record {
@@ -386,9 +448,6 @@ impl<N: Id, L: Id, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                                     fx.push(Effect::Deliver(*log, *seq));
                                 }
                             }
-                        }
-                        if fresh && !new_ops.is_empty() {
-                            fx.push(Effect::Send(MessageEnvelope::have(s.id, new_ops, true)));
                         }
                         s.gc(self.config.relay_cap);
                     }

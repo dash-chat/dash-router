@@ -12,5 +12,5 @@ anyhow = "1"
 proptest = "1"
 
 # Uncomment to develop against a local polestar checkout.
-# [patch."https://github.com/maackle/polestar-rs.git"]
-# polestar = { path = "/home/michael/proj/polestar-rs/polestar" }
+[patch."https://github.com/maackle/polestar-rs.git"]
+polestar = { path = "/home/michael/proj/polestar-rs/polestar" }
