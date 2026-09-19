@@ -1,0 +1,10 @@
+[package]
+name = "dash-router-net-model"
+description = "A bounded network model over dash-router-core: broadcast, loss and reordering as explicit actions"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dash-router-core = { path = "../dash-router-core" }
+polestar = { workspace = true }
+anyhow = { workspace = true }

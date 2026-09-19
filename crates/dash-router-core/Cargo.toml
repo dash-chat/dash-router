@@ -10,6 +10,3 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-
-[patch."https://github.com/maackle/polestar-rs"]
-polestar = { path = "/home/michael/proj/polestar-rs" }

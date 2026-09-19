@@ -1,0 +1,247 @@
+//! Scenario tests driving whole networks, with bounded model types.
+
+use std::sync::Arc;
+
+use dash_router_core::{Effect, Op, RouterAction as R, RouterConfig, RouterState};
+use dash_router_net_model::{NetAction, NetConfig, NetMachine, NetState, Topology};
+use polestar::{StateMachine, prelude::*, time::FiniteTime};
+
+type N = UpTo<4>;
+type L = UpTo<2>;
+type T = FiniteTime<4, 1000>;
+const K: usize = 8;
+type Net = NetMachine<N, L, T, K>;
+type A = NetAction<N, L, T, K>;
+type State = NetState<N, L, T>;
+
+fn t(n: usize) -> T {
+    UpTo::new(n).into()
+}
+fn n(i: usize) -> N {
+    UpTo::new(i)
+}
+fn l(i: usize) -> L {
+    UpTo::new(i)
+}
+fn i(x: usize) -> UpTo<K> {
+    UpTo::new(x)
+}
+fn op(byte: u8) -> Op {
+    Op {
+        header: vec![byte],
+        payload: Some(vec![byte, byte]),
+    }
+}
+
+fn router_config() -> RouterConfig<T> {
+    RouterConfig {
+        want_ttl: t(2),
+        have_ttl: t(2),
+        relay_cap: 3,
+    }
+}
+
+fn machine(topology: Topology<N>) -> Arc<Net> {
+    Arc::new(NetMachine::new(
+        router_config(),
+        topology,
+        NetConfig {
+            max_consecutive_drops: 2,
+            max_appends: 2,
+        },
+    ))
+}
+
+/// A network where every node subscribes to log 0.
+fn network(m: &Arc<Net>, count: usize) -> StateMachine<Net> {
+    m.state_machine(State::new(
+        (0..count).map(|id| RouterState::new(n(id), [l(0)])),
+    ))
+}
+
+fn disabled(m: &Net, s: &State, action: A) {
+    assert!(
+        m.transition(s.clone(), action.clone()).is_err(),
+        "{action:?} should not be enabled"
+    );
+}
+
+/// Deliver everything in flight, in queue order, until the network is
+/// quiet. Panics if the flood does not terminate.
+fn drain(net: &mut StateMachine<Net>) -> Vec<(N, Effect<N, L>)> {
+    let mut fx = vec![];
+    for _ in 0..64 {
+        if net.inflight.is_empty() {
+            return fx;
+        }
+        fx.extend(net.step(A::Deliver(i(0))).unwrap());
+    }
+    panic!("flood did not terminate");
+}
+
+fn holders(net: &StateMachine<Net>, log: L, seq: u32) -> Vec<N> {
+    net.nodes
+        .values()
+        .filter(|node| node.holds(&log, seq).is_some())
+        .map(|node| node.id)
+        .collect()
+}
+
+/// The end-to-end version of the core's relay tests: one append at the
+/// end of a line must reach every node, hop by hop, and the seen-set
+/// must quiesce the network rather than cycle it.
+#[test]
+fn a_flood_covers_a_path_and_the_network_quiesces() {
+    let m = machine(Topology::path([n(0), n(1), n(2), n(3)]));
+    let mut net = network(&m, 4);
+
+    net.step(A::Node(n(0), R::Append(l(0), op(7)))).unwrap();
+    assert_eq!(net.inflight.len(), 1, "0 can only reach 1");
+
+    let fx = drain(&mut net);
+    assert_eq!(holders(&net, l(0), 0), vec![n(0), n(1), n(2), n(3)]);
+    let deliveries: Vec<N> = fx
+        .iter()
+        .filter(|(_, e)| matches!(e, Effect::Deliver(..)))
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(deliveries, vec![n(1), n(2), n(3)]);
+}
+
+/// The same flood must cover any connected topology, whatever its shape.
+#[test]
+fn a_flood_covers_random_trees() {
+    for seed in 0..8 {
+        let topo = Topology::random_tree(&[n(0), n(1), n(2), n(3)], seed);
+        assert!(topo.is_connected());
+        let m = machine(topo);
+        let mut net = network(&m, 4);
+        net.step(A::Node(n(2), R::Append(l(0), op(7)))).unwrap();
+        drain(&mut net);
+        assert_eq!(
+            holders(&net, l(0), 0).len(),
+            4,
+            "seed {seed}: flood did not cover the tree"
+        );
+    }
+}
+
+/// A dropped flood message is repaired by the Want/Have exchange, and
+/// the repair travels the same hops the flood would have.
+#[test]
+fn a_dropped_flood_is_backfilled_by_want_then_have() {
+    let m = machine(Topology::path([n(0), n(1), n(2)]));
+    let mut net = network(&m, 3);
+
+    net.step(A::Node(n(0), R::Append(l(0), op(7)))).unwrap();
+    net.step(A::Deliver(i(0))).unwrap(); // 1 stores and relays to 0 and 2
+    net.step(A::Deliver(i(0))).unwrap(); // 0 hears the echo, flood stops there
+    net.step(A::Drop(i(0))).unwrap(); // the copy for 2 is lost
+    assert!(net.inflight.is_empty());
+    assert_eq!(holders(&net, l(0), 0), vec![n(0), n(1)]);
+
+    // While the flood is still "recently circulating" in 1's eyes, 1 will
+    // not offer it again; the repair happens after that record expires.
+    net.step(A::Node(n(1), R::Tick(t(2)))).unwrap();
+
+    // 2 asks for everything it lacks; only 1 can hear it.
+    net.step(A::Node(n(2), R::ArmWantTimer(t(0)))).unwrap();
+    net.step(A::Node(n(2), R::FireWant)).unwrap();
+    net.step(A::Deliver(i(0))).unwrap();
+
+    // 1 answers with a non-fresh Have, heard by both neighbours.
+    net.step(A::Node(n(1), R::ArmHaveTimer(t(0)))).unwrap();
+    net.step(A::Node(n(1), R::FireHave)).unwrap();
+    assert_eq!(net.inflight.len(), 2);
+    let fx = drain(&mut net);
+    assert_eq!(holders(&net, l(0), 0), vec![n(0), n(1), n(2)]);
+    let deliveries: Vec<N> = fx
+        .iter()
+        .filter(|(_, e)| matches!(e, Effect::Deliver(..)))
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(deliveries, vec![n(2)], "only 2 learned anything");
+}
+
+/// Duplicated packets are absorbed: delivering the copy changes no
+/// node's state and triggers no further sends.
+#[test]
+fn a_duplicated_delivery_is_idempotent() {
+    let m = machine(Topology::path([n(0), n(1)]));
+    let mut net = network(&m, 2);
+
+    net.step(A::Node(n(0), R::Append(l(0), op(7)))).unwrap();
+    net.step(A::Duplicate(i(0))).unwrap();
+    assert_eq!(net.inflight.len(), 2);
+    assert_eq!(net.inflight[0], net.inflight[1]);
+
+    net.step(A::Deliver(i(0))).unwrap(); // 1 stores, echoes back to 0
+    let before = net.clone();
+    let fx = net.step(A::Deliver(i(1))).unwrap(); // the duplicate arrives
+    assert_eq!(fx, vec![], "nothing stored, delivered or sent");
+    assert_eq!(net.nodes, before.nodes);
+    assert_eq!(net.inflight[..], before.inflight[..1]);
+}
+
+#[test]
+fn boundaries_and_fairness_disable_actions() {
+    // Hub 0 with three leaves: one append puts three copies in flight.
+    let m = machine(Topology::star([n(0), n(1), n(2), n(3)]));
+    let mut net = network(&m, 4);
+
+    disabled(&m, &net, A::Deliver(i(0))); // nothing in flight
+    disabled(&m, &net, A::Drop(i(0)));
+    disabled(&m, &net, A::Duplicate(i(0)));
+
+    net.step(A::Node(n(0), R::Append(l(0), op(1)))).unwrap();
+    net.step(A::Node(n(0), R::Append(l(0), op(2)))).unwrap();
+    disabled(&m, &net, A::Node(n(0), R::Append(l(0), op(3)))); // max_appends = 2
+    assert_eq!(net.inflight.len(), 6);
+
+    // Receiving is the network's business.
+    let smuggled = net.inflight[0].envelope.clone();
+    disabled(&m, &net, A::Node(n(1), R::Recv(smuggled)));
+
+    // max_consecutive_drops = 2: a third drop needs a delivery first.
+    net.step(A::Drop(i(0))).unwrap();
+    net.step(A::Drop(i(0))).unwrap();
+    disabled(&m, &net, A::Drop(i(0)));
+    net.step(A::Deliver(i(0))).unwrap();
+    net.step(A::Drop(i(0))).unwrap();
+}
+
+#[test]
+fn the_inflight_cap_disables_overflowing_actions() {
+    type TinyNet = NetMachine<N, L, T, 2>;
+    type TinyA = NetAction<N, L, T, 2>;
+    let m = Arc::new(TinyNet::new(
+        router_config(),
+        Topology::star([n(0), n(1), n(2), n(3)]),
+        NetConfig {
+            max_consecutive_drops: 2,
+            max_appends: 2,
+        },
+    ));
+    let mut net = m.state_machine(NetState::new(
+        (0..4).map(|id| RouterState::new(n(id), [l(0)])),
+    ));
+
+    // Fan-out of 3 cannot fit in a bag of 2.
+    assert!(
+        m.transition(
+            net.state().clone(),
+            TinyA::Node(n(0), R::Append(l(0), op(1)))
+        )
+        .is_err(),
+        "overflowing send should not be enabled"
+    );
+
+    // A leaf's append fans out to 1; duplicating fills the bag exactly.
+    net.step(TinyA::Node(n(1), R::Append(l(0), op(1)))).unwrap();
+    net.step(TinyA::Duplicate(UpTo::new(0))).unwrap();
+    assert!(
+        m.transition(net.state().clone(), TinyA::Duplicate(UpTo::new(0)))
+            .is_err(),
+        "duplicate past the cap should not be enabled"
+    );
+}
