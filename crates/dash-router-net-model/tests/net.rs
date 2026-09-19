@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use dash_router_core::{Effect, Op, RouterAction as R, RouterConfig, RouterState};
-use dash_router_net_model::{NetAction, NetConfig, NetMachine, NetState, Topology};
+use dash_router_net_model::{Fair, NetAction, NetMachine, NetState, Topology};
 use polestar::{StateMachine, prelude::*, time::FiniteTime};
 
 type N = UpTo<4>;
@@ -42,14 +42,7 @@ fn router_config() -> RouterConfig<T> {
 }
 
 fn machine(topology: Topology<N>) -> Arc<Net> {
-    Arc::new(NetMachine::new(
-        router_config(),
-        topology,
-        NetConfig {
-            max_consecutive_drops: 2,
-            max_appends: 2,
-        },
-    ))
+    Arc::new(NetMachine::new(router_config(), topology))
 }
 
 /// A network where every node subscribes to log 0.
@@ -184,7 +177,7 @@ fn a_duplicated_delivery_is_idempotent() {
 }
 
 #[test]
-fn boundaries_and_fairness_disable_actions() {
+fn absent_messages_and_smuggled_recvs_are_disabled() {
     // Hub 0 with three leaves: one append puts three copies in flight.
     let m = machine(Topology::star([n(0), n(1), n(2), n(3)]));
     let mut net = network(&m, 4);
@@ -194,20 +187,41 @@ fn boundaries_and_fairness_disable_actions() {
     disabled(&m, &net, A::Duplicate(i(0)));
 
     net.step(A::Node(n(0), R::Append(l(0), op(1)))).unwrap();
-    net.step(A::Node(n(0), R::Append(l(0), op(2)))).unwrap();
-    disabled(&m, &net, A::Node(n(0), R::Append(l(0), op(3)))); // max_appends = 2
-    assert_eq!(net.inflight.len(), 6);
+    assert_eq!(net.inflight.len(), 3);
 
     // Receiving is the network's business.
     let smuggled = net.inflight[0].envelope.clone();
     disabled(&m, &net, A::Node(n(1), R::Recv(smuggled)));
 
-    // max_consecutive_drops = 2: a third drop needs a delivery first.
+    // The bare machine imposes no fairness: it drops as often as asked.
+    for _ in 0..3 {
+        net.step(A::Drop(i(0))).unwrap();
+    }
+}
+
+/// Fairness is a harness's choice, made by wrapping, not the network's.
+#[test]
+fn the_fair_wrapper_bounds_consecutive_drops() {
+    let m = Arc::new(Fair::new(
+        NetMachine::<N, L, T, K>::new(router_config(), Topology::star([n(0), n(1), n(2), n(3)])),
+        |a| matches!(a, A::Drop(_)),
+        |a| matches!(a, A::Deliver(_)),
+        2,
+    ));
+    let mut net = m.state_machine((
+        State::new((0..4).map(|id| RouterState::new(n(id), [l(0)]))),
+        0,
+    ));
+
+    net.step(A::Node(n(0), R::Append(l(0), op(1)))).unwrap();
     net.step(A::Drop(i(0))).unwrap();
     net.step(A::Drop(i(0))).unwrap();
-    disabled(&m, &net, A::Drop(i(0)));
+    assert!(
+        m.transition(net.state().clone(), A::Drop(i(0))).is_err(),
+        "a third consecutive drop should not be enabled"
+    );
     net.step(A::Deliver(i(0))).unwrap();
-    net.step(A::Drop(i(0))).unwrap();
+    net.step(A::Drop(i(0))).unwrap(); // the streak was reset
 }
 
 #[test]
@@ -217,10 +231,6 @@ fn the_inflight_cap_disables_overflowing_actions() {
     let m = Arc::new(TinyNet::new(
         router_config(),
         Topology::star([n(0), n(1), n(2), n(3)]),
-        NetConfig {
-            max_consecutive_drops: 2,
-            max_appends: 2,
-        },
     ));
     let mut net = m.state_machine(NetState::new(
         (0..4).map(|id| RouterState::new(n(id), [l(0)])),
