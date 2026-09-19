@@ -27,7 +27,7 @@ use std::{
 };
 
 use anyhow::{bail, ensure};
-use polestar::{prelude::*, time::TimeInterval};
+use polestar::{StateMachine, prelude::*, time::TimeInterval};
 
 use crate::{
     message::{HaveOps, Message, MessageEnvelope, Op, have_ops_ranges},
@@ -46,8 +46,10 @@ pub struct RouterConfig<T> {
     pub relay_cap: usize,
 }
 
+pub type RouterStateMachine<N, L, T> = StateMachine<RouterMachine<N, L, T>>;
+
 /// The protocol. Holds only configuration; all per-node state is in [`RouterState`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RouterMachine<N, L, T> {
     pub config: RouterConfig<T>,
     phantom: PhantomData<(N, L)>,

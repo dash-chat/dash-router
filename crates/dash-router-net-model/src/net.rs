@@ -31,30 +31,30 @@
 //! in the protocol assumes synchronised clocks, and this is where that
 //! assumption would be caught if it crept in.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, marker::PhantomData};
 
 use anyhow::ensure;
 use dash_router_core::{
-    Effect, MessageEnvelope, RouterAction, RouterConfig, RouterMachine, RouterState,
+    Effect, MessageEnvelope, RouterAction, RouterState, router::RouterStateMachine,
 };
 use polestar::{prelude::*, time::TimeInterval};
 
 use crate::topology::Topology;
 
-/// The network model: a [`RouterMachine`] per node (all sharing one
-/// config) and a fixed topology. `K` caps the number of in-flight
-/// messages.
+/// The network model: a fixed topology over nodes that each carry
+/// their own router (a [`RouterStateMachine`], typically all sharing
+/// one machine). `K` caps the number of in-flight messages.
 #[derive(Clone, Debug)]
 pub struct NetMachine<N: Ord, L, T, const K: usize> {
-    pub router: RouterMachine<N, L, T>,
     pub topology: Topology<N>,
+    _marker: PhantomData<(L, T)>,
 }
 
 impl<N: Ord + Copy, L, T, const K: usize> NetMachine<N, L, T, K> {
-    pub fn new(router: RouterConfig<T>, topology: Topology<N>) -> Self {
+    pub fn new(topology: Topology<N>) -> Self {
         Self {
-            router: RouterMachine::new(router),
             topology,
+            _marker: PhantomData,
         }
     }
 }
@@ -67,8 +67,8 @@ pub struct Flight<N, L: Ord> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct NetState<N: Ord, L: Ord, T> {
-    pub nodes: BTreeMap<N, RouterState<N, L, T>>,
+pub struct NetState<N: Id, L: Id, T: TimeInterval> {
+    pub nodes: BTreeMap<N, RouterStateMachine<N, L, T>>,
 
     /// In-flight messages, kept sorted: a canonical multiset, so state
     /// equality and hashing see past insertion order. Actions address
@@ -77,7 +77,7 @@ pub struct NetState<N: Ord, L: Ord, T> {
 }
 
 impl<N: Id, L: Id, T: TimeInterval> NetState<N, L, T> {
-    pub fn new(nodes: impl IntoIterator<Item = RouterState<N, L, T>>) -> Self {
+    pub fn new(nodes: impl IntoIterator<Item = RouterStateMachine<N, L, T>>) -> Self {
         Self {
             nodes: nodes.into_iter().map(|s| (s.id, s)).collect(),
             inflight: Vec::new(),
@@ -119,7 +119,7 @@ impl<N: Id, L: Id, T: TimeInterval, const K: usize> NetMachine<N, L, T, K> {
     ) -> anyhow::Result<Vec<(N, Effect<N, L>)>> {
         let node_fx = s
             .nodes
-            .owned_update(id, |_, node| self.router.transition(node, action))?;
+            .owned_update(id, |_, node| node.transition(action))?;
         let inflight = &mut s.inflight;
 
         absorb_fx(node_fx, |effect| match effect {
