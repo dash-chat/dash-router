@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 
 use dash_router_core::{
-    Effect, LogRanges, Message, Op, Ranges, RouterAction as A, RouterConfig, RouterMachine,
-    RouterState,
+    Effect, LogRanges, Message, MessageEnvelope, Op, Ranges, RouterAction as A, RouterConfig,
+    RouterMachine, RouterState,
 };
 use polestar::{prelude::*, time::FiniteTime};
 
@@ -56,7 +56,7 @@ fn disabled(m: &Router, s: &State, action: A<N, L, T>) {
     );
 }
 
-fn sends(fx: &[Effect<N, L>]) -> Vec<Message<N, L>> {
+fn sends(fx: &[Effect<N, L>]) -> Vec<MessageEnvelope<N, L>> {
     fx.iter()
         .filter_map(|e| match e {
             Effect::Send(m) => Some(m.clone()),
@@ -74,11 +74,8 @@ fn delivered(fx: &[Effect<N, L>]) -> Vec<(L, u32)> {
         .collect()
 }
 
-fn want(from: N, log: L, ranges: Ranges) -> Message<N, L> {
-    Message::Want {
-        from,
-        ranges: LogRanges::from_pairs([(log, ranges)]),
-    }
+fn want(from: N, log: L, ranges: Ranges) -> MessageEnvelope<N, L> {
+    MessageEnvelope::want(from, LogRanges::from_pairs([(log, ranges)]))
 }
 
 #[test]
@@ -90,15 +87,18 @@ fn fresh_have_is_relayed_exactly_once_per_hop() {
 
     let fx = step(&m, &mut a, A::Append(l(0), op(7)));
     let [fresh] = sends(&fx).try_into().unwrap();
-    assert!(matches!(fresh, Message::Have { fresh: true, .. }));
+    assert!(matches!(fresh.message, Message::Have { fresh: true, .. }));
 
     // B doesn't subscribe, but stores and forwards immediately, as itself.
     let fx = step(&m, &mut b, A::Recv(fresh.clone()));
     assert_eq!(delivered(&fx), vec![]);
     assert_eq!(b.holds(&l(0), 0), Some(&op(7)));
     let [forwarded] = sends(&fx).try_into().unwrap();
-    assert_eq!(forwarded.from(), n(1));
-    assert!(matches!(forwarded, Message::Have { fresh: true, .. }));
+    assert_eq!(forwarded.from, n(1));
+    assert!(matches!(
+        forwarded.message,
+        Message::Have { fresh: true, .. }
+    ));
 
     // C gets it via B and delivers it to the app, forwarding once more.
     let fx = step(&m, &mut c, A::Recv(forwarded.clone()));
@@ -182,21 +182,17 @@ fn have_answers_wants_minus_what_is_already_circulating() {
     step(
         &m,
         &mut a,
-        A::Recv(Message::Have {
-            from: n(2),
-            ops: BTreeMap::from([(l(0), BTreeMap::from([(1, op(1))]))]),
-            fresh: false,
-        }),
+        A::Recv(MessageEnvelope::have(
+            n(2),
+            BTreeMap::from([(l(0), BTreeMap::from([(1, op(1))]))]),
+            false,
+        )),
     );
 
     step(&m, &mut a, A::ArmHaveTimer(t(0)));
     let fx = step(&m, &mut a, A::FireHave);
-    let [
-        Message::Have {
-            ops, fresh: false, ..
-        },
-    ]: [Message<N, L>; 1] = sends(&fx).try_into().unwrap()
-    else {
+    let [envelope]: [MessageEnvelope<N, L>; 1] = sends(&fx).try_into().unwrap();
+    let Message::Have { ops, fresh: false } = envelope.message else {
         panic!("expected one non-fresh Have")
     };
     assert_eq!(ops[&l(0)].keys().copied().collect::<Vec<_>>(), vec![0, 2]);
@@ -243,10 +239,12 @@ fn relay_gc_drops_payloads_before_headers_and_spares_subscriptions() {
     let mut b = State::new(n(1), [l(0)]);
     step(&m, &mut b, A::Append(l(0), op(9)));
 
-    let have = |seqs: Vec<u32>| Message::Have {
-        from: n(0),
-        ops: BTreeMap::from([(l(1), seqs.into_iter().map(|s| (s, op(s as u8))).collect())]),
-        fresh: false,
+    let have = |seqs: Vec<u32>| {
+        MessageEnvelope::have(
+            n(0),
+            BTreeMap::from([(l(1), seqs.into_iter().map(|s| (s, op(s as u8))).collect())]),
+            false,
+        )
     };
 
     // Three full ops = 6 units; dropping all three payloads reaches 3.

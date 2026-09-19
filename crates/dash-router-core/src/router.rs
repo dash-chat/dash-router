@@ -27,7 +27,7 @@ use anyhow::{bail, ensure};
 use polestar::{prelude::*, time::TimeInterval};
 
 use crate::{
-    message::{HaveOps, Message, Op, have_ops_ranges},
+    message::{HaveOps, Message, MessageEnvelope, Op, have_ops_ranges},
     ranges::{LogRanges, Ranges, Seq},
 };
 
@@ -245,13 +245,13 @@ pub enum RouterAction<N, L: Ord, T> {
     /// Author the next op on a subscribed log.
     Append(L, Op),
     /// A message arrives from another node.
-    Recv(Message<N, L>),
+    Recv(MessageEnvelope<N, L>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Effect<N, L: Ord> {
     /// Broadcast to the LAN.
-    Send(Message<N, L>),
+    Send(MessageEnvelope<N, L>),
     /// Persist an op (into the selfish or relay store, per subscription).
     Store(L, Seq, Op),
     /// Hand an op in a subscribed log to the application.
@@ -307,7 +307,7 @@ impl<N: Id, L: Id, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                 s.want_timer = None;
                 let ranges = s.next_want();
                 if !ranges.is_empty() {
-                    fx.push(Effect::Send(Message::Want { from: s.id, ranges }));
+                    fx.push(Effect::Send(MessageEnvelope::want(s.id, ranges)));
                 }
             }
 
@@ -326,11 +326,7 @@ impl<N: Id, L: Id, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                             ttl_left: self.config.have_ttl,
                         },
                     );
-                    fx.push(Effect::Send(Message::Have {
-                        from: s.id,
-                        ops,
-                        fresh: false,
-                    }));
+                    fx.push(Effect::Send(MessageEnvelope::have(s.id, ops, false)));
                 }
             }
 
@@ -347,17 +343,13 @@ impl<N: Id, L: Id, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                 s.store.entry(log).or_default().insert(seq, op.clone());
                 fx.push(Effect::Store(log, seq, op.clone()));
                 let ops = HaveOps::from([(log, BTreeMap::from([(seq, op)]))]);
-                fx.push(Effect::Send(Message::Have {
-                    from: s.id,
-                    ops,
-                    fresh: true,
-                }));
+                fx.push(Effect::Send(MessageEnvelope::have(s.id, ops, true)));
             }
 
-            RouterAction::Recv(msg) => {
-                ensure!(msg.from() != s.id, "received own message");
-                match msg {
-                    Message::Want { from, ranges } => {
+            RouterAction::Recv(MessageEnvelope { from, message }) => {
+                ensure!(from != s.id, "received own message");
+                match message {
+                    Message::Want { ranges } => {
                         s.wants.insert(
                             from,
                             Record {
@@ -366,7 +358,7 @@ impl<N: Id, L: Id, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                             },
                         );
                     }
-                    Message::Have { from, ops, fresh } => {
+                    Message::Have { ops, fresh } => {
                         s.haves.insert(
                             from,
                             Record {
@@ -396,11 +388,7 @@ impl<N: Id, L: Id, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                             }
                         }
                         if fresh && !new_ops.is_empty() {
-                            fx.push(Effect::Send(Message::Have {
-                                from: s.id,
-                                ops: new_ops,
-                                fresh: true,
-                            }));
+                            fx.push(Effect::Send(MessageEnvelope::have(s.id, new_ops, true)));
                         }
                         s.gc(self.config.relay_cap);
                     }
