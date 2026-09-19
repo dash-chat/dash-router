@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use dash_router_core::{Effect, Op, RouterAction as R, RouterConfig, RouterState};
+use dash_router_core::{
+    Effect, Op, RouterAction as R, RouterConfig, RouterMachine, RouterState,
+    router::RouterStateMachine,
+};
 use dash_router_net_model::{Fair, NetAction, NetMachine, NetState, Topology};
 use polestar::{StateMachine, prelude::*, time::FiniteTime};
 
@@ -42,14 +45,18 @@ fn router_config() -> RouterConfig<T> {
 }
 
 fn machine(topology: Topology<N>) -> Arc<Net> {
-    Arc::new(NetMachine::new(router_config(), topology))
+    Arc::new(NetMachine::new(topology))
+}
+
+/// One router per id, all sharing one machine, all subscribed to log 0.
+fn routers(count: usize) -> impl Iterator<Item = RouterStateMachine<N, L, T>> {
+    let router = Arc::new(RouterMachine::new(router_config()));
+    (0..count).map(move |id| router.state_machine(RouterState::new(n(id), [l(0)])))
 }
 
 /// A network where every node subscribes to log 0.
 fn network(m: &Arc<Net>, count: usize) -> StateMachine<Net> {
-    m.state_machine(State::new(
-        (0..count).map(|id| RouterState::new(n(id), [l(0)])),
-    ))
+    m.state_machine(State::new(routers(count)))
 }
 
 fn disabled(m: &Net, s: &State, action: A) {
@@ -203,15 +210,12 @@ fn absent_messages_and_smuggled_recvs_are_disabled() {
 #[test]
 fn the_fair_wrapper_bounds_consecutive_drops() {
     let m = Arc::new(Fair::new(
-        NetMachine::<N, L, T, K>::new(router_config(), Topology::star([n(0), n(1), n(2), n(3)])),
+        NetMachine::<N, L, T, K>::new(Topology::star([n(0), n(1), n(2), n(3)])),
         |a| matches!(a, A::Drop(_)),
         |a| matches!(a, A::Deliver(_)),
         2,
     ));
-    let mut net = m.state_machine((
-        State::new((0..4).map(|id| RouterState::new(n(id), [l(0)]))),
-        0,
-    ));
+    let mut net = m.state_machine((State::new(routers(4)), 0));
 
     net.step(A::Node(n(0), R::Append(l(0), op(1)))).unwrap();
     net.step(A::Drop(i(0))).unwrap();
@@ -228,13 +232,8 @@ fn the_fair_wrapper_bounds_consecutive_drops() {
 fn the_inflight_cap_disables_overflowing_actions() {
     type TinyNet = NetMachine<N, L, T, 2>;
     type TinyA = NetAction<N, L, T, 2>;
-    let m = Arc::new(TinyNet::new(
-        router_config(),
-        Topology::star([n(0), n(1), n(2), n(3)]),
-    ));
-    let mut net = m.state_machine(NetState::new(
-        (0..4).map(|id| RouterState::new(n(id), [l(0)])),
-    ));
+    let m = Arc::new(TinyNet::new(Topology::star([n(0), n(1), n(2), n(3)])));
+    let mut net = m.state_machine(NetState::new(routers(4)));
 
     // Fan-out of 3 cannot fit in a bag of 2.
     assert!(
