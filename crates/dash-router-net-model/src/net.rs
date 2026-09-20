@@ -84,7 +84,11 @@ impl<N: Id, L: Id, T: TimeInterval> NetState<N, L, T> {
         }
     }
 
-    pub fn node(&mut self, id: &N) -> anyhow::Result<&mut RouterStateMachine<N, L, T>> {
+    pub fn node(&self, id: &N) -> &RouterState<N, L, T> {
+        &self.nodes[id]
+    }
+
+    pub fn node_mut(&mut self, id: &N) -> anyhow::Result<&mut RouterStateMachine<N, L, T>> {
         self.nodes
             .get_mut(id)
             .ok_or_else(|| anyhow::anyhow!("no node {id:?}"))
@@ -119,7 +123,9 @@ impl<N: Id, L: Id, T: TimeInterval, const K: usize> NetMachine<N, L, T, K> {
         id: N,
         action: RouterAction<N, L, T>,
     ) -> anyhow::Result<Vec<(N, Effect<N, L>)>> {
-        let node_fx = s.node(&id)?.step(action)?;
+        let node_fx = s
+            .nodes
+            .owned_update(id, |_, node| node.transition(action))?;
         let inflight = &mut s.inflight;
 
         absorb_fx(node_fx, |effect| match effect {

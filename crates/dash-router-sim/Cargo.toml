@@ -1,0 +1,16 @@
+[package]
+name = "dash-router-sim"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dash-router-core = { path = "../dash-router-core" }
+dash-router-net-model = { path = "../dash-router-net-model" }
+polestar = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+rand_distr = { workspace = true }
+serde = { workspace = true }
+serde_norway = { workspace = true }
