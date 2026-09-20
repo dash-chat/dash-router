@@ -10,6 +10,12 @@ edition = "2024"
 polestar = { git = "https://github.com/maackle/polestar-rs.git", branch = "main" }
 anyhow = "1"
 proptest = "1"
+clap = { version = "4", features = ["derive"] }
+rand = "0.9"
+rand_chacha = "0.9"
+rand_distr = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_norway = "0.9"
 
 # Uncomment to develop against a local polestar checkout.
 [patch."https://github.com/maackle/polestar-rs.git"]

@@ -45,7 +45,9 @@ impl<N: Ord + Copy> Topology<N> {
         self.adjacency.entry(n).or_default();
     }
 
-    fn add_edge(&mut self, a: N, b: N) {
+    /// Add a symmetric edge. Useful for laying extra cross-links over a
+    /// constructed topology (PlumTree lazy links, denser LANs).
+    pub fn add_edge(&mut self, a: N, b: N) {
         assert!(a != b, "no self-edges");
         self.adjacency.entry(a).or_default().insert(b);
         self.adjacency.entry(b).or_default().insert(a);

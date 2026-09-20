@@ -1,0 +1,34 @@
+# Example scenario matrix. Run with:
+#   cargo run --release --bin sim -- crates/dash-router-sim/scenarios/example.yaml
+# Baselines: run once with --out baseline/, later diff with --baseline baseline/
+
+defaults:
+  seeds: 8
+  duration_ms: 20000
+  sample_interval_ms: 1000
+
+scenarios:
+  lan-20:
+    nodes: 20
+    topology: { kind: random-tree, extra_edges: 0.2 }
+    loss: 0.02
+    latency_ms: { distribution: log-normal, median_ms: 3.0, sigma: 0.6 }
+    # NOTE: keep want_ttl below the scaled want-interval floor, or a
+    # mid-path node is forever suppressed by its neighbour's re-asks and
+    # multi-hop repair starves (found by this simulator, day one).
+    router: { want_ttl_ms: 400, have_ttl_ms: 500, relay_cap: 1048576 }
+    policy:
+      want: { kind: density-scaled, min_ms: 300, max_ms: 700, ref_n: 20 }
+      have: { kind: fixed, min_ms: 30, max_ms: 120 }
+    workload: { writers: 4, appends_per_sec: 2.0 }
+
+  lan-50-lossy:
+    nodes: 50
+    topology: { kind: random-tree, extra_edges: 0.3 }
+    loss: 0.15
+    latency_ms: { distribution: log-normal, median_ms: 3.0, sigma: 0.6 }
+    router: { want_ttl_ms: 400, have_ttl_ms: 500, relay_cap: 1048576 }
+    policy:
+      want: { kind: density-scaled, min_ms: 300, max_ms: 700, ref_n: 20 }
+      have: { kind: fixed, min_ms: 30, max_ms: 120 }
+    workload: { writers: 4, appends_per_sec: 2.0 }
