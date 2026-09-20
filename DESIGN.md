@@ -108,6 +108,9 @@ There are three cases of data being emitted and received by nodes: Wants, Fresh 
 Each node stores records of recent (TTL-backed) Wants and Haves from other nodes, which influences its own emission of Wants and Haves, as well as what each emitted Want or Have contains.
 (The record of a Have doesn't contain the op data, only the LogRanges.)
 
+Every node re-transmits any received Want or Have immediately after receiving it: simple flooding.
+To avoid overwhelming the network, rather than making careful decisions about relaying messages, we instead make careful decisions about when to emit them in the first place, with the knowledge that each will flood the network.
+
 ### 1. Emitting Wants
 
 Each node emits Wants at random intervals (determined at the moment of the last Want emitted). The Want represents a request for other nodes to send a Have.

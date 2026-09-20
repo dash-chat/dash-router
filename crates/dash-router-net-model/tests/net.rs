@@ -144,15 +144,21 @@ fn a_dropped_flood_is_backfilled_by_want_then_have() {
     // not offer it again; the repair happens after that record expires.
     net.step(A::Node(n(1), R::Tick(t(2)))).unwrap();
 
-    // 2 asks for everything it lacks; only 1 can hear it.
+    // 2 asks for everything it lacks; 1 hears it and floods it onward,
+    // which is how a Want crosses hops the asker cannot reach.
     net.step(A::Node(n(2), R::ArmWantTimer(t(0)))).unwrap();
     net.step(A::Node(n(2), R::FireWant)).unwrap();
     net.step(A::Deliver(i(0))).unwrap();
+    assert_eq!(
+        net.inflight.len(),
+        2,
+        "1 relays the Want to both neighbours"
+    );
 
     // 1 answers with a non-fresh Have, heard by both neighbours.
     net.step(A::Node(n(1), R::ArmHaveTimer(t(0)))).unwrap();
     net.step(A::Node(n(1), R::FireHave)).unwrap();
-    assert_eq!(net.inflight.len(), 2);
+    assert_eq!(net.inflight.len(), 4);
     let fx = drain(&mut net);
     assert_eq!(holders(&net, l(0), 0), vec![n(0), n(1), n(2)]);
     let deliveries: Vec<N> = fx

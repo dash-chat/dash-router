@@ -14,10 +14,12 @@ scenarios:
     topology: {{ kind: random-tree, extra_edges: 0.0 }}
     loss: {loss}
     latency_ms: {{ distribution: uniform, min_ms: 2, max_ms: 20 }}
-    # want_ttl must undercut the want interval floor (320ms here after
-    # density scaling), or a mid-path node is forever suppressed by its
-    # neighbour's re-asks and multi-hop repair starves.
-    router: {{ want_ttl_ms: 250, have_ttl_ms: 400, relay_cap: 1048576 }}
+    # want_ttl may exceed the want interval: Wants flood the network, so
+    # suppression is fed by requests every node eventually hears, and
+    # multi-hop repair no longer depends on ttl expiry. (An earlier,
+    # non-flooding protocol starved here — kept above the interval floor
+    # deliberately as a regression check on that.)
+    router: {{ want_ttl_ms: 800, have_ttl_ms: 800, relay_cap: 1048576 }}
     policy:
       want: {{ kind: density-scaled, min_ms: 400, max_ms: 900, ref_n: 10 }}
       have: {{ kind: fixed, min_ms: 30, max_ms: 120 }}

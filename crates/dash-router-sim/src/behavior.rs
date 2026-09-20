@@ -316,11 +316,10 @@ impl Behavior for SimBehavior {
 
         match entry.ev {
             Ev::Deliver { flight, deferrals } => {
-                // A fresh Have may be relayed on receipt: require headroom
-                // for the worst case, or the tick would fail mid-flight.
-                let fresh_have =
-                    matches!(flight.envelope.message, Message::Have { fresh: true, .. });
-                if fresh_have && self.headroom(state) < self.degree(flight.to) {
+                // Every message floods: any receipt may be relayed to every
+                // neighbour, so require headroom for the worst case, or the
+                // tick would fail mid-flight.
+                if self.headroom(state) < self.degree(flight.to) {
                     if deferrals >= MAX_DEFERRALS {
                         self.metrics.forced_drops += 1;
                         self.schedule(self.now, Ev::Drop { flight });
