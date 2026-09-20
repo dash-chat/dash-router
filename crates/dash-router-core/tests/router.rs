@@ -108,41 +108,32 @@ fn fresh_have_is_relayed_exactly_once_per_hop() {
     assert_eq!(sends(&fx), vec![]);
 }
 
-/// The flood must not stop at a node that happens to already hold the data:
-/// its neighbours may not, and only this node can reach them.
+/// DESIGN.md: every received Have floods onward, fresh or not, novel to
+/// this node or not — its neighbours may still need it, and only this node
+/// can reach them. The seen-set alone ends the flood.
 #[test]
-fn a_fresh_have_is_relayed_even_when_nothing_in_it_is_new() {
+fn every_have_is_relayed_once_regardless_of_freshness_or_novelty() {
     let m = machine();
     let mut b = node(&m, 1, [l(0)]);
 
-    // B learns op 0 the slow way, from a Have answering someone's Want.
+    // B learns op 0 from a non-fresh Have answering someone's Want; even
+    // that is passed on.
     let fx = b
-        .step(A::Recv(MessageEnvelope::have(
-            n(0),
-            BTreeMap::from([(l(0), BTreeMap::from([(0, op(5))]))]),
-            false,
-        )))
+        .step(A::Recv(MessageEnvelope::have(n(0), fresh_ops(), false)))
         .unwrap();
     assert_eq!(delivered(&fx), vec![(l(0), 0)]);
-    assert_eq!(sends(&fx), vec![], "non-fresh Haves are not relayed");
+    let [forwarded] = sends(&fx).try_into().unwrap();
+    assert_eq!(forwarded, MessageEnvelope::have(n(1), fresh_ops(), false));
 
-    // The author's flood reaches B late. B has nothing to learn, but must
-    // still pass it on.
-    let fresh = MessageEnvelope::have(
-        n(2),
-        BTreeMap::from([(l(0), BTreeMap::from([(0, op(5))]))]),
-        true,
-    );
+    // The author's fresh flood arrives late with the same op: the range is
+    // already in the seen-set, so it is not relayed again — the seen-set,
+    // not novelty or freshness, is what ends the flood.
+    let fresh = MessageEnvelope::have(n(2), fresh_ops(), true);
     let fx = b.step(A::Recv(fresh.clone())).unwrap();
     assert_eq!(delivered(&fx), vec![], "nothing new to deliver");
-    let [forwarded] = sends(&fx).try_into().unwrap();
-    assert_eq!(forwarded, MessageEnvelope::have(n(1), fresh_ops(), true));
-
-    // But only once: the seen-set, not novelty, is what ends the flood.
-    let fx = b.step(A::Recv(fresh.clone())).unwrap();
     assert_eq!(sends(&fx), vec![]);
 
-    // Once the seen-set expires, B would flood it again.
+    // Once the seen-set expires, B floods it again.
     b.step(A::Tick(t(2))).unwrap();
     let fx = b.step(A::Recv(fresh)).unwrap();
     assert_eq!(sends(&fx).len(), 1);
@@ -150,6 +141,68 @@ fn a_fresh_have_is_relayed_even_when_nothing_in_it_is_new() {
 
 fn fresh_ops() -> BTreeMap<L, BTreeMap<u32, Op>> {
     BTreeMap::from([(l(0), BTreeMap::from([(0, op(5))]))])
+}
+
+/// DESIGN.md: Wants flood too — this is how a request crosses hops to reach
+/// a node that actually holds the data. Once per hop, and never back to a
+/// node that already emitted it.
+#[test]
+fn wants_flood_once_per_hop_and_never_echo() {
+    let m = machine();
+    let mut a = node(&m, 0, [l(0)]);
+    let mut b = node(&m, 1, []);
+    let mut c = node(&m, 2, []);
+
+    a.step(A::ArmWantTimer(t(0))).unwrap();
+    let fx = a.step(A::FireWant).unwrap();
+    let [asked] = sends(&fx).try_into().unwrap();
+
+    // B relays the Want re-signed, exactly once.
+    let fx = b.step(A::Recv(asked.clone())).unwrap();
+    let [relayed] = sends(&fx).try_into().unwrap();
+    assert_eq!(relayed, want(n(1), l(0), Ranges::full()));
+    let fx = b.step(A::Recv(asked)).unwrap();
+    assert_eq!(sends(&fx), vec![], "a repeated Want is not re-relayed");
+
+    // C, two hops out, hears it via B and relays it again: the request
+    // reaches nodes the asker cannot.
+    let fx = c.step(A::Recv(relayed.clone())).unwrap();
+    assert_eq!(sends(&fx), vec![want(n(2), l(0), Ranges::full())]);
+
+    // The author hears the echo and lets it die: its own emission is in
+    // its seen-set.
+    let fx = a.step(A::Recv(relayed)).unwrap();
+    assert_eq!(sends(&fx), vec![]);
+}
+
+/// Each flood adds its own seen-set record with its own TTL. A single
+/// accumulating record whose TTL refreshes on every update would let steady
+/// traffic keep old ranges suppressed forever.
+#[test]
+fn seen_set_records_expire_independently() {
+    let m = machine(); // have_ttl = 2
+    let mut b = node(&m, 1, []);
+    let have = |seq: u32| {
+        MessageEnvelope::have(
+            n(0),
+            BTreeMap::from([(l(0), BTreeMap::from([(seq, op(seq as u8))]))]),
+            false,
+        )
+    };
+
+    let fx = b.step(A::Recv(have(0))).unwrap();
+    assert_eq!(sends(&fx).len(), 1);
+    b.step(A::Tick(t(1))).unwrap();
+    // A second flood must not extend the first record's life.
+    let fx = b.step(A::Recv(have(1))).unwrap();
+    assert_eq!(sends(&fx).len(), 1);
+    b.step(A::Tick(t(1))).unwrap();
+
+    // Op 0's record has expired: it floods again. Op 1's has not.
+    let fx = b.step(A::Recv(have(0))).unwrap();
+    assert_eq!(sends(&fx).len(), 1, "expired range floods again");
+    let fx = b.step(A::Recv(have(1))).unwrap();
+    assert_eq!(sends(&fx), vec![], "younger record still suppresses");
 }
 
 #[test]
@@ -263,7 +316,7 @@ fn want_then_have_backfills_a_late_subscriber() {
 
     let fx = b.step(A::Recv(have)).unwrap();
     assert_eq!(delivered(&fx), vec![(l(0), 0), (l(0), 1)]);
-    assert_eq!(sends(&fx), vec![], "non-fresh Haves are not forwarded");
+    assert_eq!(sends(&fx).len(), 1, "the backfill floods onward too");
     assert_eq!(a.held(), b.held());
     assert_eq!(
         b.next_want(),

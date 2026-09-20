@@ -13,10 +13,10 @@ scenarios:
     topology: { kind: random-tree, extra_edges: 0.2 }
     loss: 0.02
     latency_ms: { distribution: log-normal, median_ms: 3.0, sigma: 0.6 }
-    # NOTE: keep want_ttl below the scaled want-interval floor, or a
-    # mid-path node is forever suppressed by its neighbour's re-asks and
-    # multi-hop repair starves (found by this simulator, day one).
-    router: { want_ttl_ms: 400, have_ttl_ms: 500, relay_cap: 1048576 }
+    # Wants flood the network, so want-suppression is network-wide and
+    # want_ttl need not undercut the want interval. (Both TTLs and the
+    # intervals are the tuning surface this simulator exists to explore.)
+    router: { want_ttl_ms: 500, have_ttl_ms: 500, relay_cap: 1048576 }
     policy:
       want: { kind: density-scaled, min_ms: 300, max_ms: 700, ref_n: 20 }
       have: { kind: fixed, min_ms: 30, max_ms: 120 }
@@ -27,7 +27,7 @@ scenarios:
     topology: { kind: random-tree, extra_edges: 0.3 }
     loss: 0.15
     latency_ms: { distribution: log-normal, median_ms: 3.0, sigma: 0.6 }
-    router: { want_ttl_ms: 400, have_ttl_ms: 500, relay_cap: 1048576 }
+    router: { want_ttl_ms: 500, have_ttl_ms: 500, relay_cap: 1048576 }
     policy:
       want: { kind: density-scaled, min_ms: 300, max_ms: 700, ref_n: 20 }
       have: { kind: fixed, min_ms: 30, max_ms: 120 }

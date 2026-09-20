@@ -90,13 +90,20 @@ pub struct RouterState<N: Ord, L: Ord, T> {
     /// Recent Haves from other nodes, and this node's own last non-fresh Have
     /// (keyed by its own id) so it does not repeat itself.
     pub haves: BTreeMap<N, Record<L, T>>,
-    /// Ranges this node has already flooded onward as part of a fresh Have.
-    /// This is the seen-set that terminates the flood: a node relays any given
-    /// range at most once per `have_ttl`. It is deliberately separate from
-    /// `haves`, which governs responses to Wants — a node that has just
-    /// flooded an op must still answer a Want for it, since the Want is
-    /// evidence the flood did not reach everyone.
-    pub relayed: Option<Record<L, T>>,
+    /// Have ranges this node has already flooded onward. This is the
+    /// seen-set that terminates the flood: a node relays any given range at
+    /// most once per `have_ttl`. Each flood adds its own record with its own
+    /// TTL, so older ranges fall out independently — a single accumulating
+    /// record whose TTL refreshes on every update would let steady traffic
+    /// keep the whole set alive forever, suppressing relays that should
+    /// happen. Deliberately separate from `haves`, which governs responses
+    /// to Wants — a node that has just flooded an op must still answer a
+    /// Want for it, since the Want is evidence the flood did not reach
+    /// everyone.
+    pub relayed: Vec<Record<L, T>>,
+    /// Want ranges this node has already flooded onward: the same seen-set
+    /// mechanism, for the Want flood, on `want_ttl`.
+    pub relayed_wants: Vec<Record<L, T>>,
     pub want_timer: Option<Timer<T>>,
     pub have_timer: Option<Timer<T>>,
 }
@@ -109,7 +116,8 @@ impl<N: Id, L: Id, T: TimeInterval> RouterState<N, L, T> {
             store: BTreeMap::new(),
             wants: BTreeMap::new(),
             haves: BTreeMap::new(),
-            relayed: None,
+            relayed: Vec::new(),
+            relayed_wants: Vec::new(),
             want_timer: None,
             have_timer: None,
         }
@@ -191,22 +199,28 @@ impl<N: Id, L: Id, T: TimeInterval> RouterState<N, L, T> {
 
     /// Ranges already flooded onward, if the record has not expired.
     pub fn relayed_ranges(&self) -> LogRanges<L> {
-        self.relayed
-            .as_ref()
-            .map(|r| r.ranges.clone())
-            .unwrap_or_default()
+        combined_ranges(&self.relayed)
     }
 
-    /// Note that `ranges` have been flooded onward. Ranges accumulate and the
-    /// TTL is reset, which is coarse — refreshing extends the life of earlier
-    /// ranges — but errs towards relaying less, never towards a cycle.
+    pub fn relayed_want_ranges(&self) -> LogRanges<L> {
+        combined_ranges(&self.relayed_wants)
+    }
+
+    /// Note that Have `ranges` have been flooded onward: a fresh record with
+    /// its own TTL, so it expires independently of earlier floods.
     fn note_relayed(&mut self, ranges: LogRanges<L>, ttl: T) {
-        let record = self.relayed.get_or_insert_with(|| Record {
-            ranges: LogRanges::empty(),
+        self.relayed.push(Record {
+            ranges,
             ttl_left: ttl,
         });
-        record.ranges = record.ranges.union(&ranges);
-        record.ttl_left = ttl;
+    }
+
+    /// Note that Want `ranges` have been flooded onward.
+    fn note_relayed_wants(&mut self, ranges: LogRanges<L>, ttl: T) {
+        self.relayed_wants.push(Record {
+            ranges,
+            ttl_left: ttl,
+        });
     }
 
     /// The subset of `ops` not yet flooded onward by this node.
@@ -277,6 +291,13 @@ impl<N: Id, L: Id, T: TimeInterval> RouterState<N, L, T> {
     }
 }
 
+/// Union of the ranges across a set of records.
+fn combined_ranges<L: Id, T>(records: &[Record<L, T>]) -> LogRanges<L> {
+    records
+        .iter()
+        .fold(LogRanges::empty(), |acc, r| acc.union(&r.ranges))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RouterAction<N, L: Ord, T> {
     /// Time passes. Not enabled for zero, nor if it would carry an armed timer past due.
@@ -327,9 +348,14 @@ impl<N: Id, L: Id, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                         r.ttl_left = r.ttl_left - dur;
                     }
                 }
-                match &mut s.relayed {
-                    Some(r) if dur < r.ttl_left => r.ttl_left = r.ttl_left - dur,
-                    _ => s.relayed = None,
+                for records in [&mut s.relayed, &mut s.relayed_wants] {
+                    records.retain_mut(|r| {
+                        let alive = dur < r.ttl_left;
+                        if alive {
+                            r.ttl_left = r.ttl_left - dur;
+                        }
+                        alive
+                    });
                 }
             }
 
@@ -359,6 +385,9 @@ impl<N: Id, L: Id, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                 s.want_timer = None;
                 let ranges = s.next_want();
                 if !ranges.is_empty() {
+                    // Own emissions count as relayed, or the flood's echo
+                    // would be re-flooded by its own author.
+                    s.note_relayed_wants(ranges.clone(), self.config.want_ttl);
                     fx.push(Effect::Send(MessageEnvelope::want(s.id, ranges)));
                 }
             }
@@ -378,6 +407,7 @@ impl<N: Id, L: Id, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                             ttl_left: self.config.have_ttl,
                         },
                     );
+                    s.note_relayed(have_ops_ranges(&ops), self.config.have_ttl);
                     fx.push(Effect::Send(MessageEnvelope::have(s.id, ops, false)));
                 }
             }
@@ -403,6 +433,14 @@ impl<N: Id, L: Id, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                 ensure!(from != s.id, "received own message");
                 match message {
                     Message::Want { ranges } => {
+                        // DESIGN.md: every received message is re-transmitted:
+                        // simple flooding, terminated by the seen-set. Relay
+                        // only the not-yet-relayed portion, re-signed.
+                        let relay = ranges.difference(&s.relayed_want_ranges());
+                        if !relay.is_empty() {
+                            s.note_relayed_wants(relay.clone(), self.config.want_ttl);
+                            fx.push(Effect::Send(MessageEnvelope::want(s.id, relay)));
+                        }
                         s.wants.insert(
                             from,
                             Record {
@@ -412,16 +450,26 @@ impl<N: Id, L: Id, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                         );
                     }
                     Message::Have { ops, fresh } => {
-                        // A fresh Have is relayed by everyone who receives it,
+                        // Every Have is relayed by everyone who receives it,
                         // whether or not its ops are new to this node: a peer
                         // out of the sender's earshot may still need them. The
                         // flood terminates on the seen-set, not on novelty.
-                        if fresh {
-                            let relay = s.unrelayed(&ops);
-                            if !relay.is_empty() {
-                                s.note_relayed(have_ops_ranges(&relay), self.config.have_ttl);
-                                fx.push(Effect::Send(MessageEnvelope::have(s.id, relay, true)));
-                            }
+                        // (`fresh` marks author origin; it is currently inert
+                        // on the receive side and passed through unchanged.)
+                        //
+                        // TODO: explore whether it would be more appropriate
+                        // to always relay fresh haves intact, rather than
+                        // relaying only the unrelayed portion.
+                        // Intuitively, the fact of a Have being fresh would imply
+                        // that it is entirely unrelayed, so passing it through
+                        // this filter would have no effect.
+                        // However it may be nice to keep the filter so that
+                        // "freshness" is defined not from the sender's perspective,
+                        // but from each receiver's perspective.
+                        let relay = s.unrelayed(&ops);
+                        if !relay.is_empty() {
+                            s.note_relayed(have_ops_ranges(&relay), self.config.have_ttl);
+                            fx.push(Effect::Send(MessageEnvelope::have(s.id, relay, fresh)));
                         }
                         s.haves.insert(
                             from,
