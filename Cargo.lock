@@ -228,6 +228,7 @@ dependencies = [
  "anyhow",
  "dash-router-core",
  "polestar",
+ "serde",
 ]
 
 [[package]]

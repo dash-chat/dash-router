@@ -74,6 +74,11 @@ impl<N: Id, L: Id, T: polestar::time::TimeInterval> NodeState<N, L, T> {
         }
         out
     }
+
+    /// Whether either storage side currently holds this exact `(log, seq)`.
+    pub fn holds(&self, log: &L, seq: Seq) -> bool {
+        self.ext.0.held_all().contains(log, seq) || self.relay.0.held_all().contains(log, seq)
+    }
 }
 
 impl<N: Id, L: Id + Default, T: polestar::time::TimeInterval> NodeState<N, L, T> {

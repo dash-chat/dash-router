@@ -8,3 +8,4 @@ edition.workspace = true
 dash-router-core = { path = "../dash-router-core" }
 polestar = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
