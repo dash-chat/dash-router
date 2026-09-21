@@ -425,7 +425,9 @@ struct WireMessage<N, L> {
 }
 enum WireBody<L> {
     Want(LogRanges<L>),
-    Have(Vec<(L, Seq, Op)>),   // no `fresh` field; ops may be payload-less
+    // Ops grouped per log: L is 32 bytes in production, so it is spelled
+    // once per log, not once per op. No `fresh` field; ops may be payload-less.
+    Have(Vec<(L, Vec<(Seq, Op)>)>),
 }
 ```
 

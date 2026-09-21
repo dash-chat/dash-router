@@ -35,7 +35,7 @@
 
 **Interfaces:**
 - Consumes: `Op`, `Seq`, `Ranges`, `LogRanges` (existing).
-- Produces: `WireMessage<N, L> { version: u8, sender: N, body: WireBody<L> }`, `WireBody<L>::{Want(LogRanges<L>), Have(Vec<(L, Seq, Op)>)}`, `WireMessage::encode(&self) -> Vec<u8>`, `WireMessage::decode(&[u8]) -> anyhow::Result<Self>`, `pub const WIRE_VERSION: u8 = 0`. Tasks 4–6 build `Broadcast(WireMessage)` effects and flights from these.
+- Produces: `WireMessage<N, L> { version: u8, sender: N, body: WireBody<L> }`, `WireBody<L>::{Want(LogRanges<L>), Have(Vec<(L, Vec<(Seq, Op)>)>)}` (ops grouped per log — `L` is 32 bytes in production; repeat it once per log, not once per op), `WireMessage::encode(&self) -> Vec<u8>`, `WireMessage::decode(&[u8]) -> anyhow::Result<Self>`, `pub const WIRE_VERSION: u8 = 0`. Tasks 4–6 build `Broadcast(WireMessage)` effects and flights from these.
 
 - [ ] **Step 1: Add dependencies**
 
@@ -66,7 +66,7 @@ mod tests {
         );
         let have: WireMessage<u32, u8> = WireMessage::have(
             7,
-            vec![(1u8, 0, Op { header: vec![9], payload: Some(vec![9, 9]) })],
+            vec![(1u8, vec![(0, Op { header: vec![9], payload: Some(vec![9, 9]) })])],
         );
         for msg in [want, have] {
             let bytes = msg.encode();
@@ -106,8 +106,9 @@ pub struct WireMessage<N, L: Ord> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WireBody<L: Ord> {
     Want(LogRanges<L>),
-    /// Hydrated ops in (log, seq) order; payloads may be None (GC'd).
-    Have(Vec<(L, Seq, Op)>),
+    /// Hydrated ops grouped per log, in (log, seq) order; payloads may be
+    /// None (GC'd). Grouping avoids repeating the 32-byte log id per op.
+    Have(Vec<(L, Vec<(Seq, Op)>)>),
 }
 
 impl<N: Serialize + DeserializeOwned, L: Ord + Serialize + DeserializeOwned> WireMessage<N, L> {
@@ -115,7 +116,7 @@ impl<N: Serialize + DeserializeOwned, L: Ord + Serialize + DeserializeOwned> Wir
         Self { version: WIRE_VERSION, sender, body: WireBody::Want(ranges) }
     }
 
-    pub fn have(sender: N, ops: Vec<(L, Seq, Op)>) -> Self {
+    pub fn have(sender: N, ops: Vec<(L, Vec<(Seq, Op)>)>) -> Self {
         Self { version: WIRE_VERSION, sender, body: WireBody::Have(ops) }
     }
 
@@ -545,7 +546,7 @@ fn recv_have_routes_bytes_delivers_and_rebroadcasts_hydrated() {
     let s = NodeState::new(n(0), [l(0)]);         // subscribed to log 0 only
     let op0 = Op { header: vec![7], payload: Some(vec![7]) };
     let op1 = Op { header: vec![8], payload: Some(vec![8]) };
-    let wire = WireMessage::have(n(1), vec![(l(0), 0, op0.clone()), (l(1), 0, op1.clone())]);
+    let wire = WireMessage::have(n(1), vec![(l(0), vec![(0, op0.clone())]), (l(1), vec![(0, op1.clone())])]);
     let (s, fx) = m.transition(s, NodeAction::Recv(wire)).unwrap();
 
     assert_eq!(s.ext.0.held_all(), lr([(0, Ranges::from_seqs([0]))]), "subscribed op → ext");
@@ -555,7 +556,7 @@ fn recv_have_routes_bytes_delivers_and_rebroadcasts_hydrated() {
     let broadcast = fx.iter().find_map(|e| match e {
         NodeEffect::Broadcast(w) => Some(w), _ => None }).unwrap();
     assert_eq!(broadcast.sender, n(0), "re-signed");
-    assert_eq!(broadcast.body, WireBody::Have(vec![(l(0), 0, op0), (l(1), 0, op1)]),
+    assert_eq!(broadcast.body, WireBody::Have(vec![(l(0), vec![(0, op0)]), (l(1), vec![(0, op1)])]),
         "relay hydrated from the just-ingested bytes");
     assert_eq!(s.router.held, s.held_union(), "router view reconciled");
 }
@@ -570,10 +571,10 @@ fn authored_ops_push_and_the_echo_is_absorbed() {
     let (s, fx) = m.transition(s, NodeAction::Authored(l(0), 0, op.clone())).unwrap();
     assert_eq!(s.ext.0.held_all(), lr([(0, Ranges::from_seqs([0]))]));
     assert!(matches!(&fx[..], [NodeEffect::Broadcast(w)]
-        if w.body == WireBody::Have(vec![(l(0), 0, op.clone())])));
+        if w.body == WireBody::Have(vec![(l(0), vec![(0, op.clone())])])));
     // The flood comes back from a neighbour: no re-broadcast, no delivery.
     let (_, fx) = m.transition(s, NodeAction::Recv(
-        WireMessage::have(n(1), vec![(l(0), 0, op)]))).unwrap();
+        WireMessage::have(n(1), vec![(l(0), vec![(0, op)])]))).unwrap();
     assert!(fx.is_empty());
 }
 
@@ -584,7 +585,7 @@ fn subscribe_migrates_and_preserves_held() {
     let s = NodeState::new(n(0), [l(0)]);
     let op = Op { header: vec![7], payload: Some(vec![7]) };
     let (s, _) = m.transition(s, NodeAction::Recv(
-        WireMessage::have(n(1), vec![(l(1), 0, op.clone())]))).unwrap();
+        WireMessage::have(n(1), vec![(l(1), vec![(0, op.clone())])]))).unwrap();
     let held_before = s.router.held.clone();
     let (s, fx) = m.transition(s, NodeAction::Subscribe(l(1))).unwrap();
     assert!(s.relay.0.held_all().is_empty(), "relay side emptied");
@@ -600,7 +601,7 @@ fn relay_cap_sheds_then_eviction_reopens() {
     let s = NodeState::new(n(0), []);             // pure relay
     let full = |b: u8| Op { header: vec![b], payload: Some(vec![b]) };
     let (s, fx) = m.transition(s, NodeAction::Recv(
-        WireMessage::have(n(1), vec![(l(0), 0, full(1)), (l(0), 1, full(2))]))).unwrap();
+        WireMessage::have(n(1), vec![(l(0), vec![(0, full(1)), (1, full(2))])]))).unwrap();
     assert_eq!(s.relay.0.held_all(), lr([(0, Ranges::from_seqs([0]))]), "second op shed");
     // The Have still floods in full: relaying is not conditioned on storing.
     assert!(matches!(fx.last().unwrap(), NodeEffect::Broadcast(_)));
@@ -648,8 +649,10 @@ fn transition(&self, mut s: NodeState<..>, action: NodeAction<..>) -> Transition
                 self.route_router_fx(&mut s, fx, &BTreeMap::new(), &mut out)?;
             }
             WireBody::Have(ops) => {
-                let parked: BTreeMap<(L, Seq), Op> =
-                    ops.iter().cloned().map(|(l, q, o)| ((l, q), o)).collect();
+                let parked: BTreeMap<(L, Seq), Op> = ops
+                    .into_iter()
+                    .flat_map(|(l, seqs)| seqs.into_iter().map(move |(q, o)| ((l, q), o)))
+                    .collect();
                 let ranges = ranges_of(&parked);
                 let fx = self.router_step(&mut s, RouterAction::RecvHave { from: wire.sender, ranges })?;
                 // Ingest ALL parked bytes first (idempotent; payload upgrades
@@ -691,7 +694,7 @@ Helper semantics:
 - `route_router_fx(s, fx, parked, out)`: in fx order —
   - `Accept(novel)`: for each `(log, r)` in `novel.iter()` with `s.subscriptions.contains(log)`: for each seq in the *parked keys* filtered by `r.contains(seq)` (never iterate `Ranges` directly — open ranges), push `NodeEffect::Deliver(log, seq)`.
   - `SendWant(r)`: `out.push(NodeEffect::Broadcast(WireMessage::want(s.router.id, r)))`.
-  - `SendHave(r)`: hydrate `let mut ops = s.relay.0.fetch(&r); ops.extend(s.ext.0.fetch(&r)); ops.sort(); ops.dedup_by(|a, b| (a.0, a.1) == (b.0, b.1));` then `out.push(NodeEffect::Broadcast(WireMessage::have(s.router.id, ops)))`. If hydration comes back empty (everything evicted since), broadcast nothing.
+  - `SendHave(r)`: hydrate `let mut ops = s.relay.0.fetch(&r); ops.extend(s.ext.0.fetch(&r)); ops.sort(); ops.dedup_by(|a, b| (a.0, a.1) == (b.0, b.1));` then group per log for the wire (`group_ops(ops) -> Vec<(L, Vec<(Seq, Op)>)>` — a small free fn in `node.rs`: fold the sorted flat list, pushing a new `(l, vec![])` entry whenever the log changes) and `out.push(NodeEffect::Broadcast(WireMessage::have(s.router.id, group_ops(ops))))`. If hydration comes back empty (everything evicted since), broadcast nothing.
 - `held_union`: `relay.held_all() ∪ ext.held_all()` then `for l in &subscriptions { if absent, insert (l, Ranges::empty()) }`.
 - `NodeState::new(id, subs)`: build subscriptions, empty stores, `RouterState::new(id, held_union_of_that)`.
 
