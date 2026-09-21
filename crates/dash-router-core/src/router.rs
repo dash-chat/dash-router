@@ -2,37 +2,33 @@
 //!
 //! Everything nondeterministic is an action: how much time passes (`Tick`),
 //! which interval a timer is armed with (`ArmWantTimer`/`ArmHaveTimer`), and
-//! which message arrives (`Recv`). Nothing in here draws from an RNG or reads
-//! a clock, so the same machine can be exhaustively traversed with bounded
-//! `N`, `L`, `T` and driven by a simulator or a real network with large ones.
+//! which message arrives (`RecvWant`/`RecvHave`). Nothing in here draws from
+//! an RNG or reads a clock, so the same machine can be exhaustively traversed
+//! with bounded `N`, `L`, `T` and driven by a simulator or a real network
+//! with large ones.
 //!
 //! Timers follow polestar's `fetch_timed` idiom with zero grace: a timer counts
 //! down, `Fire*` is enabled exactly when it reaches zero, and `Tick` is not
 //! enabled if it would carry any armed timer below zero. That makes randomised
 //! intervals explorable without letting the schedule skip a due timer.
 //!
+//! This machine holds no data: it decides ranges, not ops. Storage,
+//! hydration (turning a `SendHave`'s ranges into wire ops with payloads) and
+//! turning a received `Accept` into stored data all live in the shell above
+//! it (spec §5).
+//!
 //! Deliberate simplifications at this stage, to revisit:
-//! - `Append` emits its fresh Have immediately. DESIGN.md wants a brief
-//!   debounce so that several appends share one Have.
-//! - The relay cap is measured in units (2 per op with payload, 1 per
-//!   header-only op) rather than bytes.
-//! - GC "oldest" means lowest `(log, seq)`; recency-of-mention is not tracked.
-//! - The relay seen-set (`RouterState::relayed`) carries one TTL for the whole
-//!   accumulated range set rather than one per range, so a later flood extends
-//!   the life of earlier entries. That only ever suppresses more relaying.
+//! - The seen-set (`RouterState::relayed_haves`) carries one TTL for the
+//!   whole accumulated range set rather than one per range, so a later flood
+//!   extends the life of earlier entries. That only ever suppresses more
+//!   relaying.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    marker::PhantomData,
-};
+use std::{collections::BTreeMap, marker::PhantomData};
 
 use anyhow::{bail, ensure};
 use polestar::{StateMachine, prelude::*, time::TimeInterval};
 
-use crate::{
-    message::{HaveOps, Message, MessageEnvelope, Op, have_ops_ranges},
-    ranges::{LogRanges, Ranges, Seq},
-};
+use crate::ranges::LogRanges;
 
 /// Parameters shared by every node running the protocol.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -41,9 +37,6 @@ pub struct RouterConfig<T> {
     pub want_ttl: T,
     /// How long a witnessed Have suppresses re-sending the same ranges.
     pub have_ttl: T,
-    /// Cap on relay-store usage, in units: 2 per op with payload, 1 per
-    /// header-only op. Subscribed logs are never counted or collected.
-    pub relay_cap: usize,
 }
 
 pub type RouterStateMachine<N, L, T> = StateMachine<RouterMachine<N, L, T>>;
@@ -80,11 +73,10 @@ pub struct Record<L: Ord, T> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RouterState<N: Ord, L: Ord, T> {
     pub id: N,
-    /// Logs this node cares about for its own sake. Ops in these logs are
-    /// delivered to the application and never garbage collected.
-    pub subscriptions: BTreeSet<L>,
-    /// Every op held, whether subscribed or relayed.
-    pub store: BTreeMap<L, BTreeMap<Seq, Op>>,
+    /// Ranges held for every known log, as reported by the storage layer
+    /// above. An empty range for a log means the log is known but empty
+    /// ("known-but-empty"): that log wants everything.
+    pub held: LogRanges<L>,
     /// Recent Wants from other nodes.
     pub wants: BTreeMap<N, Record<L, T>>,
     /// Recent Haves from other nodes, and this node's own last non-fresh Have
@@ -97,10 +89,10 @@ pub struct RouterState<N: Ord, L: Ord, T> {
     /// record whose TTL refreshes on every update would let steady traffic
     /// keep the whole set alive forever, suppressing relays that should
     /// happen. Deliberately separate from `haves`, which governs responses
-    /// to Wants — a node that has just flooded an op must still answer a
+    /// to Wants — a node that has just flooded a range must still answer a
     /// Want for it, since the Want is evidence the flood did not reach
     /// everyone.
-    pub relayed: Vec<Record<L, T>>,
+    pub relayed_haves: Vec<Record<L, T>>,
     /// Want ranges this node has already flooded onward: the same seen-set
     /// mechanism, for the Want flood, on `want_ttl`.
     pub relayed_wants: Vec<Record<L, T>>,
@@ -109,47 +101,23 @@ pub struct RouterState<N: Ord, L: Ord, T> {
 }
 
 impl<N: Id, L: Id, T: TimeInterval> RouterState<N, L, T> {
-    pub fn new(id: N, subscriptions: impl IntoIterator<Item = L>) -> Self {
+    pub fn new(id: N, held: LogRanges<L>) -> Self {
         Self {
             id,
-            subscriptions: subscriptions.into_iter().collect(),
-            store: BTreeMap::new(),
+            held,
             wants: BTreeMap::new(),
             haves: BTreeMap::new(),
-            relayed: Vec::new(),
+            relayed_haves: Vec::new(),
             relayed_wants: Vec::new(),
             want_timer: None,
             have_timer: None,
         }
     }
 
-    /// Logs this node knows about: subscribed or holding ops for.
-    fn known_logs(&self) -> impl Iterator<Item = L> + '_ {
-        let mut logs: BTreeSet<L> = self.subscriptions.clone();
-        logs.extend(self.store.keys().copied());
-        logs.into_iter()
-    }
-
-    /// Ranges held (header at least) for every known log.
-    pub fn held(&self) -> LogRanges<L> {
-        LogRanges::from_pairs(self.known_logs().map(|log| {
-            let seqs = self
-                .store
-                .get(&log)
-                .into_iter()
-                .flat_map(|m| m.keys().copied());
-            (log, Ranges::from_seqs(seqs))
-        }))
-    }
-
-    /// Everything not held for every known log: the gaps plus the open tail
-    /// after the highest seq.
+    /// Everything not held, for every known log: the gaps plus the open
+    /// tail. A known-but-empty log (empty range in `held`) wants everything.
     pub fn wanted(&self) -> LogRanges<L> {
-        let held = self.held();
-        LogRanges::from_pairs(self.known_logs().map(|log| {
-            let h = held.get(&log).cloned().unwrap_or_default();
-            (log, h.complement())
-        }))
+        LogRanges::from_pairs(self.held.iter().map(|(log, r)| (*log, r.complement())))
     }
 
     /// Union of recent Wants from other nodes.
@@ -166,56 +134,33 @@ impl<N: Id, L: Id, T: TimeInterval> RouterState<N, L, T> {
             .fold(LogRanges::empty(), |acc, r| acc.union(&r.ranges))
     }
 
-    /// DESIGN.md §1: what this node wants, minus what others recently asked for.
+    /// DESIGN.md §1.
     pub fn next_want(&self) -> LogRanges<L> {
         self.wanted().difference(&self.others_wants())
     }
 
-    /// DESIGN.md §3: what this node holds that others recently asked for,
-    /// minus what has recently been circulating.
-    pub fn next_have(&self) -> HaveOps<L> {
-        let ranges = self
-            .held()
+    /// DESIGN.md §3 — now ranges, not ops; hydration happens above.
+    pub fn next_have(&self) -> LogRanges<L> {
+        self.held
             .intersection(&self.others_wants())
-            .difference(&self.recent_haves());
-        self.ops_in(&ranges)
+            .difference(&self.recent_haves())
     }
 
-    fn ops_in(&self, ranges: &LogRanges<L>) -> HaveOps<L> {
-        ranges
-            .iter()
-            .filter_map(|(log, r)| {
-                let ops: BTreeMap<Seq, Op> = self
-                    .store
-                    .get(log)?
-                    .iter()
-                    .filter(|(seq, _)| r.contains(**seq))
-                    .map(|(seq, op)| (*seq, op.clone()))
-                    .collect();
-                (!ops.is_empty()).then_some((*log, ops))
-            })
-            .collect()
-    }
-
-    /// Ranges already flooded onward, if the record has not expired.
-    pub fn relayed_ranges(&self) -> LogRanges<L> {
-        combined_ranges(&self.relayed)
+    pub fn relayed_have_ranges(&self) -> LogRanges<L> {
+        combined_ranges(&self.relayed_haves)
     }
 
     pub fn relayed_want_ranges(&self) -> LogRanges<L> {
         combined_ranges(&self.relayed_wants)
     }
 
-    /// Note that Have `ranges` have been flooded onward: a fresh record with
-    /// its own TTL, so it expires independently of earlier floods.
-    fn note_relayed(&mut self, ranges: LogRanges<L>, ttl: T) {
-        self.relayed.push(Record {
+    fn note_relayed_haves(&mut self, ranges: LogRanges<L>, ttl: T) {
+        self.relayed_haves.push(Record {
             ranges,
             ttl_left: ttl,
         });
     }
 
-    /// Note that Want `ranges` have been flooded onward.
     fn note_relayed_wants(&mut self, ranges: LogRanges<L>, ttl: T) {
         self.relayed_wants.push(Record {
             ranges,
@@ -223,71 +168,15 @@ impl<N: Id, L: Id, T: TimeInterval> RouterState<N, L, T> {
         });
     }
 
-    /// The subset of `ops` not yet flooded onward by this node.
-    fn unrelayed(&self, ops: &HaveOps<L>) -> HaveOps<L> {
-        let relayed = self.relayed_ranges();
-        ops.iter()
-            .filter_map(|(log, seqs)| {
-                let picked: BTreeMap<Seq, Op> = seqs
-                    .iter()
-                    .filter(|(seq, _)| !relayed.contains(log, **seq))
-                    .map(|(seq, op)| (*seq, op.clone()))
-                    .collect();
-                (!picked.is_empty()).then_some((*log, picked))
-            })
-            .collect()
-    }
-
-    pub fn holds(&self, log: &L, seq: Seq) -> Option<&Op> {
-        self.store.get(log)?.get(&seq)
-    }
-
-    fn is_relayed(&self, log: &L) -> bool {
-        !self.subscriptions.contains(log)
-    }
-
-    /// Relay-store usage in cap units (see [`RouterConfig::relay_cap`]).
-    pub fn relay_usage(&self) -> usize {
-        self.store
-            .iter()
-            .filter(|(log, _)| self.is_relayed(log))
-            .flat_map(|(_, ops)| ops.values())
-            .map(|op| if op.payload.is_some() { 2 } else { 1 })
-            .sum()
-    }
-
-    /// Drop payloads oldest-first until under the cap, then headers.
-    fn gc(&mut self, cap: usize) {
-        while self.relay_usage() > cap {
-            let oldest_with_payload = self
-                .store
-                .iter()
-                .filter(|(log, _)| self.is_relayed(log))
-                .flat_map(|(log, ops)| ops.iter().map(move |(seq, op)| (*log, *seq, op)))
-                .find(|(_, _, op)| op.payload.is_some())
-                .map(|(log, seq, _)| (log, seq));
-            if let Some((log, seq)) = oldest_with_payload {
-                self.store
-                    .get_mut(&log)
-                    .unwrap()
-                    .get_mut(&seq)
-                    .unwrap()
-                    .payload = None;
-                continue;
-            }
-            let oldest = self
-                .store
-                .iter()
-                .filter(|(log, ops)| self.is_relayed(log) && !ops.is_empty())
-                .map(|(log, ops)| (*log, *ops.keys().next().unwrap()))
-                .next()
-                .expect("usage > 0 implies a relayed op exists");
-            let ops = self.store.get_mut(&oldest.0).unwrap();
-            ops.remove(&oldest.1);
-            if ops.is_empty() {
-                self.store.remove(&oldest.0);
-            }
-        }
+    /// Record an own or received Have emission for §3 suppression.
+    fn note_have(&mut self, key: N, ranges: LogRanges<L>, ttl: T) {
+        self.haves.insert(
+            key,
+            Record {
+                ranges,
+                ttl_left: ttl,
+            },
+        );
     }
 }
 
@@ -311,26 +200,33 @@ pub enum RouterAction<N, L: Ord, T> {
     FireWant,
     /// Only when the Have timer is due.
     FireHave,
-    /// Author the next op on a subscribed log.
-    Append(L, Op),
-    /// A message arrives from another node.
-    Recv(MessageEnvelope<N, L>),
+    /// A Want message arrives from another node.
+    RecvWant { from: N, ranges: LogRanges<L> },
+    /// A Have message arrives from another node.
+    RecvHave { from: N, ranges: LogRanges<L> },
+    /// An absolute snapshot of what the storage layer holds, replacing
+    /// `held` wholesale.
+    Held(LogRanges<L>),
+    /// Storage has grown by these ranges (e.g. a local append); the router
+    /// grows `held` incrementally and floods the news.
+    Push(LogRanges<L>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Effect<N, L: Ord> {
-    /// Broadcast to the LAN.
-    Send(MessageEnvelope<N, L>),
-    /// Persist an op (into the selfish or relay store, per subscription).
-    Store(L, Seq, Op),
-    /// Hand an op in a subscribed log to the application.
-    Deliver(L, Seq),
+pub enum Effect<L: Ord> {
+    /// Broadcast a Want for these ranges to the LAN.
+    SendWant(LogRanges<L>),
+    /// Broadcast a Have for these ranges to the LAN; the shell hydrates them
+    /// into wire ops.
+    SendHave(LogRanges<L>),
+    /// Ranges newly learned about via a Have, to be fetched/stored above.
+    Accept(LogRanges<L>),
 }
 
 impl<N: Id, L: Id, T: TimeInterval> Machine for RouterMachine<N, L, T> {
     type State = RouterState<N, L, T>;
     type Action = RouterAction<N, L, T>;
-    type Fx = Vec<Effect<N, L>>;
+    type Fx = Vec<Effect<L>>;
     type Error = anyhow::Error;
 
     fn transition(&self, mut s: Self::State, action: Self::Action) -> TransitionResult<Self> {
@@ -348,7 +244,7 @@ impl<N: Id, L: Id, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                         r.ttl_left = r.ttl_left - dur;
                     }
                 }
-                for records in [&mut s.relayed, &mut s.relayed_wants] {
+                for records in [&mut s.relayed_haves, &mut s.relayed_wants] {
                     records.retain_mut(|r| {
                         let alive = dur < r.ttl_left;
                         if alive {
@@ -388,7 +284,7 @@ impl<N: Id, L: Id, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                     // Own emissions count as relayed, or the flood's echo
                     // would be re-flooded by its own author.
                     s.note_relayed_wants(ranges.clone(), self.config.want_ttl);
-                    fx.push(Effect::Send(MessageEnvelope::want(s.id, ranges)));
+                    fx.push(Effect::SendWant(ranges));
                 }
             }
 
@@ -398,110 +294,67 @@ impl<N: Id, L: Id, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                 };
                 ensure!(timer.remaining.is_zero(), "have timer not due");
                 s.have_timer = None;
-                let ops = s.next_have();
-                if !ops.is_empty() {
-                    s.haves.insert(
-                        s.id,
-                        Record {
-                            ranges: have_ops_ranges(&ops),
-                            ttl_left: self.config.have_ttl,
-                        },
-                    );
-                    s.note_relayed(have_ops_ranges(&ops), self.config.have_ttl);
-                    fx.push(Effect::Send(MessageEnvelope::have(s.id, ops, false)));
+                let ranges = s.next_have();
+                if !ranges.is_empty() {
+                    s.note_have(s.id, ranges.clone(), self.config.have_ttl);
+                    s.note_relayed_haves(ranges.clone(), self.config.have_ttl);
+                    fx.push(Effect::SendHave(ranges));
                 }
             }
 
-            RouterAction::Append(log, op) => {
-                ensure!(
-                    s.subscriptions.contains(&log),
-                    "can only append to a subscribed log"
-                );
-                let seq = s
-                    .store
-                    .get(&log)
-                    .and_then(|ops| ops.keys().next_back())
-                    .map_or(0, |last| last + 1);
-                s.store.entry(log).or_default().insert(seq, op.clone());
-                fx.push(Effect::Store(log, seq, op.clone()));
-                let ops = HaveOps::from([(log, BTreeMap::from([(seq, op)]))]);
-                s.note_relayed(have_ops_ranges(&ops), self.config.have_ttl);
-                fx.push(Effect::Send(MessageEnvelope::have(s.id, ops, true)));
+            RouterAction::Push(ranges) => {
+                ensure!(!ranges.is_empty(), "empty push");
+                // The author certainly holds what it pushes.
+                s.held = s.held.union(&ranges);
+                let relay = ranges.difference(&s.relayed_have_ranges());
+                if !relay.is_empty() {
+                    s.note_have(s.id, relay.clone(), self.config.have_ttl);
+                    s.note_relayed_haves(relay.clone(), self.config.have_ttl);
+                    fx.push(Effect::SendHave(relay));
+                }
             }
 
-            RouterAction::Recv(MessageEnvelope { from, message }) => {
+            RouterAction::Held(ranges) => {
+                // Absolute snapshot from the storage layer; replaces wholesale.
+                s.held = ranges;
+            }
+
+            RouterAction::RecvWant { from, ranges } => {
                 ensure!(from != s.id, "received own message");
-                match message {
-                    Message::Want { ranges } => {
-                        // DESIGN.md: every received message is re-transmitted:
-                        // simple flooding, terminated by the seen-set. Relay
-                        // only the not-yet-relayed portion, re-signed.
-                        let relay = ranges.difference(&s.relayed_want_ranges());
-                        if !relay.is_empty() {
-                            s.note_relayed_wants(relay.clone(), self.config.want_ttl);
-                            fx.push(Effect::Send(MessageEnvelope::want(s.id, relay)));
-                        }
-                        s.wants.insert(
-                            from,
-                            Record {
-                                ranges,
-                                ttl_left: self.config.want_ttl,
-                            },
-                        );
-                    }
-                    Message::Have { ops, fresh } => {
-                        // Every Have is relayed by everyone who receives it,
-                        // whether or not its ops are new to this node: a peer
-                        // out of the sender's earshot may still need them. The
-                        // flood terminates on the seen-set, not on novelty.
-                        // (`fresh` marks author origin; it is currently inert
-                        // on the receive side and passed through unchanged.)
-                        //
-                        // TODO: explore whether it would be more appropriate
-                        // to always relay fresh haves intact, rather than
-                        // relaying only the unrelayed portion.
-                        // Intuitively, the fact of a Have being fresh would imply
-                        // that it is entirely unrelayed, so passing it through
-                        // this filter would have no effect.
-                        // However it may be nice to keep the filter so that
-                        // "freshness" is defined not from the sender's perspective,
-                        // but from each receiver's perspective.
-                        let relay = s.unrelayed(&ops);
-                        if !relay.is_empty() {
-                            s.note_relayed(have_ops_ranges(&relay), self.config.have_ttl);
-                            fx.push(Effect::Send(MessageEnvelope::have(s.id, relay, fresh)));
-                        }
-                        s.haves.insert(
-                            from,
-                            Record {
-                                ranges: have_ops_ranges(&ops),
-                                ttl_left: self.config.have_ttl,
-                            },
-                        );
-                        let mut new_ops: HaveOps<L> = BTreeMap::new();
-                        for (log, seqs) in ops {
-                            for (seq, op) in seqs {
-                                let improves = match s.holds(&log, seq) {
-                                    None => true,
-                                    Some(held) => held.payload.is_none() && op.payload.is_some(),
-                                };
-                                if improves {
-                                    new_ops.entry(log).or_default().insert(seq, op);
-                                }
-                            }
-                        }
-                        for (log, seqs) in &new_ops {
-                            for (seq, op) in seqs {
-                                s.store.entry(*log).or_default().insert(*seq, op.clone());
-                                fx.push(Effect::Store(*log, *seq, op.clone()));
-                                if s.subscriptions.contains(log) {
-                                    fx.push(Effect::Deliver(*log, *seq));
-                                }
-                            }
-                        }
-                        s.gc(self.config.relay_cap);
-                    }
+                // DESIGN.md: every received message is re-transmitted:
+                // simple flooding, terminated by the seen-set. Relay only
+                // the not-yet-relayed portion, re-signed.
+                let relay = ranges.difference(&s.relayed_want_ranges());
+                if !relay.is_empty() {
+                    s.note_relayed_wants(relay.clone(), self.config.want_ttl);
+                    fx.push(Effect::SendWant(relay));
                 }
+                s.wants.insert(
+                    from,
+                    Record {
+                        ranges,
+                        ttl_left: self.config.want_ttl,
+                    },
+                );
+            }
+
+            RouterAction::RecvHave { from, ranges } => {
+                ensure!(from != s.id, "received own message");
+                let novel = ranges.difference(&s.held);
+                if !novel.is_empty() {
+                    s.held = s.held.union(&novel);
+                    fx.push(Effect::Accept(novel));
+                }
+                // Every Have is relayed by everyone who receives it, whether
+                // or not its ranges are new to this node: a peer out of the
+                // sender's earshot may still need them. The flood
+                // terminates on the seen-set, not on novelty.
+                let relay = ranges.difference(&s.relayed_have_ranges());
+                if !relay.is_empty() {
+                    s.note_relayed_haves(relay.clone(), self.config.have_ttl);
+                    fx.push(Effect::SendHave(relay));
+                }
+                s.note_have(from, ranges, self.config.have_ttl);
             }
         }
         Ok((s, fx))
