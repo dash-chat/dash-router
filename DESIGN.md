@@ -71,6 +71,11 @@ impl HaveOps {
     }
 }
 
+/// A key absent means "unknown"; a key present with an empty Ranges means
+/// "known but empty" (e.g. a fresh subscription that wants everything).
+/// Construction/union preserve that empty-valued marker; intersection/
+/// difference (wire-bound results) prune it — "nothing in common" is not a
+/// key. is_empty() means every known key maps to an empty range.
 struct LogRanges(HashMap<LogId, Ranges>);
 
 /// Two payloads, both opaque to relays in general.
