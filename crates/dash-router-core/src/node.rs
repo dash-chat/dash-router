@@ -335,7 +335,15 @@ where
                 Effect::SendHave(r) => {
                     let mut ops = s.relay.0.fetch(&r);
                     ops.extend(s.ext.0.fetch(&r));
-                    ops.sort();
+                    // Order by (log, seq), with a payload-bearing copy first
+                    // within a run: relay and ext can each hold their own
+                    // copy of the same (log, seq), and the dedup below keeps
+                    // only the first — it must not be the degraded one.
+                    ops.sort_by(|a, b| {
+                        (&a.0, a.1)
+                            .cmp(&(&b.0, b.1))
+                            .then_with(|| b.2.payload.is_some().cmp(&a.2.payload.is_some()))
+                    });
                     ops.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
                     if !ops.is_empty() {
                         out.push(NodeEffect::Broadcast(WireMessage::have(
