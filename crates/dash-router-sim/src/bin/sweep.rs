@@ -12,7 +12,8 @@ use clap::Parser;
 use dash_router_sim::{
     policy::IntervalPolicy,
     scenario::{
-        Defaults, LatencySpec, PolicySpec, RouterSpec, ScenarioSpec, TopologySpec, WorkloadSpec,
+        Defaults, LatencySpec, PolicySpec, RouterSpec, ScenarioSpec, StorageSpec, TopologySpec,
+        WorkloadSpec,
     },
     sweep::{self, Grid},
 };
@@ -69,8 +70,8 @@ fn base(args: &Args) -> ScenarioSpec {
         router: RouterSpec {
             want_ttl_ms: 500,
             have_ttl_ms: 500,
-            relay_cap: 1 << 20,
         },
+        storage: StorageSpec { relay_cap: 1 << 20 },
         policy: PolicySpec {
             want: IntervalPolicy::DensityScaled {
                 min_ms: args.want_min,

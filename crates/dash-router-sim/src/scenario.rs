@@ -6,12 +6,12 @@
 //! *driver*: what gets delivered when, what gets lost, what intervals get
 //! sampled, who appends and how often.
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::{Context, ensure};
-use dash_router_core::{RouterConfig, RouterMachine, RouterState};
+use dash_router_core::{NodeMachine, NodeState, RouterConfig, Units};
 use dash_router_net_model::Topology;
-use polestar::{prelude::*, time::RealTime};
+use polestar::time::RealTime;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,7 @@ pub struct ScenarioSpec {
     pub loss: f64,
     pub latency_ms: LatencySpec,
     pub router: RouterSpec,
+    pub storage: StorageSpec,
     pub policy: PolicySpec,
     pub workload: WorkloadSpec,
     pub seeds: Option<u64>,
@@ -118,7 +119,14 @@ impl LatencySpec {
 pub struct RouterSpec {
     pub want_ttl_ms: u64,
     pub have_ttl_ms: u64,
-    pub relay_cap: usize,
+}
+
+/// Storage-layer knobs. Split from [`RouterSpec`] because the storage-less
+/// router has no cap of its own: `relay_cap` bounds the node's
+/// `RelayStoreMachine` (the shell's decision, not the protocol's).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StorageSpec {
+    pub relay_cap: Units,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -158,10 +166,31 @@ impl ScenarioSpec {
             "more writers than nodes"
         );
         ensure!(self.workload.writers >= 1, "need at least one writer");
+        // The coverage metric counts subscriber deliveries and assumes
+        // `expected_coverage = nodes - 1`, i.e. every node subscribes to
+        // every writer's log. `build` below subscribes every node to the
+        // full `0..writers` log set unconditionally — this scenario shape
+        // has no knob for a narrower subscription — so the invariant holds
+        // by construction, and there is no per-scenario data to check
+        // beyond `writers <= nodes` above. Assert `full_subscription()`
+        // explicitly (rather than relying on that comment) so a future
+        // per-node subscription knob fails this loudly instead of quietly
+        // corrupting the metric.
+        ensure!(
+            self.full_subscription(),
+            "subscriber-coverage metric requires every node to subscribe to every writer's log"
+        );
         if let LatencySpec::LogNormal { median_ms, sigma } = &self.latency_ms {
             ensure!(*median_ms > 0.0 && *sigma >= 0.0, "bad log-normal latency");
         }
         Ok(())
+    }
+
+    /// Whether this scenario shape subscribes every node to every writer's
+    /// log, as `build` constructs it — the invariant `expected_coverage =
+    /// nodes - 1` relies on.
+    fn full_subscription(&self) -> bool {
+        (self.workload.writers as u32) <= self.nodes
     }
 
     pub fn topology(&self, seed: u64) -> Topology<NodeId> {
@@ -192,16 +221,14 @@ impl ScenarioSpec {
         self.validate().context("invalid scenario")?;
         let duration = ms(self.duration_ms.unwrap_or(defaults.duration_ms));
         let topology = self.topology(seed);
-        let router = Arc::new(RouterMachine::new(RouterConfig::<RealTime> {
+        let router_config = RouterConfig::<RealTime> {
             want_ttl: ms(self.router.want_ttl_ms).into(),
             have_ttl: ms(self.router.have_ttl_ms).into(),
-            relay_cap: self.router.relay_cap,
-        }));
+        };
+        let node_machine = NodeMachine::new(router_config, self.storage.relay_cap);
         let logs: Vec<LogId> = (0..self.workload.writers).collect();
-        let state = SimNetState::new(
-            (0..self.nodes)
-                .map(|id| router.state_machine(RouterState::new(id, logs.iter().copied()))),
-        );
+        let state =
+            SimNetState::new((0..self.nodes).map(|id| NodeState::new(id, logs.iter().copied())));
         let params = SimParams {
             n: self.nodes as usize,
             loss: self.loss,
@@ -219,7 +246,7 @@ impl ScenarioSpec {
             "topology node count mismatch"
         );
         let behavior = SimBehavior::new(topology.clone(), params, seed);
-        let net = SimNet::new(topology);
+        let net = SimNet::new(topology, node_machine);
         Ok(Simulation::new(net, state, behavior, duration))
     }
 
@@ -244,7 +271,8 @@ scenarios:
     topology: { kind: random-tree, extra_edges: 0.2 }
     loss: 0.1
     latency_ms: { distribution: uniform, min_ms: 1, max_ms: 5 }
-    router: { want_ttl_ms: 500, have_ttl_ms: 500, relay_cap: 65536 }
+    router: { want_ttl_ms: 500, have_ttl_ms: 500 }
+    storage: { relay_cap: 65536 }
     policy:
       want: { kind: density-scaled, min_ms: 200, max_ms: 400, ref_n: 10 }
       have: { kind: fixed, min_ms: 20, max_ms: 80 }

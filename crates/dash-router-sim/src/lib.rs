@@ -41,5 +41,5 @@ pub type SimNetAction = NetAction<NodeId, LogId, RealTime, K>;
 
 pub use behavior::SimBehavior;
 pub use metrics::{Metrics, RunRecord};
-pub use scenario::{Config, ScenarioSpec};
+pub use scenario::{Config, ScenarioSpec, StorageSpec};
 pub use sim::Simulation;

@@ -1,0 +1,242 @@
+scenario: lan-50-lossy
+params:
+  nodes: 50
+  topology:
+    kind: random-tree
+    extra_edges: 0.3
+  loss: 0.15
+  latency_ms:
+    distribution: log-normal
+    median_ms: 3.0
+    sigma: 0.6
+  router:
+    want_ttl_ms: 500
+    have_ttl_ms: 500
+  storage:
+    relay_cap: 1048576
+  policy:
+    want:
+      kind: density-scaled
+      min_ms: 300.0
+      max_ms: 700.0
+      ref_n: 20
+      alpha: 1.0
+    have:
+      kind: fixed
+      min_ms: 30.0
+      max_ms: 120.0
+  workload:
+    writers: 4
+    appends_per_sec: 2.0
+    payload_bytes: 64
+  seeds: null
+  duration_ms: null
+runs:
+- seed: 0
+  ops_authored: 43
+  ops_fully_covered: 43
+  ops_missed: 0
+  t_full_ms:
+    mean: 1221.069021674419
+    p95: 2359.728807
+    max: 4820.3396219999995
+  want_msgs: 9508
+  have_msgs: 14205
+  receives: 20219
+  redundant_receives: 18115
+  redundancy: 0.8959394628814481
+  duplicate_replies: 10013
+  backfill_receives: 2104
+  drops: 3494
+  shed_appends: 0
+  fire_backpressure: 0
+  forced_drops: 0
+  relay_occupancy_mean: 0.0
+  relay_occupancy_max: 0
+  inflight_mean: 4.9523809523809526
+  inflight_max: 32
+- seed: 1
+  ops_authored: 50
+  ops_fully_covered: 50
+  ops_missed: 0
+  t_full_ms:
+    mean: 1379.2617327599999
+    p95: 4070.5833599999996
+    max: 5103.030974
+  want_msgs: 9073
+  have_msgs: 14314
+  receives: 19921
+  redundant_receives: 17483
+  redundancy: 0.8776165855127754
+  duplicate_replies: 9726
+  backfill_receives: 2438
+  drops: 3466
+  shed_appends: 0
+  fire_backpressure: 0
+  forced_drops: 0
+  relay_occupancy_mean: 0.0
+  relay_occupancy_max: 0
+  inflight_mean: 3.380952380952381
+  inflight_max: 22
+- seed: 2
+  ops_authored: 42
+  ops_fully_covered: 42
+  ops_missed: 0
+  t_full_ms:
+    mean: 764.8604445238095
+    p95: 1901.416373
+    max: 2731.268932
+  want_msgs: 7275
+  have_msgs: 10772
+  receives: 15294
+  redundant_receives: 13240
+  redundancy: 0.8656989669151302
+  duplicate_replies: 7079
+  backfill_receives: 2054
+  drops: 2753
+  shed_appends: 0
+  fire_backpressure: 0
+  forced_drops: 0
+  relay_occupancy_mean: 0.0
+  relay_occupancy_max: 0
+  inflight_mean: 2.95
+  inflight_max: 24
+- seed: 3
+  ops_authored: 35
+  ops_fully_covered: 35
+  ops_missed: 0
+  t_full_ms:
+    mean: 998.0379985428572
+    p95: 2554.9846230000003
+    max: 3582.5211
+  want_msgs: 7347
+  have_msgs: 9880
+  receives: 14747
+  redundant_receives: 13034
+  redundancy: 0.8838407811758324
+  duplicate_replies: 6750
+  backfill_receives: 1713
+  drops: 2480
+  shed_appends: 0
+  fire_backpressure: 0
+  forced_drops: 0
+  relay_occupancy_mean: 0.0
+  relay_occupancy_max: 0
+  inflight_mean: 4.9
+  inflight_max: 54
+- seed: 4
+  ops_authored: 40
+  ops_fully_covered: 40
+  ops_missed: 0
+  t_full_ms:
+    mean: 1632.7800807750002
+    p95: 3524.042457
+    max: 4282.359585
+  want_msgs: 9160
+  have_msgs: 12605
+  receives: 18574
+  redundant_receives: 16623
+  redundancy: 0.8949606977495423
+  duplicate_replies: 8814
+  backfill_receives: 1951
+  drops: 3191
+  shed_appends: 0
+  fire_backpressure: 0
+  forced_drops: 0
+  relay_occupancy_mean: 0.0
+  relay_occupancy_max: 0
+  inflight_mean: 3.5
+  inflight_max: 27
+- seed: 5
+  ops_authored: 48
+  ops_fully_covered: 48
+  ops_missed: 0
+  t_full_ms:
+    mean: 1009.8594735
+    p95: 2976.025441
+    max: 3600.304188
+  want_msgs: 8341
+  have_msgs: 13991
+  receives: 18944
+  redundant_receives: 16598
+  redundancy: 0.8761613175675675
+  duplicate_replies: 9485
+  backfill_receives: 2346
+  drops: 3388
+  shed_appends: 0
+  fire_backpressure: 0
+  forced_drops: 0
+  relay_occupancy_mean: 0.0
+  relay_occupancy_max: 0
+  inflight_mean: 2.45
+  inflight_max: 26
+- seed: 6
+  ops_authored: 35
+  ops_fully_covered: 35
+  ops_missed: 0
+  t_full_ms:
+    mean: 996.7941069714284
+    p95: 2190.024336
+    max: 3455.5451559999997
+  want_msgs: 7813
+  have_msgs: 9867
+  receives: 14926
+  redundant_receives: 13213
+  redundancy: 0.8852338201795524
+  duplicate_replies: 6621
+  backfill_receives: 1713
+  drops: 2754
+  shed_appends: 0
+  fire_backpressure: 0
+  forced_drops: 0
+  relay_occupancy_mean: 0.0
+  relay_occupancy_max: 0
+  inflight_mean: 5.380952380952381
+  inflight_max: 49
+- seed: 7
+  ops_authored: 41
+  ops_fully_covered: 41
+  ops_missed: 0
+  t_full_ms:
+    mean: 1135.1948470731706
+    p95: 2156.1939620000003
+    max: 5309.774095
+  want_msgs: 8976
+  have_msgs: 13132
+  receives: 18841
+  redundant_receives: 16840
+  redundancy: 0.893795446101587
+  duplicate_replies: 9185
+  backfill_receives: 2001
+  drops: 3267
+  shed_appends: 0
+  fire_backpressure: 0
+  forced_drops: 0
+  relay_occupancy_mean: 0.0
+  relay_occupancy_max: 0
+  inflight_mean: 7.4
+  inflight_max: 43
+summary:
+  coverage_rate: 1.0
+  t_full_ms_mean:
+    mean: 1142.2322132275856
+    p95: 1632.7800807750002
+    max: 1632.7800807750002
+  t_full_ms_p95:
+    mean: 2716.624919875
+    p95: 4070.5833599999996
+    max: 4070.5833599999996
+  messages_per_op: 497.7814371257485
+  redundancy:
+    mean: 0.8841558847604293
+    p95: 0.8959394628814481
+    max: 0.8959394628814481
+  duplicate_replies_per_op: 202.61377245508982
+  drops: 3099.125
+  backpressure_events: 0.0
+  relay_occupancy_max: 0
+  inflight_max: 54
+sometimes:
+  loss_exercised: true
+  backfill_exercised: true
+  backpressure_exercised: false

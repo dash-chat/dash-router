@@ -24,7 +24,9 @@ use std::{
 };
 
 use anyhow::ensure;
-use dash_router_core::{Effect, Message, Op, RouterAction};
+use dash_router_core::{
+    EvictableStorage, LogRanges, NodeAction, NodeEffect, Op, RouterAction, Seq, WireBody,
+};
 use dash_router_net_model::Flight;
 use polestar::prelude::*;
 use rand::{Rng, SeedableRng};
@@ -100,7 +102,15 @@ impl Ord for Entry {
 #[derive(Clone, Debug)]
 enum Tag {
     Plumbing,
-    Recv { nonfresh_have: bool },
+    /// `is_have` distinguishes a Have receipt from a Want receipt (the wire
+    /// no longer marks a Have as fresh-vs-reply, so that finer split is
+    /// gone). `held_before` is the receiving node's router-held snapshot
+    /// just before this transition, for the growth check in `handle_fx`.
+    Recv {
+        to: NodeId,
+        is_have: bool,
+        held_before: LogRanges<LogId>,
+    },
     Append,
 }
 
@@ -113,6 +123,10 @@ pub struct SimBehavior {
     now: Duration,
     queue: BinaryHeap<Entry>,
     next_seq: u64,
+    /// Per-(node, log) next sequence number to author: `Authored` takes an
+    /// explicit seq, so this is the behavior's own bookkeeping of what
+    /// each writer has authored so far.
+    authored_seq: BTreeMap<(NodeId, LogId), Seq>,
     clocks: BTreeMap<NodeId, Duration>,
     known_inflight: Vec<Flight<NodeId, LogId>>,
     tags: VecDeque<Tag>,
@@ -135,6 +149,7 @@ impl SimBehavior {
             now: Duration::ZERO,
             queue: BinaryHeap::new(),
             next_seq: 0,
+            authored_seq: BTreeMap::new(),
             clocks: BTreeMap::new(),
             known_inflight: Vec::new(),
             tags: VecDeque::new(),
@@ -190,8 +205,8 @@ impl SimBehavior {
         actions: &mut Vec<SimNetAction>,
     ) -> (Duration, Option<Duration>, Option<Duration>) {
         let node = state.node(&n);
-        let want_rem = node.want_timer.as_ref().map(|t| *t.remaining);
-        let have_rem = node.have_timer.as_ref().map(|t| *t.remaining);
+        let want_rem = node.router.want_timer.as_ref().map(|t| *t.remaining);
+        let have_rem = node.router.have_timer.as_ref().map(|t| *t.remaining);
         let clock = self.clocks.entry(n).or_default();
         let mut dt = self.now.saturating_sub(*clock);
         for rem in [want_rem, have_rem].into_iter().flatten() {
@@ -199,7 +214,10 @@ impl SimBehavior {
         }
         if !dt.is_zero() {
             *clock += dt;
-            actions.push(SimNetAction::Node(n, RouterAction::Tick(dt.into())));
+            actions.push(SimNetAction::Node(
+                n,
+                NodeAction::Router(RouterAction::Tick(dt.into())),
+            ));
             self.tags.push_back(Tag::Plumbing);
         }
         (dt, want_rem.map(|r| r - dt), have_rem.map(|r| r - dt))
@@ -209,7 +227,7 @@ impl SimBehavior {
         let interval = self.params.want_policy.sample(&mut self.rng, self.params.n);
         actions.push(SimNetAction::Node(
             n,
-            RouterAction::ArmWantTimer(interval.into()),
+            NodeAction::Router(RouterAction::ArmWantTimer(interval.into())),
         ));
         self.tags.push_back(Tag::Plumbing);
         let due = self.clocks.get(&n).copied().unwrap_or_default() + interval;
@@ -220,11 +238,20 @@ impl SimBehavior {
         let interval = self.params.have_policy.sample(&mut self.rng, self.params.n);
         actions.push(SimNetAction::Node(
             n,
-            RouterAction::ArmHaveTimer(interval.into()),
+            NodeAction::Router(RouterAction::ArmHaveTimer(interval.into())),
         ));
         self.tags.push_back(Tag::Plumbing);
         let due = self.clocks.get(&n).copied().unwrap_or_default() + interval;
         self.schedule(due.max(self.now), Ev::FireHave(n));
+    }
+
+    /// The next sequence number to author for `(node, log)`, tracked here
+    /// since `NodeAction::Authored` takes an explicit seq.
+    fn next_authored_seq(&mut self, node: NodeId, log: LogId) -> Seq {
+        let counter = self.authored_seq.entry((node, log)).or_insert(0);
+        let seq = *counter;
+        *counter += 1;
+        seq
     }
 
     fn schedule_next_append(&mut self) {
@@ -261,10 +288,9 @@ impl SimBehavior {
             }
         }
         for flight in new {
-            match &flight.envelope.message {
-                Message::Want { .. } => self.metrics.want_msgs += 1,
-                Message::Have { fresh: true, .. } => self.metrics.have_fresh_msgs += 1,
-                Message::Have { fresh: false, .. } => self.metrics.have_nonfresh_msgs += 1,
+            match &flight.message.body {
+                WireBody::Want(_) => self.metrics.want_msgs += 1,
+                WireBody::Have(_) => self.metrics.have_msgs += 1,
             }
             let latency = self.params.latency.sample(&mut self.rng);
             let at = self.now + latency;
@@ -339,18 +365,18 @@ impl Behavior for SimBehavior {
                     .binary_search(&flight)
                     .map_err(|_| anyhow::anyhow!("scheduled flight not in flight: {flight:?}"))?;
                 let to = flight.to;
-                let is_want = matches!(flight.envelope.message, Message::Want { .. });
+                let is_want = matches!(flight.message.body, WireBody::Want(_));
+                let held_before = state.node(&to).router.held.clone();
                 self.advance(state, to, &mut actions);
                 actions.push(SimNetAction::Deliver(UpTo::new(idx)));
                 self.tags.push_back(Tag::Recv {
-                    nonfresh_have: matches!(
-                        flight.envelope.message,
-                        Message::Have { fresh: false, .. }
-                    ),
+                    to,
+                    is_have: !is_want,
+                    held_before,
                 });
                 // A witnessed Want is what makes arming the Have timer
                 // legal; do it in the same tick, right after the Recv.
-                if is_want && state.node(&to).have_timer.is_none() {
+                if is_want && state.node(&to).router.have_timer.is_none() {
                     self.arm_have(to, &mut actions);
                 }
             }
@@ -370,7 +396,10 @@ impl Behavior for SimBehavior {
                 match want_rem {
                     Some(rem) if rem.is_zero() => {
                         if self.headroom(state) >= self.degree(n) {
-                            actions.push(SimNetAction::Node(n, RouterAction::FireWant));
+                            actions.push(SimNetAction::Node(
+                                n,
+                                NodeAction::Router(RouterAction::FireWant),
+                            ));
                             self.tags.push_back(Tag::Plumbing);
                             self.arm_want(n, &mut actions);
                         } else {
@@ -391,13 +420,20 @@ impl Behavior for SimBehavior {
                 match have_rem {
                     Some(rem) if rem.is_zero() => {
                         if self.headroom(state) >= self.degree(n) {
-                            actions.push(SimNetAction::Node(n, RouterAction::FireHave));
+                            actions.push(SimNetAction::Node(
+                                n,
+                                NodeAction::Router(RouterAction::FireHave),
+                            ));
                             self.tags.push_back(Tag::Plumbing);
                             // Wants may still be outstanding — but only the
                             // ones that survive the tick we just proposed:
                             // arming with none witnessed is not enabled.
-                            let wants_survive =
-                                state.node(&n).wants.values().any(|r| dt < *r.ttl_left);
+                            let wants_survive = state
+                                .node(&n)
+                                .router
+                                .wants
+                                .values()
+                                .any(|r| dt < *r.ttl_left);
                             if wants_survive {
                                 self.arm_have(n, &mut actions);
                             }
@@ -418,7 +454,12 @@ impl Behavior for SimBehavior {
                     if self.headroom(state) >= self.degree(writer) {
                         self.advance(state, writer, &mut actions);
                         let op = self.op();
-                        actions.push(SimNetAction::Node(writer, RouterAction::Append(log, op)));
+                        let seq = self.next_authored_seq(writer, log);
+                        self.metrics.authored(log, seq, self.now);
+                        actions.push(SimNetAction::Node(
+                            writer,
+                            NodeAction::Authored(log, seq, op),
+                        ));
                         self.tags.push_back(Tag::Append);
                     } else {
                         self.metrics.shed_appends += 1;
@@ -428,7 +469,11 @@ impl Behavior for SimBehavior {
             }
 
             Ev::Sample => {
-                let usages: Vec<usize> = state.nodes.values().map(|n| n.relay_usage()).collect();
+                let usages: Vec<usize> = state
+                    .nodes
+                    .values()
+                    .map(|n| n.relay.0.usage() as usize)
+                    .collect();
                 let mean = usages.iter().sum::<usize>() as f64 / usages.len().max(1) as f64;
                 let max = usages.iter().copied().max().unwrap_or(0);
                 self.metrics
@@ -445,42 +490,50 @@ impl Behavior for SimBehavior {
     fn handle_fx(
         &mut self,
         state: &SimNetState,
-        fx: Vec<(NodeId, Effect<NodeId, LogId>)>,
-    ) -> anyhow::Result<Option<Vec<(NodeId, Effect<NodeId, LogId>)>>> {
+        fx: Vec<(NodeId, NodeEffect<NodeId, LogId>)>,
+    ) -> anyhow::Result<Option<Vec<(NodeId, NodeEffect<NodeId, LogId>)>>> {
         let tag = self.tags.pop_front();
         ensure!(
             tag.is_some(),
             "effects arrived with no proposed action to attribute them to"
         );
         match tag.unwrap() {
-            Tag::Recv { nonfresh_have } => {
+            Tag::Recv {
+                to,
+                is_have,
+                held_before,
+            } => {
                 self.metrics.receives += 1;
                 let mut taught = false;
                 for (node, effect) in &fx {
-                    match effect {
-                        Effect::Deliver(log, seq) => {
-                            taught = true;
-                            self.metrics.delivered(*node, *log, *seq, self.now);
-                        }
-                        Effect::Store(..) => taught = true,
-                        Effect::Send(_) => {}
+                    if let NodeEffect::Deliver(log, seq) = effect {
+                        taught = true;
+                        self.metrics.delivered(*node, *log, *seq, self.now);
                     }
+                }
+                // "Taught nothing" also covers state growth with no
+                // subscriber delivery: e.g. relay-only ingest of an
+                // unsubscribed log's bytes. `Deliver` only fires for novel
+                // subscribed data (Task 6 brief), so the held-ranges
+                // comparison is the only way to see that.
+                if !taught {
+                    let held_after = &state.node(&to).router.held;
+                    taught = !held_after.difference(&held_before).is_empty();
                 }
                 if !taught {
                     self.metrics.redundant_receives += 1;
-                    if nonfresh_have {
+                    if is_have {
                         self.metrics.duplicate_replies += 1;
                     }
-                } else if nonfresh_have {
+                } else if is_have {
                     self.metrics.backfill_receives += 1;
                 }
             }
             Tag::Append => {
-                for (_, effect) in &fx {
-                    if let Effect::Store(log, seq, _) = effect {
-                        self.metrics.authored(*log, *seq, self.now);
-                    }
-                }
+                // `metrics.authored` is recorded eagerly in `next_tick`,
+                // since `Authored` takes an explicit seq the behavior
+                // already knows — there is no `Effect::Store` to wait for
+                // anymore.
             }
             Tag::Plumbing => {}
         }
