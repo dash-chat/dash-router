@@ -25,6 +25,22 @@ Out of scope for this round: the `dash-router-p2panda` adapter's
 *implementation* (designed here at the interface level, §6.3, built when
 Dash Chat integration starts) and `dash-router-model-check`.
 
+**Inherited follow-ups from the pure-world final review** (this plan's
+scope, not optional): the eviction subsystem is currently unreachable at
+the composition level and must become real here — add an
+`EvictPayloads`-tier `NodeAction` (the payloads-first, headers-later GC
+from DESIGN.md), implement `eviction_candidates` (the pure policy over
+`held_payloads()` + router recency), give the sim a cap-pressure scenario
+with a realistic `relay_cap` and behavior proposals for
+`RelayEvict`/`NativeSync`/`AppGc`, and add the push-vs-pull propagation
+latency metric (separable at the action level even though the wire has no
+marker). Also on the table for this round: whether `Unsubscribe` should
+keep *wanting* an unsubscribed log's open tail (today it does — tested,
+documented — making the log a perpetual pull source into the capped relay
+until `AppGc`), and the shed-at-cap churn loop the spec now documents in
+§5 (a saturated relay Wants, receives, and re-sheds the same data each
+`have_ttl`).
+
 ## 2. The node task: one owner, pure transitions inside
 
 One tokio task owns everything mutable — no locks, no shared state. The
