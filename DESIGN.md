@@ -59,10 +59,6 @@ enum Message {
     Want(LogRanges),
     Have {
         ops: HaveOps,
-        /// Set true only by the author of the data immediately
-        // after creating it. A fresh Have is relayed
-        // immediately.
-        fresh: bool,
     }
 }
 
@@ -103,7 +99,7 @@ type Seq = u32;
 
 ## Sync Algorithm
 
-There are three cases of data being emitted and received by nodes: Wants, Fresh Haves, and Non-Fresh Haves.
+There are three cases of data being emitted and received by nodes: Wants, pushed Haves (authored data), and repair Haves (Want-triggered).
 
 Each node stores records of recent (TTL-backed) Wants and Haves from other nodes, which influences its own emission of Wants and Haves, as well as what each emitted Want or Have contains.
 (The record of a Have doesn't contain the op data, only the LogRanges.)
@@ -124,15 +120,13 @@ After each interval, the node calculates its next Want to send as follows:
 This accounts for the expectation that others' Wants will be responded to soon, while still requesting the portion that has not recently been requested.
 When other's wants' TTLs expire, it results in the next node to fire a Want re-including a request for that range to the network.
 
-### 2. Emitting Fresh Haves
+### 2. Emitting pushed Haves
 
-Whenever a node authors data, it emits a Fresh Have after a brief debounce, with the set of recently authored ops. All nodes who receive a Fresh Have immediately forward it on, and then store the contained ops.
+Authors emit a Have for newly authored ops after a brief debounce. The message carries no marker — receivers treat it identically to any other Have, relaying it under the same seen-set rules. This may create gaps that future Wants backfill.
 
-This may create gaps that need to be backfilled by future Wants, but it pushes the most recent data out efficiently.
+### 3. Emitting repair Haves
 
-### 3. Emitting Non-Fresh Haves
-
-Each node is also emitting Haves for non-fresh data at intervals, triggered by witnessing Wants from other nodes.
+Each node is also emitting Haves at intervals in response to Wants from other nodes.
 
 When a node sees a Want from another node, and is not already waiting to send its next Have, it chooses a random interval after which it will fire off a new Have.
 (This means that as long as a node sees no new Wants from other nodes, and does not author new data itself, it will never send a Have.)
