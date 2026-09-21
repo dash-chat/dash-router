@@ -211,3 +211,61 @@ fn ext_spontaneity_reconciles_and_smuggled_recvs_are_disabled() {
         .is_err()
     );
 }
+
+/// When relay and ext both hold a copy of the same (log, seq), SendHave
+/// hydration must prefer the payload-bearing copy: broadcasting the
+/// header-only one would degrade an op the node actually has in full.
+#[test]
+fn send_have_hydration_prefers_the_payload_bearing_copy() {
+    let m = machine();
+    let full = Op {
+        header: vec![1],
+        payload: Some(vec![1]),
+    };
+    let header_only = Op {
+        header: vec![1],
+        payload: None,
+    };
+
+    // Build the collision directly: ext holds the full op, relay holds a
+    // header-only copy of the very same (log, seq). States are plain
+    // values, so mutating the stores' `OpsMap`s directly (via the public
+    // `Storage` trait) is the simplest way to arrange this.
+    let mut s = NodeState::new(n(0), [l(0)]);
+    s.ext.0.ingest(l(0), 0, full.clone());
+    s.relay.0.ingest(l(0), 0, header_only);
+
+    // Reconcile the router's held snapshot against the stores we just
+    // mutated by hand (NativeSync-ing the same op again is idempotent).
+    let (s, _) = m
+        .transition(s, NodeAction::NativeSync(l(0), 0, full.clone()))
+        .unwrap();
+
+    // Force a SendHave via a Want/ArmHaveTimer/FireHave round trip. A
+    // RecvWant reaches the router only through NodeAction::Recv.
+    let (s, _) = m
+        .transition(
+            s,
+            NodeAction::Recv(WireMessage::want(n(1), lr([(0, Ranges::full())]))),
+        )
+        .unwrap();
+    let (s, _) = m
+        .transition(s, NodeAction::Router(RouterAction::ArmHaveTimer(t(0))))
+        .unwrap();
+    let (_, fx) = m
+        .transition(s, NodeAction::Router(RouterAction::FireHave))
+        .unwrap();
+
+    let broadcast = fx
+        .iter()
+        .find_map(|e| match e {
+            NodeEffect::Broadcast(w) => Some(w),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        broadcast.body,
+        WireBody::Have(vec![(l(0), vec![(0, full)])]),
+        "the richer copy must win, not whichever store sorted first"
+    );
+}
