@@ -13,6 +13,7 @@ serde = { workspace = true }
 rand = { workspace = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 trait-variant = "0.1"
+redb = "4.3.0"
 
 [dev-dependencies]
 proptest = { workspace = true }
