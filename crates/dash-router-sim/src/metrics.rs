@@ -33,12 +33,15 @@ pub struct Metrics {
     pub have_msgs: u64,
 
     pub receives: u64,
-    /// Receives that produced no Store and no Deliver: pure overhead.
+    /// Receives that produced no `NodeEffect::Deliver` and no growth of the
+    /// receiving node's `router.held` ranges: pure overhead.
     pub redundant_receives: u64,
-    /// Non-fresh Have receives that taught nothing: the NACK-implosion
-    /// signature (several nodes answered the same Want).
+    /// Have receives (any Have, not just replies — the wire no longer
+    /// marks fresh-vs-reply, see `have_msgs`) that taught nothing: the
+    /// NACK-implosion signature (several nodes answered the same Want).
     pub duplicate_replies: u64,
-    /// Non-fresh Have receives that *did* teach: repair working.
+    /// Have receives that *did* teach (a `Deliver` or `held` growth):
+    /// repair working.
     pub backfill_receives: u64,
 
     pub drops: u64,
