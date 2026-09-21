@@ -5,7 +5,10 @@
 //! scenario from `scenarios/example.yaml`); only the interval policies'
 //! `max_ms` vary. Each `min_ms` is held at the given value.
 
-use std::{path::PathBuf, sync::atomic::{AtomicUsize, Ordering}};
+use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use anyhow::Context;
 use clap::Parser;

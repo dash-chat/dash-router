@@ -46,7 +46,10 @@ fn main() -> anyhow::Result<()> {
             runs.push(record);
 
             let dot_path = args.out.join(format!("{name}.{seed:04}.topology.dot"));
-            std::fs::write(&dot_path, spec.topology(seed).to_dot(&format!("{name} seed {seed}")))?;
+            std::fs::write(
+                &dot_path,
+                spec.topology(seed).to_dot(&format!("{name} seed {seed}")),
+            )?;
         }
         let report = ScenarioReport::new(name.clone(), spec.clone(), runs);
         println!("{}", report.headline());

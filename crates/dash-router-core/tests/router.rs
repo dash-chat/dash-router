@@ -87,7 +87,10 @@ fn a_want_floods_once_per_hop_and_never_echoes() {
             ranges: full.clone(),
         })
         .unwrap();
-    assert!(sends_want(&fx).is_empty(), "repeated Want is not re-relayed");
+    assert!(
+        sends_want(&fx).is_empty(),
+        "repeated Want is not re-relayed"
+    );
 
     // Once the seen-set entry expires, the same Want floods again.
     b.step(A::Tick(t(2))).unwrap();
@@ -117,7 +120,10 @@ fn a_have_floods_once_and_accepts_only_novelty() {
         .unwrap();
     assert_eq!(
         fx,
-        vec![Effect::Accept(ranges.clone()), Effect::SendHave(ranges.clone())],
+        vec![
+            Effect::Accept(ranges.clone()),
+            Effect::SendHave(ranges.clone())
+        ],
         "novel ranges are accepted before being relayed"
     );
 
@@ -173,7 +179,10 @@ fn seen_set_records_expire_independently() {
             ranges: have(1),
         })
         .unwrap();
-    assert!(sends_have(&fx).is_empty(), "younger record still suppresses");
+    assert!(
+        sends_have(&fx).is_empty(),
+        "younger record still suppresses"
+    );
 }
 
 /// `Push` is storage telling the router "I now hold this too": `held` grows
