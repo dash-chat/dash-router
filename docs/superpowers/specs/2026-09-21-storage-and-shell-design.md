@@ -392,7 +392,7 @@ implements the same rows with `.await`s):
 | Trigger | Glue does |
 |---|---|
 | wire message arrives | parse; **park the op bytes**; feed router `RecvWant`/`RecvHave` (ranges only) |
-| router fx `Accept(ranges)` | split by `subscriptions`; ingest parked bytes → ext (subscribed, then emit `Deliver`) / relay (rest); run eviction policy if relay over cap |
+| router fx `Accept(ranges)` | ingest ALL parked bytes (not just accepted ones) → ext (subscribed) / relay (rest); idempotent ingest absorbs duplicates and payload upgrades, which are invisible to the router's ranges-level novelty check; `Deliver` for accepted ∩ subscribed; a relay ingest that would exceed the cap is shed (skipped) until eviction frees room |
 | router fx `SendWant(r)` | wrap as wire message, `Broadcast` |
 | router fx `SendHave(r)` | hydrate: `relay.fetch(r) ∪ ext.fetch(r)`; wrap, `Broadcast` |
 | any `HeldChanged` from either store | router `Held(relay.held ∪ ext.held ∪ empty-keys for subscriptions)` |
