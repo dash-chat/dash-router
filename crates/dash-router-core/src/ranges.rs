@@ -191,7 +191,17 @@ impl Ranges {
     }
 }
 
-/// Ranges across several logs. A log absent from the map has no ranges.
+/// Ranges across several logs. A log absent from the map is *unknown*; a log
+/// present with an empty [`Ranges`] value is *known but empty* — a marker
+/// meaning "this log exists and nothing is held/wanted/relayed for it,"
+/// distinct from not knowing about the log at all (e.g. a freshly-created
+/// log with no data yet still wants everything). Key presence therefore
+/// carries meaning independent of the value's emptiness: construction
+/// ([`Self::from_pairs`], [`Self::insert`]) and [`Self::union`] preserve
+/// marker keys, while the derived, wire-bound results of
+/// [`Self::intersection`] and [`Self::difference`] drop empty entries, since
+/// those represent "nothing to say about this log" rather than a knowledge
+/// marker.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LogRanges<L: Ord>(BTreeMap<L, Ranges>);
 
@@ -206,9 +216,10 @@ impl<L: Ord + Clone> LogRanges<L> {
         Self::default()
     }
 
-    /// Build from pairs, dropping empty ranges.
+    /// Build from pairs. A pair with an empty `Ranges` is kept as a
+    /// known-but-empty marker, not dropped.
     pub fn from_pairs(iter: impl IntoIterator<Item = (L, Ranges)>) -> Self {
-        Self(iter.into_iter().filter(|(_, r)| !r.is_empty()).collect())
+        Self(iter.into_iter().collect())
     }
 
     pub fn get(&self, log: &L) -> Option<&Ranges> {
@@ -219,22 +230,28 @@ impl<L: Ord + Clone> LogRanges<L> {
         self.0.iter()
     }
 
+    /// True when every known log maps to an empty range (vacuously true
+    /// when no logs are known at all). A `LogRanges` holding only
+    /// known-but-empty markers is still "empty" in this sense: there is
+    /// nothing to fetch, send or accept, even though logs are known.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.0.values().all(|r| r.is_empty())
     }
 
     pub fn contains(&self, log: &L, seq: Seq) -> bool {
         self.0.get(log).is_some_and(|r| r.contains(seq))
     }
 
+    /// Set `log`'s ranges, including an empty one: presence of the key is
+    /// itself meaningful (see the type doc), so an empty `ranges` is kept
+    /// as a known-but-empty marker rather than removing the key.
     pub fn insert(&mut self, log: L, ranges: Ranges) {
-        if ranges.is_empty() {
-            self.0.remove(&log);
-        } else {
-            self.0.insert(log, ranges);
-        }
+        self.0.insert(log, ranges);
     }
 
+    /// Keeps every key present in either operand, even where the merged
+    /// value is empty, so a known-but-empty marker in either side survives
+    /// (e.g. `held.union(&novel)` never loses a log's "known" status).
     pub fn union(&self, other: &Self) -> Self {
         let mut out = self.clone();
         for (log, r) in &other.0 {
@@ -247,23 +264,36 @@ impl<L: Ord + Clone> LogRanges<L> {
         out
     }
 
+    /// Only the logs present in both operands, with each empty result
+    /// dropped: this produces wire-bound content (what to send/accept),
+    /// where "nothing in common" must not be represented as a key.
     pub fn intersection(&self, other: &Self) -> Self {
-        Self::from_pairs(
+        Self(
             self.0
                 .iter()
-                .filter_map(|(log, r)| other.0.get(log).map(|o| (log.clone(), r.intersection(o)))),
+                .filter_map(|(log, r)| other.0.get(log).map(|o| (log.clone(), r.intersection(o))))
+                .filter(|(_, r)| !r.is_empty())
+                .collect(),
         )
     }
 
-    /// Everything in `self` not in `other`.
+    /// Everything in `self` not in `other`, with each empty result dropped
+    /// (see [`Self::intersection`] on why: this is derived, wire-bound
+    /// content, not a knowledge marker).
     pub fn difference(&self, other: &Self) -> Self {
-        Self::from_pairs(self.0.iter().map(|(log, r)| {
-            let d = match other.0.get(log) {
-                Some(o) => r.difference(o),
-                None => r.clone(),
-            };
-            (log.clone(), d)
-        }))
+        Self(
+            self.0
+                .iter()
+                .map(|(log, r)| {
+                    let d = match other.0.get(log) {
+                        Some(o) => r.difference(o),
+                        None => r.clone(),
+                    };
+                    (log.clone(), d)
+                })
+                .filter(|(_, r)| !r.is_empty())
+                .collect(),
+        )
     }
 }
 
@@ -297,6 +327,38 @@ mod tests {
     fn rejects_non_increasing() {
         assert!(Ranges::from_boundaries(vec![3, 3]).is_err());
         assert!(Ranges::from_boundaries(vec![5, 2]).is_err());
+    }
+
+    /// A `LogRanges` key with an empty value is a "known but empty" marker,
+    /// not the same as the key being absent: construction and `union`
+    /// preserve it, while `intersection`/`difference` (derived, wire-bound
+    /// content) still drop empty results as before.
+    #[test]
+    fn empty_valued_keys_are_preserved_by_construction_and_union() {
+        // from_pairs and insert keep an empty-valued key.
+        let known_empty: LogRanges<u8> = LogRanges::from_pairs([(1u8, Ranges::empty())]);
+        assert_eq!(known_empty.get(&1), Some(&Ranges::empty()));
+        let mut via_insert = LogRanges::empty();
+        via_insert.insert(1u8, Ranges::empty());
+        assert_eq!(via_insert, known_empty);
+
+        // union preserves a marker key from either side, even when the
+        // other side doesn't mention that log at all.
+        let other: LogRanges<u8> = LogRanges::from_pairs([(2u8, Ranges::from(0))]);
+        let merged = known_empty.union(&other);
+        assert_eq!(merged.get(&1), Some(&Ranges::empty()), "marker key from self survives");
+        assert_eq!(merged.get(&2), Some(&Ranges::from(0)), "other's key survives");
+
+        // A LogRanges holding only marker keys is still logically empty:
+        // nothing to fetch, send or accept, even though a log is known.
+        assert!(known_empty.is_empty());
+        assert!(!merged.is_empty(), "log 2 has real content");
+
+        // intersection/difference must not manufacture or keep empty
+        // entries: they represent "nothing to say," not a knowledge marker.
+        assert!(known_empty.intersection(&other).get(&1).is_none());
+        assert!(known_empty.difference(&other).get(&1).is_none());
+        assert!(other.difference(&known_empty).get(&1).is_none());
     }
 
     #[test]

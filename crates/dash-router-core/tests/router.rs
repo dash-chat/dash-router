@@ -217,15 +217,9 @@ fn a_held_snapshot_shrink_reopens_the_want() {
     assert_eq!(sends_want(&fx), vec![&lr([(0, Ranges::from(1))])]);
 }
 
-/// BLOCKED: per the brief, an empty-range key in `held` should mark a log as
-/// "known but empty," so it is wanted in full. `RouterState::wanted` already
-/// implements that (see `router.rs`), but `LogRanges::from_pairs`/`insert`
-/// (ranges.rs, from Task 1) drop empty-valued entries by construction, so no
-/// public API can currently produce such a `held`. This test documents the
-/// intended behaviour and is `#[ignore]`d until `LogRanges` gains a way to
-/// record a known-but-empty log; see task-2-report.md for detail.
+/// An empty-range key in `held` marks a log as "known but empty" (see
+/// `LogRanges`'s type doc in ranges.rs), so it is wanted in full.
 #[test]
-#[ignore = "needs LogRanges support for a known-but-empty log entry; see task-2-report.md"]
 fn an_empty_held_key_wants_the_whole_log() {
     let m = machine();
     let mut a = node(&m, 0, lr([(0, Ranges::empty())]));
