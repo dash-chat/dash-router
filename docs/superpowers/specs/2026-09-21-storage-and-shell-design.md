@@ -80,6 +80,16 @@ sender lacks" weakens from invariant to eventually-true; this is honest,
 because a router and a disk store genuinely are two components with a
 consistency boundary.
 
+The empty-range-key marker above only works because `LogRanges` itself
+treats key presence and value emptiness as separate axes: construction
+(`from_pairs`, `insert`) and `union` preserve an empty-valued key as a
+"known but empty" marker (so `held.union(&novel)` never loses a log's known
+status), while `intersection` and `difference` — which derive wire-bound
+content, i.e. what to actually send or accept — drop any key whose result is
+empty, since "nothing in common" or "nothing left" must not be represented
+as a key on the wire. `LogRanges::is_empty()` asks the value question only:
+true when every known key maps to an empty range, even if keys are present.
+
 ### 2.2 Actions
 
 ```rust
@@ -410,6 +420,18 @@ Invariant worth checking at this level: **`Subscribe`/`Unsubscribe` never
 change the router's `held`** — now true by construction (the router has no
 subscribe action), so the check is really that migration is range-preserving
 across the two stores.
+
+Shed-at-cap consequence: when a relay ingest is shed because it would exceed
+the cap, the router has already marked the *full* received range in
+`relayed_haves` — the relay decision is unconditional, upstream of storage.
+So for the remainder of that `have_ttl`, the node will not re-relay the
+truncated portion (it believes it already has), cannot answer a repair Want
+for it (storage doesn't have it), and will itself Want-receive-shed it again
+once the seen-set entry expires. Sustained cap pressure is therefore a churn
+loop, not a one-off drop: the same bytes arrive, get shed, and get
+re-requested on a cycle bounded by `have_ttl`. Breaking that loop — eviction
+policy, backpressure, or admission control under cap pressure — is follow-up
+work for the shell/sim plan (§9), not solved by the model as it stands.
 
 ## 6. Wire format
 
