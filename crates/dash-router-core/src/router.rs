@@ -79,8 +79,8 @@ pub struct RouterState<N: Ord, L: Ord, T> {
     pub held: LogRanges<L>,
     /// Recent Wants from other nodes.
     pub wants: BTreeMap<N, Record<L, T>>,
-    /// Recent Haves from other nodes, and this node's own last non-fresh Have
-    /// (keyed by its own id) so it does not repeat itself.
+    /// Recent Haves from other nodes, plus this node's own last Have
+    /// emission (keyed by its own id) for §3 suppression.
     pub haves: BTreeMap<N, Record<L, T>>,
     /// Have ranges this node has already flooded onward. This is the
     /// seen-set that terminates the flood: a node relays any given range at
