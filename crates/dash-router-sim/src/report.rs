@@ -49,10 +49,7 @@ impl ScenarioReport {
         let n = runs.len().max(1) as f64;
         let total_ops: u64 = runs.iter().map(|r| r.ops_authored).sum();
         let covered: u64 = runs.iter().map(|r| r.ops_fully_covered).sum();
-        let messages: u64 = runs
-            .iter()
-            .map(|r| r.want_msgs + r.have_fresh_msgs + r.have_nonfresh_msgs)
-            .sum();
+        let messages: u64 = runs.iter().map(|r| r.want_msgs + r.have_msgs).sum();
         let summary = Summary {
             coverage_rate: ratio(covered, total_ops),
             t_full_ms_mean: Stats::of(&runs.iter().map(|r| r.t_full_ms.mean).collect::<Vec<_>>()),

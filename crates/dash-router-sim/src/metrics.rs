@@ -26,8 +26,11 @@ pub struct Metrics {
     ops: BTreeMap<(LogId, u32), OpCoverage>,
 
     pub want_msgs: u64,
-    pub have_fresh_msgs: u64,
-    pub have_nonfresh_msgs: u64,
+    /// Have broadcasts, of any origin. The wire no longer marks a Have as
+    /// "fresh" (author-origin) vs. a periodic reply — that distinction was
+    /// dropped along with the storage-less router refactor — so this is a
+    /// single count where the old model split into two.
+    pub have_msgs: u64,
 
     pub receives: u64,
     /// Receives that produced no Store and no Deliver: pure overhead.
@@ -104,8 +107,7 @@ impl Metrics {
             ops_missed: authored - fully_covered,
             t_full_ms: Stats::of(&full_times),
             want_msgs: self.want_msgs,
-            have_fresh_msgs: self.have_fresh_msgs,
-            have_nonfresh_msgs: self.have_nonfresh_msgs,
+            have_msgs: self.have_msgs,
             receives: self.receives,
             redundant_receives: self.redundant_receives,
             redundancy: ratio(self.redundant_receives, self.receives),
@@ -175,8 +177,7 @@ pub struct RunRecord {
     /// Time from append to full coverage, over covered ops.
     pub t_full_ms: Stats,
     pub want_msgs: u64,
-    pub have_fresh_msgs: u64,
-    pub have_nonfresh_msgs: u64,
+    pub have_msgs: u64,
     pub receives: u64,
     pub redundant_receives: u64,
     pub redundancy: f64,

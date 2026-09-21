@@ -19,7 +19,8 @@ scenarios:
     # multi-hop repair no longer depends on ttl expiry. (An earlier,
     # non-flooding protocol starved here — kept above the interval floor
     # deliberately as a regression check on that.)
-    router: {{ want_ttl_ms: 800, have_ttl_ms: 800, relay_cap: 1048576 }}
+    router: {{ want_ttl_ms: 800, have_ttl_ms: 800 }}
+    storage: {{ relay_cap: 1048576 }}
     policy:
       want: {{ kind: density-scaled, min_ms: 400, max_ms: 900, ref_n: 10 }}
       have: {{ kind: fixed, min_ms: 30, max_ms: 120 }}
