@@ -525,6 +525,7 @@ dependencies = [
  "itertools",
  "num-traits",
  "rustversion",
+ "serde",
  "tracing",
 ]
 
