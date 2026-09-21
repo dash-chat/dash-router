@@ -35,6 +35,7 @@ use rand_chacha::ChaCha8Rng;
 
 use crate::{
     K, LogId, Metrics, NodeId, SimNet, SimNetAction, SimNetState,
+    metrics::HaveOrigin,
     policy::IntervalPolicy,
     scenario::{AppGcSpec, LatencySpec},
 };
@@ -117,12 +118,18 @@ enum Tag {
     /// no longer marks a Have as fresh-vs-reply, so that finer split is
     /// gone). `held_before` is the receiving node's router-held snapshot
     /// just before this transition, for the growth check in `handle_fx`.
+    /// `origin` is the Have-flight's push-vs-repair attribution (`None`
+    /// for Want receipts and out-of-band arrivals).
     Recv {
         to: NodeId,
         is_have: bool,
         held_before: LogRanges<LogId>,
+        origin: Option<HaveOrigin>,
     },
     Append,
+    /// A `RouterAction::FireHave` proposal: roots a repair-origin Have
+    /// flight.
+    FireHave,
 }
 
 /// The seeded discrete-event driver. See the [module docs](self).
@@ -143,6 +150,11 @@ pub struct SimBehavior {
     authored_ops: BTreeMap<(LogId, Seq), Op>,
     clocks: BTreeMap<NodeId, Duration>,
     known_inflight: Vec<Flight<NodeId, LogId>>,
+    /// Push-vs-repair attribution for in-flight Have messages, keyed by
+    /// flight identity. Populated when a new Have flight is observed
+    /// (`sync_inflight`), consumed on `Deliver`, and removed on both
+    /// `Deliver` and `Drop` to bound the map.
+    flight_origins: BTreeMap<Flight<NodeId, LogId>, HaveOrigin>,
     tags: VecDeque<Tag>,
     initialized: bool,
     append_count: u64,
@@ -167,6 +179,7 @@ impl SimBehavior {
             authored_ops: BTreeMap::new(),
             clocks: BTreeMap::new(),
             known_inflight: Vec::new(),
+            flight_origins: BTreeMap::new(),
             tags: VecDeque::new(),
             initialized: false,
             append_count: 0,
@@ -284,7 +297,7 @@ impl SimBehavior {
 
     /// Register flights the model created since we last looked, sampling
     /// each one's fate (latency, loss) and scheduling it.
-    fn sync_inflight(&mut self, state: &SimNetState) {
+    fn sync_inflight(&mut self, state: &SimNetState, origin: Option<HaveOrigin>) {
         // Sorted-multiset difference: state.inflight \ known_inflight.
         let mut new = Vec::new();
         let mut old = self.known_inflight.iter().peekable();
@@ -312,6 +325,11 @@ impl SimBehavior {
             match &flight.message.body {
                 WireBody::Want(_) => self.metrics.want_msgs += 1,
                 WireBody::Have(_) => self.metrics.have_msgs += 1,
+            }
+            if matches!(flight.message.body, WireBody::Have(_))
+                && let Some(o) = origin
+            {
+                self.flight_origins.entry(flight.clone()).or_insert(o);
             }
             let latency = self.params.latency.sample(&mut self.rng);
             let at = self.now + latency;
@@ -399,12 +417,14 @@ impl Behavior for SimBehavior {
                 let to = flight.to;
                 let is_want = matches!(flight.message.body, WireBody::Want(_));
                 let held_before = state.node(&to).router.held.clone();
+                let origin = self.flight_origins.remove(&flight);
                 self.advance(state, to, &mut actions);
                 actions.push(SimNetAction::Deliver(UpTo::new(idx)));
                 self.tags.push_back(Tag::Recv {
                     to,
                     is_have: !is_want,
                     held_before,
+                    origin,
                 });
                 // A witnessed Want is what makes arming the Have timer
                 // legal; do it in the same tick, right after the Recv.
@@ -419,6 +439,7 @@ impl Behavior for SimBehavior {
                     .binary_search(&flight)
                     .map_err(|_| anyhow::anyhow!("scheduled flight not in flight: {flight:?}"))?;
                 self.metrics.drops += 1;
+                self.flight_origins.remove(&flight);
                 actions.push(SimNetAction::Drop(UpTo::new(idx)));
                 self.tags.push_back(Tag::Plumbing);
             }
@@ -456,7 +477,7 @@ impl Behavior for SimBehavior {
                                 n,
                                 NodeAction::Router(RouterAction::FireHave),
                             ));
-                            self.tags.push_back(Tag::Plumbing);
+                            self.tags.push_back(Tag::FireHave);
                             // Wants may still be outstanding — but only the
                             // ones that survive the tick we just proposed:
                             // arming with none witnessed is not enabled.
@@ -583,7 +604,7 @@ impl Behavior for SimBehavior {
                             self.metrics.native_syncs += 1;
                             // Out-of-band arrival still counts as this node having the
                             // op: no NodeEffect::Deliver fires for a NativeSync.
-                            self.metrics.delivered(node, log, seq, self.now);
+                            self.metrics.delivered(node, log, seq, self.now, None);
                         }
                     }
                     self.schedule_next_native_sync();
@@ -632,18 +653,26 @@ impl Behavior for SimBehavior {
             tag.is_some(),
             "effects arrived with no proposed action to attribute them to"
         );
-        match tag.unwrap() {
+        let tag = tag.unwrap();
+        let ctx = match &tag {
+            Tag::Append => Some(HaveOrigin::Push),
+            Tag::FireHave => Some(HaveOrigin::Repair),
+            Tag::Recv { origin, .. } => *origin,
+            Tag::Plumbing => None,
+        };
+        match tag {
             Tag::Recv {
                 to,
                 is_have,
                 held_before,
+                origin,
             } => {
                 self.metrics.receives += 1;
                 let mut taught = false;
                 for (node, effect) in &fx {
                     if let NodeEffect::Deliver(log, seq) = effect {
                         taught = true;
-                        self.metrics.delivered(*node, *log, *seq, self.now);
+                        self.metrics.delivered(*node, *log, *seq, self.now, origin);
                     }
                 }
                 // "Taught nothing" also covers state growth with no
@@ -670,9 +699,10 @@ impl Behavior for SimBehavior {
                 // already knows — there is no `Effect::Store` to wait for
                 // anymore.
             }
+            Tag::FireHave => {}
             Tag::Plumbing => {}
         }
-        self.sync_inflight(state);
+        self.sync_inflight(state, ctx);
         Ok(None)
     }
 }

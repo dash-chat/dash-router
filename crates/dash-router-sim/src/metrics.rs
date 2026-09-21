@@ -9,6 +9,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{LogId, NodeId};
 
+/// How a Have flight came to exist: rooted in an author's push flood, or
+/// in a Want-triggered repair fire. Relays preserve the origin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HaveOrigin {
+    Push,
+    Repair,
+}
+
 /// Coverage bookkeeping for one authored op.
 #[derive(Clone, Debug)]
 struct OpCoverage {
@@ -55,6 +63,9 @@ pub struct Metrics {
     relay_samples: Vec<(f64, usize)>,
     inflight_samples: Vec<usize>,
 
+    push_latencies: Vec<f64>,
+    pull_latencies: Vec<f64>,
+
     pub payload_evictions: u64,
     pub full_evictions: u64,
     pub native_syncs: u64,
@@ -80,7 +91,14 @@ impl Metrics {
         );
     }
 
-    pub fn delivered(&mut self, node: NodeId, log: LogId, seq: u32, now: Duration) {
+    pub fn delivered(
+        &mut self,
+        node: NodeId,
+        log: LogId,
+        seq: u32,
+        now: Duration,
+        origin: Option<HaveOrigin>,
+    ) {
         let Some(expected) = self.expected.get(&log) else {
             return;
         };
@@ -88,7 +106,14 @@ impl Metrics {
             return;
         }
         if let Some(op) = self.ops.get_mut(&(log, seq)) {
-            op.covered.insert(node);
+            if op.covered.insert(node) {
+                let latency = (now - op.born).as_secs_f64() * 1000.0;
+                match origin {
+                    Some(HaveOrigin::Push) => self.push_latencies.push(latency),
+                    Some(HaveOrigin::Repair) => self.pull_latencies.push(latency),
+                    None => {}
+                }
+            }
             if op.full_at.is_none() && op.covered.len() >= expected.len() {
                 op.full_at = Some(now);
             }
@@ -144,6 +169,10 @@ impl Metrics {
             full_evictions: self.full_evictions,
             native_syncs: self.native_syncs,
             app_gc_runs: self.app_gc_runs,
+            push_deliveries: self.push_latencies.len() as u64,
+            pull_deliveries: self.pull_latencies.len() as u64,
+            t_push_ms: Stats::of(&self.push_latencies),
+            t_pull_ms: Stats::of(&self.pull_latencies),
         }
     }
 }
@@ -213,4 +242,8 @@ pub struct RunRecord {
     pub full_evictions: u64,
     pub native_syncs: u64,
     pub app_gc_runs: u64,
+    pub push_deliveries: u64,
+    pub pull_deliveries: u64,
+    pub t_push_ms: Stats,
+    pub t_pull_ms: Stats,
 }

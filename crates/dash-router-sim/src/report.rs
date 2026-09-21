@@ -35,6 +35,7 @@ pub struct Summary {
     pub backpressure_events: f64,
     pub relay_occupancy_max: usize,
     pub inflight_max: usize,
+    pub push_share: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -74,6 +75,10 @@ impl ScenarioReport {
                 .max()
                 .unwrap_or(0),
             inflight_max: runs.iter().map(|r| r.inflight_max).max().unwrap_or(0),
+            push_share: ratio(
+                runs.iter().map(|r| r.push_deliveries).sum(),
+                runs.iter().map(|r| r.push_deliveries + r.pull_deliveries).sum(),
+            ),
         };
         let sometimes = Sometimes {
             loss_exercised: runs.iter().any(|r| r.drops > 0),
