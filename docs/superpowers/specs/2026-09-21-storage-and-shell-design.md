@@ -219,18 +219,19 @@ pub trait EvictableStorage<L: Ord>: Storage<L> {
 
 Design notes, in anticipation of revision:
 
-- **The held queries are summary reads, not scans — that is a contract.**
-  Implementations are expected to maintain the ranges summary
-  incrementally (updated on every ingest/evict), so `held_of` is a lookup
-  and even `held_all` is O(size of the summary). The summary is small by
-  nature: `Ranges` grows with the number of *contiguous runs* (i.e. with
-  fragmentation), not with op count — a million-op log with no gaps is
-  one pair of numbers. A store that must scan to answer is a
-  non-conforming (but functional) implementation.
+- **The held queries impose no summary-maintenance contract.** A one-time
+  scan for `held_all` is acceptable (it runs at startup and on lost-hint
+  resync), and `held_of` may reasonably be a per-log scan too; an
+  incrementally maintained ranges summary is an optimization an
+  implementation may choose, not an obligation. The *result* is small
+  either way: `Ranges` grows with the number of contiguous runs (i.e.
+  with fragmentation), not with op count — a million-op gapless log is
+  one pair of numbers.
 - **`held_of` is the hot path; `held_all` is startup.** Change
   notifications carry the touched logs (§3.3), so steady-state
   reconciliation re-reads only those logs and patches the glue's per-log
-  cache; the full query runs once at startup and on lost-hint resync.
+  cache — the narrowing lives in the query shape and the caller's cache,
+  not in demands on the store.
 - **`fetch` is total, not fallible.** Absence is data (the protocol expects
   gaps); only the async mirror adds an error channel, for I/O failure.
 - **No `contains`/point queries.** Every consumer works in ranges; a point
