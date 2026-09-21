@@ -7,10 +7,12 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::ranges::{LogRanges, Ranges, Seq};
 
 /// One log entry. Both parts are opaque to relays.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Op {
     /// A relatively small blob, independently useful.
     pub header: Vec<u8>,

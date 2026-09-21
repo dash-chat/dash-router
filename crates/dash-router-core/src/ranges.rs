@@ -14,11 +14,13 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 /// Sequence number within a log.
 pub type Seq = u32;
 
 /// A set of contiguous, possibly open-ended, ranges of sequence numbers.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Ranges(Vec<Seq>);
 
 /// Boundaries were not strictly increasing.
@@ -190,7 +192,7 @@ impl Ranges {
 }
 
 /// Ranges across several logs. A log absent from the map has no ranges.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LogRanges<L: Ord>(BTreeMap<L, Ranges>);
 
 impl<L: Ord> Default for LogRanges<L> {
