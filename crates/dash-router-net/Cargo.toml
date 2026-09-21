@@ -1,0 +1,21 @@
+[package]
+name = "dash-router-net"
+description = "The tokio shell: a real Dash Router node over async storage and a LAN transport"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dash-router-core = { path = "../dash-router-core" }
+dash-router-policy = { path = "../dash-router-policy" }
+anyhow = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+rand = { workspace = true }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+trait-variant = "0.1"
+
+[dev-dependencies]
+proptest = { workspace = true }
+rand_chacha = { workspace = true }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "test-util"] }
+tempfile = "3"
