@@ -356,9 +356,30 @@ mod tests {
 
         // intersection/difference must not manufacture or keep empty
         // entries: they represent "nothing to say," not a knowledge marker.
+        // These first three are vacuous by disjointness (key 1 vs key 2) and
+        // prove only that no *new* key gets manufactured — not that a
+        // same-key empty result gets pruned. The cases below use the same
+        // key on both sides so the result is empty by actual cancellation.
         assert!(known_empty.intersection(&other).get(&1).is_none());
         assert!(known_empty.difference(&other).get(&1).is_none());
         assert!(other.difference(&known_empty).get(&1).is_none());
+
+        // Both sides mention key 1 with disjoint ranges: the intersection is
+        // empty by cancellation, not by absence, and must still be pruned.
+        let low: LogRanges<u8> = LogRanges::from_pairs([(1u8, Ranges::range(0, 2))]);
+        let high: LogRanges<u8> = LogRanges::from_pairs([(1u8, Ranges::range(5, 7))]);
+        assert!(
+            low.intersection(&high).get(&1).is_none(),
+            "same-key disjoint ranges intersect to nothing: key must be dropped, not kept as an empty marker"
+        );
+
+        // A difference that exactly empties a shared key must also drop it.
+        let whole: LogRanges<u8> = LogRanges::from_pairs([(1u8, Ranges::range(0, 5))]);
+        let same: LogRanges<u8> = LogRanges::from_pairs([(1u8, Ranges::range(0, 5))]);
+        assert!(
+            whole.difference(&same).get(&1).is_none(),
+            "subtracting everything held for a shared key must drop it, not keep an empty marker"
+        );
     }
 
     #[test]
