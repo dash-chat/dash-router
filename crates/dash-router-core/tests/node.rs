@@ -3,8 +3,8 @@
 //! wire. See task-4-brief.md.
 
 use dash_router_core::{
-    LogRanges, NodeAction, NodeEffect, NodeMachine, NodeState, Op, Ranges, RouterAction,
-    RouterConfig, Storage, Units, WireBody, WireMessage,
+    EvictableStorage, LogRanges, NodeAction, NodeEffect, NodeMachine, NodeState, Op, Ranges,
+    RouterAction, RouterConfig, Storage, Units, WireBody, WireMessage,
 };
 use polestar::{id::UpTo, prelude::*, time::FiniteTime};
 
@@ -174,8 +174,21 @@ fn relay_cap_sheds_then_eviction_reopens() {
         lr([(0, Ranges::from_seqs([0]))]),
         "second op shed"
     );
-    // The Have still floods in full: relaying is not conditioned on storing.
-    assert!(matches!(fx.last().unwrap(), NodeEffect::Broadcast(_)));
+    // The relay decision is unconditional (it does not check storage), but
+    // the re-broadcast is hydrated FROM storage, so the shed op is absent
+    // from it: only the stored op goes out, not both.
+    let broadcast = fx
+        .iter()
+        .find_map(|e| match e {
+            NodeEffect::Broadcast(w) => Some(w),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        broadcast.body,
+        WireBody::Have(vec![(l(0), vec![(0, full(1))])]),
+        "truncated broadcast: the shed op is dropped from the flood"
+    );
     let (s, _) = m
         .transition(
             s,
@@ -184,6 +197,92 @@ fn relay_cap_sheds_then_eviction_reopens() {
         .unwrap();
     assert!(s.relay.0.held_all().is_empty());
     assert_eq!(s.router.held, s.held_union(), "shrink reconciled");
+}
+
+/// Fix for the cap-arithmetic divergence: the glue's shed check must use the
+/// same delta the storage machine's own cap `ensure!` uses. At cap, a
+/// payload upgrade over a held header-only op costs only 1 unit (not 2, as
+/// if the slot were vacant), so it must fit and upgrade rather than being
+/// shed.
+#[test]
+fn relay_cap_upgrade_over_header_only_fits_within_the_true_delta() {
+    let m = tiny(2); // cap = 2 units
+    let mut s = NodeState::new(n(0), []); // pure relay, unsubscribed
+    let header_only = Op {
+        header: vec![1],
+        payload: None,
+    };
+    // Arrange the held-header-only state directly on storage, then
+    // reconcile the router's snapshot via a no-op evict (public API).
+    s.relay.0.ingest(l(0), 0, header_only);
+    let (s, _) = m
+        .transition(s, NodeAction::RelayEvict(LogRanges::empty()))
+        .unwrap();
+    assert_eq!(s.relay.0.usage(), 1, "header-only op costs 1 unit");
+
+    let full = Op {
+        header: vec![1],
+        payload: Some(vec![9]),
+    };
+    let (s, _) = m
+        .transition(
+            s,
+            NodeAction::Recv(WireMessage::have(n(1), vec![(l(0), vec![(0, full.clone())])])),
+        )
+        .unwrap();
+    assert_eq!(
+        s.relay.0.fetch(&s.relay.0.held_all()),
+        vec![(l(0), 0, full)],
+        "the 1-unit upgrade fits at cap 2 (1 held + 1 delta), so it must not be shed"
+    );
+}
+
+/// No test at any layer previously exercised `Unsubscribe`. Pins both halves
+/// of the current semantics (a controller ruling, not a behavior change):
+/// unsubscribing does not migrate or forget data, so the node keeps
+/// advertising what it already holds in `ext` AND keeps wanting the log's
+/// open tail.
+#[test]
+fn unsubscribe_keeps_advertising_and_keeps_wanting() {
+    let m = machine();
+    let s = NodeState::new(n(0), [l(0)]);
+    let op = Op {
+        header: vec![1],
+        payload: Some(vec![1]),
+    };
+    let (s, _) = m
+        .transition(s, NodeAction::Authored(l(0), 0, op))
+        .unwrap();
+
+    let (s, _) = m.transition(s, NodeAction::Unsubscribe(l(0))).unwrap();
+
+    // (a) keep advertising: `held` still contains the log's stored ranges.
+    assert!(
+        s.router.held.get(&l(0)).is_some_and(|r| r.contains(0)),
+        "unsubscribe must not stop advertising ext-held data (spec §5 option 1)"
+    );
+
+    // (b) keep wanting: the log's open tail is still armed/fired as a Want.
+    let (s, _) = m
+        .transition(s, NodeAction::Router(RouterAction::ArmWantTimer(t(0))))
+        .unwrap();
+    let (_, fx) = m
+        .transition(s, NodeAction::Router(RouterAction::FireWant))
+        .unwrap();
+    let want = fx
+        .iter()
+        .find_map(|e| match e {
+            NodeEffect::Broadcast(w) => Some(w),
+            _ => None,
+        })
+        .unwrap();
+    match &want.body {
+        WireBody::Want(ranges) => assert!(
+            ranges.get(&l(0)).is_some_and(|r| r.contains(1)),
+            "still wants the log's open tail after unsubscribe"
+        ),
+        other => panic!("expected a Want, got {other:?}"),
+    }
 }
 
 /// Native sync and AppGc reach the router as snapshots; direct router
@@ -202,13 +301,33 @@ fn ext_spontaneity_reconciles_and_smuggled_recvs_are_disabled() {
     assert!(!s.router.held.contains(&l(0), 0));
     assert!(
         m.transition(
-            s,
+            s.clone(),
             NodeAction::Router(RouterAction::RecvWant {
                 from: n(1),
                 ranges: lr([(0, Ranges::full())]),
             })
         )
         .is_err()
+    );
+    // `Held` and `Push` are equally the glue's business (reconcile_held /
+    // Authored are the only legitimate writers): a smuggled `Held` would
+    // desync `router.held` from storage, and a smuggled `Push` would grow
+    // `held` for data the node doesn't actually hold.
+    assert!(
+        m.transition(
+            s.clone(),
+            NodeAction::Router(RouterAction::Held(lr([(0, Ranges::full())])))
+        )
+        .is_err(),
+        "smuggled Held must be disabled"
+    );
+    assert!(
+        m.transition(
+            s,
+            NodeAction::Router(RouterAction::Push(lr([(0, Ranges::full())])))
+        )
+        .is_err(),
+        "smuggled Push must be disabled"
     );
 }
 

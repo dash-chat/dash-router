@@ -172,6 +172,11 @@ where
                     ),
                     "receiving is the node's business: use NodeAction::Recv"
                 );
+                ensure!(
+                    !matches!(a, RouterAction::Held(..) | RouterAction::Push(..)),
+                    "held/push are the node glue's business: reconcile_held/Authored are the \
+                     only legitimate writers, not a bare NodeAction::Router"
+                );
                 let fx = self.router_step(&mut s, a)?;
                 self.route_router_fx(&mut s, fx, &BTreeMap::new(), &mut out)?;
             }
@@ -300,7 +305,7 @@ where
             if s.subscriptions.contains(log) {
                 self.ext_step(s, ExtStoreAction::Ingest(*log, *seq, op.clone()))?;
             } else {
-                let units: Units = if op.payload.is_some() { 2 } else { 1 };
+                let units: Units = s.relay.0.ingest_delta(log, *seq, op);
                 if s.relay.0.usage() + units > self.relay.cap {
                     continue; // shed: no room, and no eviction happened yet
                 }
