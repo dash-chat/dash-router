@@ -392,3 +392,54 @@ fn send_have_hydration_prefers_the_payload_bearing_copy() {
         "the richer copy must win, not whichever store sorted first"
     );
 }
+
+/// Payload eviction is reachable from the node level: candidates spare
+/// recently-wanted ranges, evicting frees units, headers keep advertising.
+#[test]
+fn relay_evict_payloads_frees_units_and_keeps_advertising() {
+    let m = machine();
+    let s = NodeState::new(n(0), std::iter::empty()); // no subscriptions: bytes land in the relay
+    let op = |h: u8| Op {
+        header: vec![h],
+        payload: Some(vec![h; 4]),
+    };
+    let have = WireMessage::have(n(1), vec![(l(1), vec![(0, op(10)), (1, op(11))])]);
+    let (s, _) = m.transition(s, NodeAction::Recv(have)).unwrap();
+    assert_eq!(s.relay.0.usage(), 4);
+
+    // Peer 2 wants seq 0: its payload must survive to answer the Want.
+    let want = WireMessage::want(n(2), lr([(1, Ranges::range(0, 1))]));
+    let (s, _) = m.transition(s, NodeAction::Recv(want)).unwrap();
+    let candidates = s.eviction_candidates();
+    assert_eq!(
+        candidates,
+        lr([(1, Ranges::range(1, 2))]),
+        "the wanted seq 0 is spared; only seq 1's payload is a candidate"
+    );
+
+    let (s, fx) = m
+        .transition(s, NodeAction::RelayEvictPayloads(candidates))
+        .unwrap();
+    assert!(fx.is_empty(), "headers survive: nothing broadcast or delivered");
+    assert_eq!(s.relay.0.usage(), 3, "one payload unit freed");
+    assert_eq!(s.relay.0.held_payloads(), lr([(1, Ranges::range(0, 1))]));
+    assert_eq!(
+        s.router.held.get(&l(1)),
+        Some(&Ranges::range(0, 2)),
+        "both seqs still advertised (headers held)"
+    );
+}
+
+/// With no outstanding Wants, every relay payload is a candidate.
+#[test]
+fn eviction_candidates_cover_everything_when_nothing_is_wanted() {
+    let m = machine();
+    let s = NodeState::new(n(0), std::iter::empty());
+    let op = Op {
+        header: vec![9],
+        payload: Some(vec![9]),
+    };
+    let have = WireMessage::have(n(1), vec![(l(0), vec![(0, op)])]);
+    let (s, _) = m.transition(s, NodeAction::Recv(have)).unwrap();
+    assert_eq!(s.eviction_candidates(), s.relay.0.held_payloads());
+}

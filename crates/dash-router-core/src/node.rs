@@ -79,6 +79,11 @@ impl<N: Id, L: Id, T: polestar::time::TimeInterval> NodeState<N, L, T> {
     pub fn holds(&self, log: &L, seq: Seq) -> bool {
         self.ext.0.held_all().contains(log, seq) || self.relay.0.held_all().contains(log, seq)
     }
+
+    /// See [`eviction_candidates`].
+    pub fn eviction_candidates(&self) -> LogRanges<L> {
+        eviction_candidates(&self.relay.0.held_payloads(), &self.router.others_wants())
+    }
 }
 
 impl<N: Id, L: Id + Default, T: polestar::time::TimeInterval> NodeState<N, L, T> {
@@ -117,6 +122,10 @@ pub enum NodeAction<N, L: Ord, T> {
     /// The relay evicted to reclaim space; nondeterministic in the model,
     /// policy lives in the simulator.
     RelayEvict(LogRanges<L>),
+    /// The relay dropped payloads (keeping headers) to reclaim space:
+    /// DESIGN.md's payloads-first GC stage. Policy lives above the machine
+    /// ([`eviction_candidates`]); the model takes the ranges as an action.
+    RelayEvictPayloads(LogRanges<L>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -148,6 +157,17 @@ fn ranges_of<L: Ord + Clone>(parked: &BTreeMap<(L, Seq), Op>) -> LogRanges<L> {
             .into_iter()
             .map(|(log, seqs)| (log, Ranges::from_seqs(seqs))),
     )
+}
+
+/// Payload-eviction candidates: relay payloads nobody currently wants
+/// (DESIGN.md's payloads-first GC). Evicting a wanted payload would force
+/// the network to re-send it, so recent Wants are spared. Pure policy,
+/// shared verbatim by the model composition and the tokio shell.
+pub fn eviction_candidates<L: Id>(
+    relay_held_payloads: &LogRanges<L>,
+    others_wants: &LogRanges<L>,
+) -> LogRanges<L> {
+    relay_held_payloads.difference(others_wants)
 }
 
 impl<N, L, T> Machine for NodeMachine<N, L, T>
@@ -242,6 +262,10 @@ where
             }
             NodeAction::RelayEvict(ranges) => {
                 self.relay_step(&mut s, RelayStoreAction::Evict(ranges))?;
+                self.reconcile_held(&mut s)?;
+            }
+            NodeAction::RelayEvictPayloads(ranges) => {
+                self.relay_step(&mut s, RelayStoreAction::EvictPayloads(ranges))?;
                 self.reconcile_held(&mut s)?;
             }
         }
