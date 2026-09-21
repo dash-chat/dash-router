@@ -277,7 +277,11 @@ where
         Ok(())
     }
 
-    fn ext_step(&self, s: &mut NodeState<N, L, T>, action: ExtStoreAction<L>) -> anyhow::Result<()> {
+    fn ext_step(
+        &self,
+        s: &mut NodeState<N, L, T>,
+        action: ExtStoreAction<L>,
+    ) -> anyhow::Result<()> {
         let ext = s.ext.clone();
         let (ext, _fx) = self.ext.transition(ext, action)?;
         s.ext = ext;

@@ -63,7 +63,10 @@ fn recv_have_routes_bytes_delivers_and_rebroadcasts_hydrated() {
     };
     let wire = WireMessage::have(
         n(1),
-        vec![(l(0), vec![(0, op0.clone())]), (l(1), vec![(0, op1.clone())])],
+        vec![
+            (l(0), vec![(0, op0.clone())]),
+            (l(1), vec![(0, op1.clone())]),
+        ],
     );
     let (s, fx) = m.transition(s, NodeAction::Recv(wire)).unwrap();
 
@@ -147,7 +150,10 @@ fn subscribe_migrates_and_preserves_held() {
         vec![(l(1), 0, op)],
         "bytes moved"
     );
-    assert_eq!(s.router.held, held_before, "spec §5: migration never changes held");
+    assert_eq!(
+        s.router.held, held_before,
+        "spec §5: migration never changes held"
+    );
     assert!(fx.is_empty(), "no traffic from a subscription change");
 }
 
@@ -190,10 +196,7 @@ fn relay_cap_sheds_then_eviction_reopens() {
         "truncated broadcast: the shed op is dropped from the flood"
     );
     let (s, _) = m
-        .transition(
-            s,
-            NodeAction::RelayEvict(lr([(0, Ranges::from_seqs([0]))])),
-        )
+        .transition(s, NodeAction::RelayEvict(lr([(0, Ranges::from_seqs([0]))])))
         .unwrap();
     assert!(s.relay.0.held_all().is_empty());
     assert_eq!(s.router.held, s.held_union(), "shrink reconciled");
@@ -227,7 +230,10 @@ fn relay_cap_upgrade_over_header_only_fits_within_the_true_delta() {
     let (s, _) = m
         .transition(
             s,
-            NodeAction::Recv(WireMessage::have(n(1), vec![(l(0), vec![(0, full.clone())])])),
+            NodeAction::Recv(WireMessage::have(
+                n(1),
+                vec![(l(0), vec![(0, full.clone())])],
+            )),
         )
         .unwrap();
     assert_eq!(
@@ -250,9 +256,7 @@ fn unsubscribe_keeps_advertising_and_keeps_wanting() {
         header: vec![1],
         payload: Some(vec![1]),
     };
-    let (s, _) = m
-        .transition(s, NodeAction::Authored(l(0), 0, op))
-        .unwrap();
+    let (s, _) = m.transition(s, NodeAction::Authored(l(0), 0, op)).unwrap();
 
     let (s, _) = m.transition(s, NodeAction::Unsubscribe(l(0))).unwrap();
 

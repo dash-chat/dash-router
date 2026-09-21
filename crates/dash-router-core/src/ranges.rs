@@ -346,8 +346,16 @@ mod tests {
         // other side doesn't mention that log at all.
         let other: LogRanges<u8> = LogRanges::from_pairs([(2u8, Ranges::from(0))]);
         let merged = known_empty.union(&other);
-        assert_eq!(merged.get(&1), Some(&Ranges::empty()), "marker key from self survives");
-        assert_eq!(merged.get(&2), Some(&Ranges::from(0)), "other's key survives");
+        assert_eq!(
+            merged.get(&1),
+            Some(&Ranges::empty()),
+            "marker key from self survives"
+        );
+        assert_eq!(
+            merged.get(&2),
+            Some(&Ranges::from(0)),
+            "other's key survives"
+        );
 
         // A LogRanges holding only marker keys is still logically empty:
         // nothing to fetch, send or accept, even though a log is known.

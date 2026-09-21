@@ -116,13 +116,16 @@ pub fn run_grid(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     done.sort_by(|a, b| {
-        (a.want_max_ms, a.have_max_ms).partial_cmp(&(b.want_max_ms, b.have_max_ms)).unwrap()
+        (a.want_max_ms, a.have_max_ms)
+            .partial_cmp(&(b.want_max_ms, b.have_max_ms))
+            .unwrap()
     });
     Ok(done)
 }
 
 pub fn to_csv(cells: &[Cell]) -> String {
-    let mut out = String::from("want_max_ms,have_max_ms,messages_per_op,coverage_rate,t_full_ms_p95\n");
+    let mut out =
+        String::from("want_max_ms,have_max_ms,messages_per_op,coverage_rate,t_full_ms_p95\n");
     for c in cells {
         out.push_str(&format!(
             "{},{},{:.3},{:.4},{:.1}\n",
@@ -137,7 +140,11 @@ pub fn to_csv(cells: &[Cell]) -> String {
 pub fn to_html(grid: &Grid, cells: &[Cell], title: &str) -> String {
     let xs: Vec<String> = grid.want_max_ms.iter().map(|v| format!("{v}")).collect();
     let ys: Vec<String> = grid.have_max_ms.iter().map(|v| format!("{v}")).collect();
-    let lookup = |w: f64, h: f64| cells.iter().find(|c| c.want_max_ms == w && c.have_max_ms == h);
+    let lookup = |w: f64, h: f64| {
+        cells
+            .iter()
+            .find(|c| c.want_max_ms == w && c.have_max_ms == h)
+    };
     let z: Vec<Vec<Option<f64>>> = grid
         .have_max_ms
         .iter()

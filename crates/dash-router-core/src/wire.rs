@@ -3,7 +3,10 @@
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::{op::Op, ranges::{LogRanges, Seq}};
+use crate::{
+    op::Op,
+    ranges::{LogRanges, Seq},
+};
 
 /// Bump together with the gossip topic on breaking change.
 pub const WIRE_VERSION: u8 = 0;
@@ -26,11 +29,19 @@ pub enum WireBody<L: Ord> {
 
 impl<N: Serialize + DeserializeOwned, L: Ord + Serialize + DeserializeOwned> WireMessage<N, L> {
     pub fn want(sender: N, ranges: LogRanges<L>) -> Self {
-        Self { version: WIRE_VERSION, sender, body: WireBody::Want(ranges) }
+        Self {
+            version: WIRE_VERSION,
+            sender,
+            body: WireBody::Want(ranges),
+        }
     }
 
     pub fn have(sender: N, ops: Vec<(L, Vec<(Seq, Op)>)>) -> Self {
-        Self { version: WIRE_VERSION, sender, body: WireBody::Have(ops) }
+        Self {
+            version: WIRE_VERSION,
+            sender,
+            body: WireBody::Have(ops),
+        }
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -39,7 +50,11 @@ impl<N: Serialize + DeserializeOwned, L: Ord + Serialize + DeserializeOwned> Wir
 
     pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
         let msg: Self = postcard::from_bytes(bytes)?;
-        anyhow::ensure!(msg.version == WIRE_VERSION, "unknown wire version {}", msg.version);
+        anyhow::ensure!(
+            msg.version == WIRE_VERSION,
+            "unknown wire version {}",
+            msg.version
+        );
         Ok(msg)
     }
 }
@@ -47,17 +62,27 @@ impl<N: Serialize + DeserializeOwned, L: Ord + Serialize + DeserializeOwned> Wir
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{op::Op, ranges::{LogRanges, Ranges}};
+    use crate::{
+        op::Op,
+        ranges::{LogRanges, Ranges},
+    };
 
     #[test]
     fn wire_messages_round_trip_and_reject_unknown_versions() {
-        let want: WireMessage<u32, u8> = WireMessage::want(
-            7,
-            LogRanges::from_pairs([(1u8, Ranges::from(3))]),
-        );
+        let want: WireMessage<u32, u8> =
+            WireMessage::want(7, LogRanges::from_pairs([(1u8, Ranges::from(3))]));
         let have: WireMessage<u32, u8> = WireMessage::have(
             7,
-            vec![(1u8, vec![(0, Op { header: vec![9], payload: Some(vec![9, 9]) })])],
+            vec![(
+                1u8,
+                vec![(
+                    0,
+                    Op {
+                        header: vec![9],
+                        payload: Some(vec![9, 9]),
+                    },
+                )],
+            )],
         );
         for msg in [want, have] {
             let bytes = msg.encode();

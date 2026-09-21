@@ -153,8 +153,11 @@ fn a_dropped_flood_is_backfilled_by_want_then_have() {
 
     // 2 asks for everything it lacks; 1 hears it and floods it onward,
     // which is how a Want crosses hops the asker cannot reach.
-    net.step(A::Node(n(2), NodeAction::Router(RouterAction::ArmWantTimer(t(0)))))
-        .unwrap();
+    net.step(A::Node(
+        n(2),
+        NodeAction::Router(RouterAction::ArmWantTimer(t(0))),
+    ))
+    .unwrap();
     net.step(A::Node(n(2), NodeAction::Router(RouterAction::FireWant)))
         .unwrap();
     net.step(A::Deliver(i(0))).unwrap();
@@ -165,8 +168,11 @@ fn a_dropped_flood_is_backfilled_by_want_then_have() {
     );
 
     // 1 answers with a non-fresh Have, heard by both neighbours.
-    net.step(A::Node(n(1), NodeAction::Router(RouterAction::ArmHaveTimer(t(0)))))
-        .unwrap();
+    net.step(A::Node(
+        n(1),
+        NodeAction::Router(RouterAction::ArmHaveTimer(t(0))),
+    ))
+    .unwrap();
     net.step(A::Node(n(1), NodeAction::Router(RouterAction::FireHave)))
         .unwrap();
     assert_eq!(net.inflight.len(), 4);
@@ -243,10 +249,7 @@ fn absent_messages_and_smuggled_recvs_are_disabled() {
 #[test]
 fn the_fair_wrapper_bounds_consecutive_drops() {
     let m = Arc::new(Fair::new(
-        NetMachine::<N, L, T, K>::new(
-            Topology::star([n(0), n(1), n(2), n(3)]),
-            node_machine(),
-        ),
+        NetMachine::<N, L, T, K>::new(Topology::star([n(0), n(1), n(2), n(3)]), node_machine()),
         |a| matches!(a, A::Drop(_)),
         |a| matches!(a, A::Deliver(_)),
         2,
