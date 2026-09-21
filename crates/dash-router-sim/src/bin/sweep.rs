@@ -91,6 +91,7 @@ fn base(args: &Args) -> ScenarioSpec {
             writers: 4,
             appends_per_sec: 2.0,
             payload_bytes: 64,
+            subscribers: None,
         },
         seeds: Some(args.seeds),
         duration_ms: Some(args.duration_ms),

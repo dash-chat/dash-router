@@ -80,6 +80,47 @@ fn identical_seeds_reproduce_identical_runs() {
     assert_ne!(a, c, "different seeds should diverge");
 }
 
+/// With `subscribers: k`, log w is subscribed by nodes (w + i) % nodes for
+/// i in 0..k, coverage counts only those subscribers (minus the author),
+/// and unsubscribed traffic finally lands in relay stores.
+#[test]
+fn partial_subscription_exercises_the_relay_path() {
+    let yaml = r#"
+defaults: { seeds: 1, duration_ms: 3000 }
+scenarios:
+  partial:
+    nodes: 6
+    topology: { kind: path }
+    loss: 0.0
+    latency_ms: { distribution: uniform, min_ms: 1, max_ms: 3 }
+    router: { want_ttl_ms: 500, have_ttl_ms: 500 }
+    storage: { relay_cap: 1048576 }
+    policy:
+      want: { kind: fixed, min_ms: 100, max_ms: 200 }
+      have: { kind: fixed, min_ms: 20, max_ms: 60 }
+    workload: { writers: 2, appends_per_sec: 4.0, subscribers: 2 }
+"#;
+    let config = dash_router_sim::Config::from_yaml(yaml).unwrap();
+    let spec = &config.scenarios["partial"];
+
+    // Log 0: author node 0, subscribers {0, 1}; expected coverage {1}.
+    let expected = spec.expected_coverage();
+    assert_eq!(
+        expected[&0],
+        std::collections::BTreeSet::from([1u32]),
+        "author excluded from its own log's expected set"
+    );
+    assert_eq!(expected[&1], std::collections::BTreeSet::from([2u32]));
+
+    let mut sim = spec.build(0, &config.defaults).unwrap();
+    let record = sim.run(0).unwrap();
+    assert_eq!(record.ops_missed, 0, "subscribers still fully covered");
+    assert!(
+        record.relay_occupancy_max > 0,
+        "unsubscribed nodes hold relayed bytes: the relay path is live"
+    );
+}
+
 #[test]
 fn jump_to_replays_to_the_same_state() {
     let config = config(0.1, 5, 1_500);
