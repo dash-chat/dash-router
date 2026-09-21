@@ -20,9 +20,9 @@ struct OpCoverage {
 /// Live collectors, updated by the behavior as effects flow past.
 #[derive(Clone, Debug, Default)]
 pub struct Metrics {
-    /// Nodes that must deliver an op for it to count as fully covered
-    /// (everyone but the author).
-    expected_coverage: usize,
+    /// Per-log coverage targets: the subscriber set (minus the author) that
+    /// must deliver an op for it to count as fully covered.
+    expected: BTreeMap<LogId, BTreeSet<NodeId>>,
     ops: BTreeMap<(LogId, u32), OpCoverage>,
 
     pub want_msgs: u64,
@@ -57,9 +57,9 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    pub fn new(nodes: usize) -> Self {
+    pub fn new(expected: BTreeMap<LogId, BTreeSet<NodeId>>) -> Self {
         Self {
-            expected_coverage: nodes.saturating_sub(1),
+            expected,
             ..Default::default()
         }
     }
@@ -76,9 +76,15 @@ impl Metrics {
     }
 
     pub fn delivered(&mut self, node: NodeId, log: LogId, seq: u32, now: Duration) {
+        let Some(expected) = self.expected.get(&log) else {
+            return;
+        };
+        if !expected.contains(&node) {
+            return;
+        }
         if let Some(op) = self.ops.get_mut(&(log, seq)) {
             op.covered.insert(node);
-            if op.full_at.is_none() && op.covered.len() >= self.expected_coverage {
+            if op.full_at.is_none() && op.covered.len() >= expected.len() {
                 op.full_at = Some(now);
             }
         }

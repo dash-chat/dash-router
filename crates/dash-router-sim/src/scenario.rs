@@ -6,7 +6,10 @@
 //! *driver*: what gets delivered when, what gets lost, what intervals get
 //! sampled, who appends and how often.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use anyhow::{Context, ensure};
 use dash_router_core::{NodeMachine, NodeState, RouterConfig, Units};
@@ -144,6 +147,11 @@ pub struct WorkloadSpec {
     pub appends_per_sec: f64,
     #[serde(default = "default_payload")]
     pub payload_bytes: usize,
+    /// Nodes subscribed per log: log `w` (authored by node `w`) is subscribed
+    /// by nodes `(w + i) % nodes` for `i in 0..subscribers`. `None` = every
+    /// node subscribes to every log (the original shape).
+    #[serde(default)]
+    pub subscribers: Option<u32>,
 }
 
 fn default_payload() -> usize {
@@ -166,31 +174,17 @@ impl ScenarioSpec {
             "more writers than nodes"
         );
         ensure!(self.workload.writers >= 1, "need at least one writer");
-        // The coverage metric counts subscriber deliveries and assumes
-        // `expected_coverage = nodes - 1`, i.e. every node subscribes to
-        // every writer's log. `build` below subscribes every node to the
-        // full `0..writers` log set unconditionally — this scenario shape
-        // has no knob for a narrower subscription — so the invariant holds
-        // by construction, and there is no per-scenario data to check
-        // beyond `writers <= nodes` above. Assert `full_subscription()`
-        // explicitly (rather than relying on that comment) so a future
-        // per-node subscription knob fails this loudly instead of quietly
-        // corrupting the metric.
-        ensure!(
-            self.full_subscription(),
-            "subscriber-coverage metric requires every node to subscribe to every writer's log"
-        );
+        if let Some(k) = self.workload.subscribers {
+            ensure!(
+                k >= 2,
+                "need at least 2 subscribers per log: with only the author, the coverage metric is vacuous"
+            );
+            ensure!(k <= self.nodes, "more subscribers than nodes");
+        }
         if let LatencySpec::LogNormal { median_ms, sigma } = &self.latency_ms {
             ensure!(*median_ms > 0.0 && *sigma >= 0.0, "bad log-normal latency");
         }
         Ok(())
-    }
-
-    /// Whether this scenario shape subscribes every node to every writer's
-    /// log, as `build` constructs it — the invariant `expected_coverage =
-    /// nodes - 1` relies on.
-    fn full_subscription(&self) -> bool {
-        (self.workload.writers as u32) <= self.nodes
     }
 
     pub fn topology(&self, seed: u64) -> Topology<NodeId> {
@@ -227,8 +221,14 @@ impl ScenarioSpec {
         };
         let node_machine = NodeMachine::new(router_config, self.storage.relay_cap);
         let logs: Vec<LogId> = (0..self.workload.writers).collect();
-        let state =
-            SimNetState::new((0..self.nodes).map(|id| NodeState::new(id, logs.iter().copied())));
+        let state = SimNetState::new((0..self.nodes).map(|id| {
+            let subs: Vec<LogId> = logs
+                .iter()
+                .copied()
+                .filter(|&log| self.subscribers_of(log).contains(&id))
+                .collect();
+            NodeState::new(id, subs)
+        }));
         let params = SimParams {
             n: self.nodes as usize,
             loss: self.loss,
@@ -240,6 +240,7 @@ impl ScenarioSpec {
             payload_bytes: self.workload.payload_bytes,
             duration,
             sample_interval: ms(defaults.sample_interval_ms),
+            expected: self.expected_coverage(),
         };
         ensure!(
             topology.nodes().count() == self.nodes as usize,
@@ -252,6 +253,24 @@ impl ScenarioSpec {
 
     pub fn seeds(&self, defaults: &Defaults) -> u64 {
         self.seeds.unwrap_or(defaults.seeds)
+    }
+
+    /// The nodes subscribed to `log` (always includes the author, node `log`).
+    pub fn subscribers_of(&self, log: LogId) -> BTreeSet<NodeId> {
+        let k = self.workload.subscribers.unwrap_or(self.nodes);
+        (0..k).map(|i| (log as NodeId + i) % self.nodes).collect()
+    }
+
+    /// Per-log coverage targets: each log's subscribers minus its author
+    /// (`Deliver` never fires for a node's own authored data).
+    pub fn expected_coverage(&self) -> BTreeMap<LogId, BTreeSet<NodeId>> {
+        (0..self.workload.writers)
+            .map(|log| {
+                let mut subs = self.subscribers_of(log);
+                subs.remove(&(log as NodeId));
+                (log, subs)
+            })
+            .collect()
     }
 }
 

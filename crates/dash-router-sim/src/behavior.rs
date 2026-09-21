@@ -19,7 +19,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap, VecDeque},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
     time::Duration,
 };
 
@@ -55,6 +55,7 @@ pub struct SimParams {
     pub payload_bytes: usize,
     pub duration: Duration,
     pub sample_interval: Duration,
+    pub expected: BTreeMap<LogId, BTreeSet<NodeId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -141,7 +142,7 @@ impl SimBehavior {
         params: SimParams,
         seed: u64,
     ) -> Self {
-        let metrics = Metrics::new(params.n);
+        let metrics = Metrics::new(params.expected.clone());
         Self {
             topology,
             params,
