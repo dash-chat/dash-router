@@ -8,7 +8,7 @@ use crate::{op::Op, ranges::{LogRanges, Seq}};
 /// Bump together with the gossip topic on breaking change.
 pub const WIRE_VERSION: u8 = 0;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct WireMessage<N, L: Ord> {
     pub version: u8,
     /// Gossip strips the transport sender; we carry our own.
@@ -16,7 +16,7 @@ pub struct WireMessage<N, L: Ord> {
     pub body: WireBody<L>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum WireBody<L: Ord> {
     Want(LogRanges<L>),
     /// Hydrated ops grouped per log, in (log, seq) order; payloads may be
