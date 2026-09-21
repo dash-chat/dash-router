@@ -54,6 +54,11 @@ pub struct Metrics {
 
     relay_samples: Vec<(f64, usize)>,
     inflight_samples: Vec<usize>,
+
+    pub payload_evictions: u64,
+    pub full_evictions: u64,
+    pub native_syncs: u64,
+    pub app_gc_runs: u64,
 }
 
 impl Metrics {
@@ -135,6 +140,10 @@ impl Metrics {
                 .unwrap_or(0),
             inflight_mean: mean(self.inflight_samples.iter().map(|&x| x as f64)),
             inflight_max: self.inflight_samples.iter().copied().max().unwrap_or(0),
+            payload_evictions: self.payload_evictions,
+            full_evictions: self.full_evictions,
+            native_syncs: self.native_syncs,
+            app_gc_runs: self.app_gc_runs,
         }
     }
 }
@@ -200,4 +209,8 @@ pub struct RunRecord {
     pub relay_occupancy_max: usize,
     pub inflight_mean: f64,
     pub inflight_max: usize,
+    pub payload_evictions: u64,
+    pub full_evictions: u64,
+    pub native_syncs: u64,
+    pub app_gc_runs: u64,
 }

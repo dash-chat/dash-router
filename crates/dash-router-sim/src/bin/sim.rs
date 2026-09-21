@@ -60,6 +60,11 @@ fn main() -> anyhow::Result<()> {
                 "backpressure_exercised",
                 report.sometimes.backpressure_exercised,
             ),
+            ("eviction_exercised", report.sometimes.eviction_exercised),
+            (
+                "cap_pressure_exercised",
+                report.sometimes.cap_pressure_exercised,
+            ),
         ] {
             if !ok {
                 println!("  sometimes NOT hit: {check}");

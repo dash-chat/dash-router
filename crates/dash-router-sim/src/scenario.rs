@@ -130,6 +130,17 @@ pub struct RouterSpec {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StorageSpec {
     pub relay_cap: Units,
+    /// Maintenance evicts once usage reaches `evict_at * relay_cap`.
+    #[serde(default = "default_evict_at")]
+    pub evict_at: f64,
+    /// Per-node relay-maintenance interval; `None` = maintenance off
+    /// (the pre-eviction shape).
+    #[serde(default)]
+    pub maintain_interval_ms: Option<u64>,
+}
+
+fn default_evict_at() -> f64 {
+    0.75
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -152,6 +163,22 @@ pub struct WorkloadSpec {
     /// node subscribes to every log (the original shape).
     #[serde(default)]
     pub subscribers: Option<u32>,
+    /// Poisson rate of out-of-band `NativeSync` ingests (a random subscriber
+    /// receives a random already-authored op outside the gossip). 0 = off.
+    #[serde(default)]
+    pub native_sync_per_sec: f64,
+    /// Periodic application GC of subscribed ext stores. Note (kept-as-is
+    /// ruling, 2026-09-21): GC'd ranges leave `held`, so nodes re-Want them —
+    /// expect refill traffic when this is on. Off in baseline scenarios.
+    #[serde(default)]
+    pub app_gc: Option<AppGcSpec>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AppGcSpec {
+    pub interval_ms: u64,
+    /// Per log, keep the newest `keep_last` seqs; GC everything older.
+    pub keep_last: u32,
 }
 
 fn default_payload() -> usize {
@@ -184,6 +211,14 @@ impl ScenarioSpec {
         if let LatencySpec::LogNormal { median_ms, sigma } = &self.latency_ms {
             ensure!(*median_ms > 0.0 && *sigma >= 0.0, "bad log-normal latency");
         }
+        ensure!(
+            (0.0..=1.0).contains(&self.storage.evict_at) && self.storage.evict_at > 0.0,
+            "evict_at must be in (0, 1]"
+        );
+        ensure!(
+            self.workload.native_sync_per_sec >= 0.0,
+            "negative native_sync_per_sec"
+        );
         Ok(())
     }
 
@@ -241,6 +276,11 @@ impl ScenarioSpec {
             duration,
             sample_interval: ms(defaults.sample_interval_ms),
             expected: self.expected_coverage(),
+            relay_cap: self.storage.relay_cap,
+            evict_at: self.storage.evict_at,
+            maintain_interval: self.storage.maintain_interval_ms.map(ms),
+            native_sync_per_sec: self.workload.native_sync_per_sec,
+            app_gc: self.workload.app_gc.clone(),
         };
         ensure!(
             topology.nodes().count() == self.nodes as usize,

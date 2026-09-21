@@ -42,6 +42,8 @@ pub struct Sometimes {
     pub loss_exercised: bool,
     pub backfill_exercised: bool,
     pub backpressure_exercised: bool,
+    pub eviction_exercised: bool,
+    pub cap_pressure_exercised: bool,
 }
 
 impl ScenarioReport {
@@ -79,6 +81,13 @@ impl ScenarioReport {
             backpressure_exercised: runs
                 .iter()
                 .any(|r| r.shed_appends + r.fire_backpressure + r.forced_drops > 0),
+            eviction_exercised: runs
+                .iter()
+                .any(|r| r.payload_evictions + r.full_evictions > 0),
+            cap_pressure_exercised: runs.iter().any(|r| {
+                r.relay_occupancy_max as f64
+                    >= params.storage.evict_at * params.storage.relay_cap as f64
+            }),
         };
         Self {
             scenario,
