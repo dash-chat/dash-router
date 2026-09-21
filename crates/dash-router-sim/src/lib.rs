@@ -19,6 +19,7 @@ pub mod policy;
 pub mod report;
 pub mod scenario;
 pub mod sim;
+pub mod sweep;
 
 use dash_router_net_model::{NetAction, NetMachine, NetState};
 use polestar::time::RealTime;
