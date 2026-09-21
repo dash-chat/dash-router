@@ -14,6 +14,8 @@ params:
     have_ttl_ms: 500
   storage:
     relay_cap: 1048576
+    evict_at: 0.75
+    maintain_interval_ms: null
   policy:
     want:
       kind: density-scaled
@@ -29,6 +31,9 @@ params:
     writers: 4
     appends_per_sec: 2.0
     payload_bytes: 64
+    subscribers: null
+    native_sync_per_sec: 0.0
+    app_gc: null
   seeds: null
   duration_ms: null
 runs:
@@ -55,6 +60,20 @@ runs:
   relay_occupancy_max: 0
   inflight_mean: 0.8
   inflight_max: 9
+  payload_evictions: 0
+  full_evictions: 0
+  native_syncs: 0
+  app_gc_runs: 0
+  push_deliveries: 790
+  pull_deliveries: 8
+  t_push_ms:
+    mean: 11.831834989873423
+    p95: 24.148043
+    max: 33.372651000000005
+  t_pull_ms:
+    mean: 509.94216362500003
+    p95: 906.133877
+    max: 906.133877
 - seed: 1
   ops_authored: 34
   ops_fully_covered: 34
@@ -78,6 +97,20 @@ runs:
   relay_occupancy_max: 0
   inflight_mean: 1.7
   inflight_max: 13
+  payload_evictions: 0
+  full_evictions: 0
+  native_syncs: 0
+  app_gc_runs: 0
+  push_deliveries: 640
+  pull_deliveries: 6
+  t_push_ms:
+    mean: 10.776133229687492
+    p95: 21.542717999999997
+    max: 37.843706999999995
+  t_pull_ms:
+    mean: 720.3447755000001
+    p95: 1254.683306
+    max: 1254.683306
 - seed: 2
   ops_authored: 49
   ops_fully_covered: 49
@@ -101,6 +134,20 @@ runs:
   relay_occupancy_max: 0
   inflight_mean: 0.55
   inflight_max: 9
+  payload_evictions: 0
+  full_evictions: 0
+  native_syncs: 0
+  app_gc_runs: 0
+  push_deliveries: 926
+  pull_deliveries: 5
+  t_push_ms:
+    mean: 12.239781497840166
+    p95: 24.704955
+    max: 43.13859
+  t_pull_ms:
+    mean: 540.1822324000001
+    p95: 699.8530499999999
+    max: 699.8530499999999
 - seed: 3
   ops_authored: 40
   ops_fully_covered: 40
@@ -124,6 +171,20 @@ runs:
   relay_occupancy_max: 0
   inflight_mean: 0.75
   inflight_max: 8
+  payload_evictions: 0
+  full_evictions: 0
+  native_syncs: 0
+  app_gc_runs: 0
+  push_deliveries: 731
+  pull_deliveries: 29
+  t_push_ms:
+    mean: 10.768612972640216
+    p95: 21.792959
+    max: 31.3335
+  t_pull_ms:
+    mean: 373.4081010689655
+    p95: 897.941323
+    max: 1184.719603
 - seed: 4
   ops_authored: 47
   ops_fully_covered: 47
@@ -147,6 +208,20 @@ runs:
   relay_occupancy_max: 0
   inflight_mean: 0.35
   inflight_max: 3
+  payload_evictions: 0
+  full_evictions: 0
+  native_syncs: 0
+  app_gc_runs: 0
+  push_deliveries: 888
+  pull_deliveries: 5
+  t_push_ms:
+    mean: 11.9869712578829
+    p95: 24.206072
+    max: 36.515802
+  t_pull_ms:
+    mean: 578.0050868000001
+    p95: 798.569888
+    max: 798.569888
 - seed: 5
   ops_authored: 42
   ops_fully_covered: 42
@@ -170,6 +245,20 @@ runs:
   relay_occupancy_max: 0
   inflight_mean: 0.7
   inflight_max: 11
+  payload_evictions: 0
+  full_evictions: 0
+  native_syncs: 0
+  app_gc_runs: 0
+  push_deliveries: 768
+  pull_deliveries: 30
+  t_push_ms:
+    mean: 9.468558686197913
+    p95: 20.426619
+    max: 30.16672
+  t_pull_ms:
+    mean: 622.4667384333334
+    p95: 902.567648
+    max: 1028.2662
 - seed: 6
   ops_authored: 51
   ops_fully_covered: 51
@@ -193,6 +282,20 @@ runs:
   relay_occupancy_max: 0
   inflight_mean: 0.5
   inflight_max: 10
+  payload_evictions: 0
+  full_evictions: 0
+  native_syncs: 0
+  app_gc_runs: 0
+  push_deliveries: 948
+  pull_deliveries: 21
+  t_push_ms:
+    mean: 11.227400548523203
+    p95: 21.866854
+    max: 35.439565
+  t_pull_ms:
+    mean: 176.33396523809523
+    p95: 336.89140499999996
+    max: 532.302489
 - seed: 7
   ops_authored: 57
   ops_fully_covered: 57
@@ -216,6 +319,20 @@ runs:
   relay_occupancy_max: 0
   inflight_mean: 0.5714285714285714
   inflight_max: 8
+  payload_evictions: 0
+  full_evictions: 0
+  native_syncs: 0
+  app_gc_runs: 0
+  push_deliveries: 1058
+  pull_deliveries: 25
+  t_push_ms:
+    mean: 9.519310396975424
+    p95: 19.488867
+    max: 29.158884
+  t_pull_ms:
+    mean: 504.07131907999997
+    p95: 695.7267919999999
+    max: 766.189224
 summary:
   coverage_rate: 1.0
   t_full_ms_mean:
@@ -236,7 +353,10 @@ summary:
   backpressure_events: 0.0
   relay_occupancy_max: 0
   inflight_max: 13
+  push_share: 0.9812445478336725
 sometimes:
   loss_exercised: true
   backfill_exercised: true
   backpressure_exercised: false
+  eviction_exercised: false
+  cap_pressure_exercised: false

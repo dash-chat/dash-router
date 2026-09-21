@@ -119,6 +119,10 @@ scenarios:
         record.relay_occupancy_max > 0,
         "unsubscribed nodes hold relayed bytes: the relay path is live"
     );
+    assert!(
+        record.push_deliveries + record.pull_deliveries > 0,
+        "every gossip delivery carries an origin"
+    );
 }
 
 /// A tight relay cap plus maintenance: the relay saturates, eviction runs,
@@ -211,4 +215,29 @@ fn jump_to_replays_to_the_same_state() {
     sim.jump_to(steps).unwrap();
     assert_eq!(sim.net_state(), &mid);
     assert_eq!(sim.steps(), steps);
+}
+
+/// Origin attribution: push-flood deliveries and repair deliveries land in
+/// separate latency buckets; out-of-band (None) deliveries in neither.
+#[test]
+fn delivery_latency_splits_by_have_origin() {
+    use dash_router_sim::metrics::{HaveOrigin, Metrics};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::time::Duration;
+
+    let expected = BTreeMap::from([(0u8, BTreeSet::from([1u32, 2, 3]))]);
+    let mut m = Metrics::new(expected);
+    let ms = Duration::from_millis;
+    m.authored(0, 0, ms(0));
+    m.delivered(1, 0, 0, ms(10), Some(HaveOrigin::Push));
+    m.delivered(2, 0, 0, ms(500), Some(HaveOrigin::Repair));
+    m.delivered(3, 0, 0, ms(20), None); // e.g. native sync
+    // A repeat never double-counts.
+    m.delivered(1, 0, 0, ms(999), Some(HaveOrigin::Repair));
+    let r = m.finish(0);
+    assert_eq!(r.push_deliveries, 1);
+    assert_eq!(r.pull_deliveries, 1);
+    assert_eq!(r.t_push_ms.max, 10.0);
+    assert_eq!(r.t_pull_ms.max, 500.0);
+    assert_eq!(r.ops_fully_covered, 1);
 }
