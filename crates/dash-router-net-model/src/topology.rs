@@ -127,6 +127,14 @@ impl<N: Ord + Copy> Topology<N> {
         self.adjacency.get(n).into_iter().flatten().copied()
     }
 
+    /// Every edge once, with `a < b`.
+    pub fn edges(&self) -> impl Iterator<Item = (N, N)> + '_ {
+        self.adjacency
+            .iter()
+            .flat_map(|(a, peers)| peers.iter().map(move |b| (*a, *b)))
+            .filter(|(a, b)| a < b)
+    }
+
     pub fn edge_count(&self) -> usize {
         self.adjacency.values().map(BTreeSet::len).sum::<usize>() / 2
     }
@@ -148,6 +156,23 @@ impl<N: Ord + Copy> Topology<N> {
             }
         }
         seen.len() == self.adjacency.len()
+    }
+}
+
+impl<N: Ord + Copy + std::fmt::Display> Topology<N> {
+    /// Graphviz source for the adjacency, for eyeballing a fixture:
+    /// `dot -Tsvg topology.dot` (or `neato`, for a spring layout of a
+    /// denser graph). Named `graph`, so edges are undirected.
+    pub fn to_dot(&self, name: &str) -> String {
+        let mut out = format!("graph \"{name}\" {{\n  node [shape=circle];\n");
+        for n in self.nodes() {
+            out.push_str(&format!("  \"{n}\";\n"));
+        }
+        for (a, b) in self.edges() {
+            out.push_str(&format!("  \"{a}\" -- \"{b}\";\n"));
+        }
+        out.push_str("}\n");
+        out
     }
 }
 
