@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::{Op, ranges::{LogRanges, Seq}};
+use crate::{op::Op, ranges::{LogRanges, Seq}};
 
 /// Bump together with the gossip topic on breaking change.
 pub const WIRE_VERSION: u8 = 0;
@@ -47,7 +47,7 @@ impl<N: Serialize + DeserializeOwned, L: Ord + Serialize + DeserializeOwned> Wir
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Op, ranges::{LogRanges, Ranges}};
+    use crate::{op::Op, ranges::{LogRanges, Ranges}};
 
     #[test]
     fn wire_messages_round_trip_and_reject_unknown_versions() {
