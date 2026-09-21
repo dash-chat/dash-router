@@ -25,7 +25,8 @@ use std::{
 
 use anyhow::ensure;
 use dash_router_core::{
-    EvictableStorage, LogRanges, NodeAction, NodeEffect, Op, RouterAction, Seq, WireBody,
+    EvictableStorage, LogRanges, NodeAction, NodeEffect, Op, Ranges, RouterAction, Seq, Storage,
+    Units, WireBody,
 };
 use dash_router_net_model::Flight;
 use polestar::prelude::*;
@@ -33,8 +34,9 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 use crate::{
-    K, LogId, Metrics, NodeId, SimNet, SimNetAction, SimNetState, policy::IntervalPolicy,
-    scenario::LatencySpec,
+    K, LogId, Metrics, NodeId, SimNet, SimNetAction, SimNetState,
+    policy::IntervalPolicy,
+    scenario::{AppGcSpec, LatencySpec},
 };
 
 /// How long a deferred event waits before retrying.
@@ -56,6 +58,11 @@ pub struct SimParams {
     pub duration: Duration,
     pub sample_interval: Duration,
     pub expected: BTreeMap<LogId, BTreeSet<NodeId>>,
+    pub relay_cap: Units,
+    pub evict_at: f64,
+    pub maintain_interval: Option<Duration>,
+    pub native_sync_per_sec: f64,
+    pub app_gc: Option<AppGcSpec>,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +78,9 @@ enum Ev {
     FireHave(NodeId),
     Append,
     Sample,
+    Maintain(NodeId),
+    NativeSync,
+    AppGc,
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +138,9 @@ pub struct SimBehavior {
     /// explicit seq, so this is the behavior's own bookkeeping of what
     /// each writer has authored so far.
     authored_seq: BTreeMap<(NodeId, LogId), Seq>,
+    /// Every op ever authored, for `NativeSync` to draw an already-real one
+    /// from.
+    authored_ops: BTreeMap<(LogId, Seq), Op>,
     clocks: BTreeMap<NodeId, Duration>,
     known_inflight: Vec<Flight<NodeId, LogId>>,
     tags: VecDeque<Tag>,
@@ -151,6 +164,7 @@ impl SimBehavior {
             queue: BinaryHeap::new(),
             next_seq: 0,
             authored_seq: BTreeMap::new(),
+            authored_ops: BTreeMap::new(),
             clocks: BTreeMap::new(),
             known_inflight: Vec::new(),
             tags: VecDeque::new(),
@@ -262,6 +276,12 @@ impl SimBehavior {
         self.schedule(self.now + gap, Ev::Append);
     }
 
+    fn schedule_next_native_sync(&mut self) {
+        let exp = rand_distr::Exp::new(self.params.native_sync_per_sec).expect("rate > 0");
+        let gap = Duration::from_secs_f64(self.rng.sample(exp));
+        self.schedule(self.now + gap, Ev::NativeSync);
+    }
+
     /// Register flights the model created since we last looked, sampling
     /// each one's fate (latency, loss) and scheduling it.
     fn sync_inflight(&mut self, state: &SimNetState) {
@@ -333,6 +353,17 @@ impl Behavior for SimBehavior {
             }
             self.schedule_next_append();
             self.schedule(self.params.sample_interval, Ev::Sample);
+            if let Some(interval) = self.params.maintain_interval {
+                for n in state.nodes.keys().copied().collect::<Vec<_>>() {
+                    self.schedule(interval, Ev::Maintain(n));
+                }
+            }
+            if self.params.native_sync_per_sec > 0.0 {
+                self.schedule_next_native_sync();
+            }
+            if let Some(gc) = &self.params.app_gc {
+                self.schedule(Duration::from_millis(gc.interval_ms), Ev::AppGc);
+            }
             return Ok(actions);
         }
 
@@ -457,6 +488,7 @@ impl Behavior for SimBehavior {
                         let op = self.op();
                         let seq = self.next_authored_seq(writer, log);
                         self.metrics.authored(log, seq, self.now);
+                        self.authored_ops.insert((log, seq), op.clone());
                         actions.push(SimNetAction::Node(
                             writer,
                             NodeAction::Authored(log, seq, op),
@@ -481,6 +513,108 @@ impl Behavior for SimBehavior {
                     .sample_occupancy(mean, max, state.inflight.len());
                 if self.now < self.params.duration * 2 {
                     self.schedule(self.now + self.params.sample_interval, Ev::Sample);
+                }
+            }
+
+            Ev::Maintain(n) => {
+                let node = state.node(&n);
+                let threshold =
+                    ((self.params.evict_at * self.params.relay_cap as f64) as Units).max(1);
+                if node.relay.0.usage() >= threshold {
+                    let candidates = node.eviction_candidates();
+                    if !candidates.is_empty() {
+                        // Payloads-first (DESIGN.md GC): units freed = one per payload.
+                        let freed: usize = candidates.iter().filter_map(|(_, r)| r.len()).sum();
+                        self.metrics.payload_evictions += freed as u64;
+                        self.advance(state, n, &mut actions);
+                        actions.push(SimNetAction::Node(
+                            n,
+                            NodeAction::RelayEvictPayloads(candidates),
+                        ));
+                        self.tags.push_back(Tag::Plumbing);
+                    } else {
+                        // Headers-later stage: shed whole non-wanted ranges.
+                        let full = node
+                            .relay
+                            .0
+                            .held_all()
+                            .difference(&node.router.others_wants());
+                        if !full.is_empty() {
+                            self.metrics.full_evictions += 1;
+                            self.advance(state, n, &mut actions);
+                            actions.push(SimNetAction::Node(n, NodeAction::RelayEvict(full)));
+                            self.tags.push_back(Tag::Plumbing);
+                        }
+                    }
+                }
+                if self.now < self.params.duration * 2 {
+                    let interval = self
+                        .params
+                        .maintain_interval
+                        .expect("scheduled only when set");
+                    self.schedule(self.now + interval, Ev::Maintain(n));
+                }
+            }
+
+            Ev::NativeSync => {
+                if self.now <= self.params.duration {
+                    if !self.authored_ops.is_empty() {
+                        let idx = self.rng.random_range(0..self.authored_ops.len());
+                        let ((log, seq), op) = self
+                            .authored_ops
+                            .iter()
+                            .nth(idx)
+                            .map(|(k, v)| (*k, v.clone()))
+                            .expect("idx < len");
+                        let subs: Vec<NodeId> = self
+                            .params
+                            .expected
+                            .get(&log)
+                            .map(|s| s.iter().copied().collect())
+                            .unwrap_or_default();
+                        if !subs.is_empty() {
+                            let node = subs[self.rng.random_range(0..subs.len())];
+                            self.advance(state, node, &mut actions);
+                            actions.push(SimNetAction::Node(
+                                node,
+                                NodeAction::NativeSync(log, seq, op),
+                            ));
+                            self.tags.push_back(Tag::Plumbing);
+                            self.metrics.native_syncs += 1;
+                            // Out-of-band arrival still counts as this node having the
+                            // op: no NodeEffect::Deliver fires for a NativeSync.
+                            self.metrics.delivered(node, log, seq, self.now);
+                        }
+                    }
+                    self.schedule_next_native_sync();
+                }
+            }
+
+            Ev::AppGc => {
+                let gc_spec = self.params.app_gc.clone().expect("scheduled only when set");
+                for n in state.nodes.keys().copied().collect::<Vec<_>>() {
+                    let node = state.node(&n);
+                    let mut gc = LogRanges::empty();
+                    for log in &node.subscriptions {
+                        if let Some(r) = node.ext.0.held_all().get(log)
+                            && let Some(last) = r.last()
+                            && last + 1 > gc_spec.keep_last
+                        {
+                            gc.insert(*log, Ranges::range(0, last + 1 - gc_spec.keep_last));
+                        }
+                    }
+                    if !gc.is_empty() {
+                        self.metrics.app_gc_runs += 1;
+                        self.advance(state, n, &mut actions);
+                        actions.push(SimNetAction::Node(n, NodeAction::AppGc(gc)));
+                        self.tags.push_back(Tag::Plumbing);
+                    }
+                }
+                if self.now < self.params.duration {
+                    self.schedule(
+                        self.now + Duration::from_millis(gc_spec.interval_ms),
+                        Ev::AppGc,
+                    );
                 }
             }
         }

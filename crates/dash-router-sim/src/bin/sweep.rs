@@ -74,7 +74,11 @@ fn base(args: &Args) -> ScenarioSpec {
             want_ttl_ms: 500,
             have_ttl_ms: 500,
         },
-        storage: StorageSpec { relay_cap: 1 << 20 },
+        storage: StorageSpec {
+            relay_cap: 1 << 20,
+            evict_at: 0.75,
+            maintain_interval_ms: None,
+        },
         policy: PolicySpec {
             want: IntervalPolicy::DensityScaled {
                 min_ms: args.want_min,
@@ -92,6 +96,8 @@ fn base(args: &Args) -> ScenarioSpec {
             appends_per_sec: 2.0,
             payload_bytes: 64,
             subscribers: None,
+            native_sync_per_sec: 0.0,
+            app_gc: None,
         },
         seeds: Some(args.seeds),
         duration_ms: Some(args.duration_ms),

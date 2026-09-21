@@ -121,6 +121,76 @@ scenarios:
     );
 }
 
+/// A tight relay cap plus maintenance: the relay saturates, eviction runs,
+/// usage never exceeds the cap, and subscribers still get covered.
+#[test]
+fn cap_pressure_evicts_and_stays_within_cap() {
+    let yaml = r#"
+defaults: { seeds: 4, duration_ms: 3000 }
+scenarios:
+  pressure:
+    nodes: 6
+    topology: { kind: path }
+    loss: 0.0
+    latency_ms: { distribution: uniform, min_ms: 1, max_ms: 3 }
+    router: { want_ttl_ms: 500, have_ttl_ms: 500 }
+    storage: { relay_cap: 8, evict_at: 0.75, maintain_interval_ms: 100 }
+    policy:
+      want: { kind: fixed, min_ms: 100, max_ms: 200 }
+      have: { kind: fixed, min_ms: 20, max_ms: 60 }
+    workload: { writers: 2, appends_per_sec: 8.0, subscribers: 2 }
+"#;
+    let config = dash_router_sim::Config::from_yaml(yaml).unwrap();
+    let spec = &config.scenarios["pressure"];
+    let mut evictions = 0;
+    for seed in 0..4 {
+        let mut sim = spec.build(seed, &config.defaults).unwrap();
+        let record = sim.run(seed).unwrap();
+        assert!(record.relay_occupancy_max <= 8, "cap is a hard bound");
+        evictions += record.payload_evictions + record.full_evictions;
+    }
+    assert!(
+        evictions > 0,
+        "maintenance never fired under sustained pressure"
+    );
+}
+
+/// NativeSync counts toward coverage; AppGc runs and (kept-as-is ruling)
+/// reopens wanted gaps — the run still terminates at the drain cap.
+#[test]
+fn native_sync_and_app_gc_are_proposed() {
+    let yaml = r#"
+defaults: { seeds: 2, duration_ms: 2000 }
+scenarios:
+  spontaneous:
+    nodes: 4
+    topology: { kind: path }
+    loss: 0.0
+    latency_ms: { distribution: uniform, min_ms: 1, max_ms: 3 }
+    router: { want_ttl_ms: 500, have_ttl_ms: 500 }
+    storage: { relay_cap: 1048576 }
+    policy:
+      want: { kind: fixed, min_ms: 100, max_ms: 200 }
+      have: { kind: fixed, min_ms: 20, max_ms: 60 }
+    workload:
+      writers: 2
+      appends_per_sec: 8.0
+      native_sync_per_sec: 4.0
+      app_gc: { interval_ms: 400, keep_last: 1 }
+"#;
+    let config = dash_router_sim::Config::from_yaml(yaml).unwrap();
+    let spec = &config.scenarios["spontaneous"];
+    let (mut syncs, mut gcs) = (0, 0);
+    for seed in 0..2 {
+        let mut sim = spec.build(seed, &config.defaults).unwrap();
+        let record = sim.run(seed).unwrap();
+        syncs += record.native_syncs;
+        gcs += record.app_gc_runs;
+    }
+    assert!(syncs > 0, "native sync never proposed");
+    assert!(gcs > 0, "app gc never proposed");
+}
+
 #[test]
 fn jump_to_replays_to_the_same_state() {
     let config = config(0.1, 5, 1_500);
