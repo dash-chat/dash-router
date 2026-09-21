@@ -740,7 +740,9 @@ The existing 7 tests survive with translated vocabulary:
 
 - [ ] **Step 4: Commit** — `git add -A && git commit -m "feat(net-model)!: drive NodeMachine per node; flights carry WireMessages"`
 
----### Task 6: sim on the new composition
+---
+
+### Task 6: sim on the new composition
 
 **Files:**
 - Modify: `crates/dash-router-sim/src/lib.rs` (`SimNet` aliases → `NodeMachine`-based)
