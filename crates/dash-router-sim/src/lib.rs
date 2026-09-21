@@ -15,11 +15,12 @@
 
 pub mod behavior;
 pub mod metrics;
-pub mod policy;
 pub mod report;
 pub mod scenario;
 pub mod sim;
 pub mod sweep;
+
+pub use dash_router_policy as policy;
 
 use dash_router_net_model::{NetAction, NetMachine, NetState};
 use polestar::time::RealTime;

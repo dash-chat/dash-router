@@ -232,6 +232,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dash-router-policy"
+version = "0.1.0"
+dependencies = [
+ "rand",
+ "rand_chacha",
+ "serde",
+]
+
+[[package]]
 name = "dash-router-sim"
 version = "0.1.0"
 dependencies = [
@@ -239,6 +248,7 @@ dependencies = [
  "clap",
  "dash-router-core",
  "dash-router-net-model",
+ "dash-router-policy",
  "polestar",
  "rand",
  "rand_chacha",

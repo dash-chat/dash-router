@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 dash-router-core = { path = "../dash-router-core" }
 dash-router-net-model = { path = "../dash-router-net-model" }
+dash-router-policy = { path = "../dash-router-policy" }
 polestar = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
