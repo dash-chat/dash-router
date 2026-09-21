@@ -1,9 +1,11 @@
+pub mod node;
 pub mod op;
 pub mod ranges;
 pub mod router;
 pub mod storage;
 pub mod wire;
 
+pub use node::{NodeAction, NodeEffect, NodeMachine, NodeState};
 pub use op::Op;
 pub use ranges::{LogRanges, Ranges, Seq};
 pub use router::{Effect, RouterAction, RouterConfig, RouterMachine, RouterState};
