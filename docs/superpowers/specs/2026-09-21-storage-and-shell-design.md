@@ -54,7 +54,7 @@ pub struct RouterState<N, L, T> {
     pub held: LogRanges<L>,
     pub wants: BTreeMap<N, Record<L, T>>,      // unchanged
     pub haves: BTreeMap<N, Record<L, T>>,      // unchanged
-    pub relayed: Vec<Record<L, T>>,            // unchanged
+    pub relayed_haves: Vec<Record<L, T>>,      // renamed from `relayed`
     pub relayed_wants: Vec<Record<L, T>>,      // unchanged
     pub want_timer: Option<Timer<T>>,          // unchanged
     pub have_timer: Option<Timer<T>>,          // unchanged
@@ -92,12 +92,21 @@ pub enum RouterAction<N, L, T> {
     RecvWant { from: N, ranges: LogRanges<L> },
     RecvHave { from: N, ranges: LogRanges<L> },
     Held(LogRanges<L>),                       // absolute snapshot from above
+    Push(LogRanges<L>),                       // client-initiated fast Have
 }
 ```
 
-Removed: `Append`/`Authored` (see §2.4), `Recv(MessageEnvelope)` (split into
-the two ranges-only variants; op bytes never enter the router), and any
-notion of `fresh`.
+Removed: `Append`/`Authored` (subsumed by `Push` + ingest, see §2.4),
+`Recv(MessageEnvelope)` (split into the two ranges-only variants; op bytes
+never enter the router), and any notion of `fresh`.
+
+`Push(ranges)` is the author-side fast path: it emits
+`SendHave(ranges − relayed_haves)` immediately and notes the emission in
+`relayed_haves`, exactly as a relay would. No label travels on the wire —
+receivers treat a pushed Have identically to a slow-repair Have (it floods
+by the same seen-set rules). Debouncing/coalescing of rapid appends is the
+*caller's* timing policy (glue/shell), like interval sampling — the router
+stays policy-free.
 
 ### 2.3 Effects
 
@@ -119,26 +128,25 @@ wire layer.
 `Accept(novel)` before `SendHave(relay_portion)`, so by the time the glue
 hydrates the relayed flood, the parked bytes are already ingested.
 
-### 2.4 Removal of "fresh", and its consequence
+### 2.4 Removal of the "fresh" label (push stays)
 
-With flooding, `fresh` was already inert as a relay signal. Removing the
-*notion* removes more: the author-side push path (DESIGN.md §2's debounced
-fresh Have on authoring). The protocol becomes **pull-only for new data**:
-an authored op sits until some node's Want interval elapses, the Want
-floods, and the author (or any holder) answers with a Have. Worst-case
-propagation latency for new data rises from ~have-debounce to
-~(want interval + have interval + flood time). At chat-scale intervals
-(hundreds of ms) this is acceptable; the sim will quantify it, and the push
-path can be reintroduced later as a pure emission-policy change if latency
-matters (it would not touch storage or wire format).
+With flooding, `fresh` was already inert as a relay signal, so the *label*
+goes: no wire field, no receiver-side distinction, no separate emission
+rules in the router. What stays is the author-side **push**: on authoring,
+the client initiates a fast Have via `Push` (previous section), which is
+treated by every receiver exactly like a slow-repair Have. New-data
+propagation latency stays at ~debounce + flood time; the pull path
+(Want-triggered Haves) remains the repair mechanism it always was.
 
-This also deletes `Authored`: authorship reaches the router the same way
-native sync does — the external store grows, a `Held` snapshot arrives, and
-the complement shrinks. One mechanism for all three of {local append,
-p2panda native sync, migration}.
+`Authored` as a distinct action dissolves into two existing mechanisms: the
+op bytes reach storage by ingest (whose `HeldChanged` → `Held` snapshot
+grows the router's view), and the fast announcement is a `Push`. Native
+sync and migration use the first mechanism only — no push, since p2panda
+already carried the data to whoever it could.
 
-DESIGN.md §2 and the `fresh` field in the message enum need a corresponding
-edit (listed as a work item, §9).
+DESIGN.md's message enum (`fresh` field) and §2 need a corresponding edit:
+the emission behavior survives, the freshness *distinction* does not
+(listed as a work item, §9).
 
 ## 3. The `Storage` trait
 
@@ -166,14 +174,16 @@ pub type Units = u64;
 /// Read/write surface of one op store. Implemented by the in-memory
 /// model/sim stores; mirrored by AsyncStorage in the shell.
 pub trait Storage<L: Ord> {
-    /// Ranges for which AT LEAST the header is held. Keys may map to
-    /// empty ranges: "this log exists here, nothing held" (used to
-    /// express interest for freshly subscribed logs). This is the value
-    /// that feeds the router's Held snapshots (unioned across stores).
-    fn held(&self) -> LogRanges<L>;
+    /// Held ranges (header at least) for exactly the given logs. A
+    /// requested log with nothing held appears with an empty range —
+    /// presence in the result mirrors the request, so the caller can
+    /// patch its per-log cache without ambiguity.
+    fn held_of(&self, logs: &BTreeSet<L>) -> LogRanges<L>;
 
-    /// Ranges for which the full payload is held. Always ⊆ held().
-    fn held_payloads(&self) -> LogRanges<L>;
+    /// Held ranges for ALL logs. Startup and full-resync only — never
+    /// the hot path. Keys may map to empty ranges ("log known here,
+    /// nothing held").
+    fn held_all(&self) -> LogRanges<L>;
 
     /// Every held op intersecting `ranges`, in (log, seq) order.
     /// Gaps and evicted payloads are silently reflected in the output
@@ -193,6 +203,12 @@ pub trait EvictableStorage<L: Ord>: Storage<L> {
     /// Current usage in cap units. Cheap; called on every ingest cycle.
     fn usage(&self) -> Units;
 
+    /// Ranges for which the full payload is held (⊆ held). Feeds the
+    /// eviction policy (payloads drop first). Deliberately NOT on
+    /// `Storage`: only the eviction policy consumes it, so the external
+    /// store — the implementation we don't control — never pays for it.
+    fn held_payloads(&self) -> LogRanges<L>;
+
     /// Drop payloads (keep headers) for held ops in `ranges`.
     fn evict_payloads(&mut self, ranges: &LogRanges<L>);
 
@@ -203,19 +219,26 @@ pub trait EvictableStorage<L: Ord>: Storage<L> {
 
 Design notes, in anticipation of revision:
 
+- **The held queries are summary reads, not scans — that is a contract.**
+  Implementations are expected to maintain the ranges summary
+  incrementally (updated on every ingest/evict), so `held_of` is a lookup
+  and even `held_all` is O(size of the summary). The summary is small by
+  nature: `Ranges` grows with the number of *contiguous runs* (i.e. with
+  fragmentation), not with op count — a million-op log with no gaps is
+  one pair of numbers. A store that must scan to answer is a
+  non-conforming (but functional) implementation.
+- **`held_of` is the hot path; `held_all` is startup.** Change
+  notifications carry the touched logs (§3.3), so steady-state
+  reconciliation re-reads only those logs and patches the glue's per-log
+  cache; the full query runs once at startup and on lost-hint resync.
 - **`fetch` is total, not fallible.** Absence is data (the protocol expects
   gaps); only the async mirror adds an error channel, for I/O failure.
 - **No `contains`/point queries.** Every consumer works in ranges; a point
-  query is `fetch` of a unit range. Keeps the trait at four methods.
+  query is `fetch` of a unit range.
 - **No transactionality.** Each method is atomic on its own; the glue never
   needs multi-call atomicity because `Held` snapshots are idempotent
   reconciliation, not a ledger. If an ingest lands and the process dies
   before the router hears, the next snapshot repairs it.
-- **`held_payloads` earns its place** twice: eviction policy (payloads
-  drop first, so the policy needs to know which ranges still have them)
-  and Have hydration honesty (a header-only op is still advertisable and
-  fetchable; the receiver sees `payload: None` and may Want it again
-  later — same semantics as today's GC).
 - **No change notification here.** Notification is push-shaped and
   async-native; it lives in the shell trait (§3.3) and, in the model, in
   the storage machines' effects. Putting a callback in the sync trait
@@ -226,8 +249,8 @@ Design notes, in anticipation of revision:
 ```rust
 #[async_trait]
 pub trait AsyncStorage<L: Ord>: Send + Sync {
-    async fn held(&self) -> Result<LogRanges<L>>;
-    async fn held_payloads(&self) -> Result<LogRanges<L>>;
+    async fn held_of(&self, logs: &BTreeSet<L>) -> Result<LogRanges<L>>;
+    async fn held_all(&self) -> Result<LogRanges<L>>;
     async fn fetch(&self, ranges: &LogRanges<L>) -> Result<Vec<(L, Seq, Op)>>;
     async fn ingest(&self, log: L, seq: Seq, op: Op) -> Result<()>;
 }
@@ -235,18 +258,21 @@ pub trait AsyncStorage<L: Ord>: Send + Sync {
 #[async_trait]
 pub trait AsyncEvictableStorage<L>: AsyncStorage<L> {
     async fn usage(&self) -> Result<Units>;
+    async fn held_payloads(&self) -> Result<LogRanges<L>>;
     async fn evict_payloads(&self, ranges: &LogRanges<L>) -> Result<()>;
     async fn evict(&self, ranges: &LogRanges<L>) -> Result<()>;
 }
 
 /// Implemented by stores that change behind Dash Router's back
 /// (Dash Chat's store, written by p2panda native sync and GC'd by the
-/// app). The notification carries no data: on any change the shell
-/// re-reads held() and snapshots the union to the router. Coalescing,
-/// lossy notification is therefore fine — one notification after N
-/// writes produces one correct snapshot.
+/// app). Each item is a HINT naming the logs that changed: the shell
+/// re-reads held_of(those logs) and patches its cached union before
+/// snapshotting Held to the router. An EMPTY set means "unknown —
+/// re-read everything" (held_all). Because reconciliation is
+/// re-read-and-patch, coalescing or lossily merging notifications is
+/// always safe: one hint after N writes yields one correct patch.
 pub trait WatchableStorage<L>: AsyncStorage<L> {
-    fn changed(&self) -> impl Stream<Item = ()> + Send;
+    fn changed(&self) -> impl Stream<Item = BTreeSet<L>> + Send;
 }
 ```
 
@@ -267,8 +293,37 @@ pub trait WatchableStorage<L>: AsyncStorage<L> {
 
 **Standalone is not the null store.** A standalone node still authors and
 subscribes, so it still needs a selfish-side store; `dash-router-net` ships
-a simple one. The "null" degenerate case is a pure relay that subscribes to
-nothing — that is just an external store whose `held()` is forever empty.
+a simple one. Keeping it as a genuine external store (rather than folding
+authored ops into the relay store) preserves the authored/relayed
+distinction — GC exemption, Deliver, and the push path all key off it. The
+"null" degenerate case is a pure relay that subscribes to nothing — that is
+just an external store whose held ranges are forever empty.
+
+### 3.5 Relation to p2panda-store / p2panda-sync
+
+Reuse happens **inside the adapter, not in the trait**. Reasons the trait
+stays ours:
+
+- p2panda's `LogRanges` is one contiguous `(from, until)` per log and
+  cannot express our gapped `Ranges`; adopting it would lose exactly the
+  expressiveness DESIGN.md's diff arithmetic depends on.
+- p2panda-store's `OperationStore`/`LogStore` traits are keyed by structured
+  `p2panda_core::Header`s (public key, seq_num, hashes); our `Op` is
+  deliberately opaque bytes ("both payloads opaque to relays in general").
+  Binding the core trait to those types would drag p2panda into
+  `dash-router-core` and break relay opacity.
+- p2panda-sync's session-oriented `SyncProtocol` machinery is the wrong
+  shape for an open-ended broadcast protocol; nothing there maps.
+
+What *is* worth building once, by us rather than by every embedder: a
+`dash-router-p2panda` adapter (crate or module in `dash-router-net`)
+implementing `AsyncStorage + WatchableStorage` generically over
+p2panda-store's traits — the held-summary maintenance, the header/body ↔
+`Op` packing, and the change-hint stream live there. **To verify at impl
+time** (§10): whether current p2panda-store exposes any change
+notification; if not, the `changed()` stream needs a small hook on Dash
+Chat's side (it knows when it writes) plus a coarse poll as fallback for
+native-sync writes.
 
 ## 4. The storage machines (model/sim)
 
@@ -296,7 +351,9 @@ enum ExtStoreAction<L> {
 ```
 
 Both emit one effect: `HeldChanged(LogRanges<L>)`, an absolute snapshot of
-their own `held()`, whenever it changes. Cap enforcement (`relay_cap`, in
+their own `held_all()`, whenever it changes. (The model machines emit full
+snapshots; the shell's hint-based partial re-reads in §3.3 reconstruct the
+same value through the per-log cache.) Cap enforcement (`relay_cap`, in
 `Units`) is `RelayStoreMachine` config; the model checks "usage never
 exceeds cap" as an invariant of that machine, composed.
 
@@ -340,7 +397,7 @@ implements the same rows with `.await`s):
 | any `HeldChanged` from either store | router `Held(relay.held ∪ ext.held ∪ empty-keys for subscriptions)` |
 | `Subscribe(L)` | add to set; migrate: `relay.fetch(L-range)` → `ext.ingest` → `relay.evict(L-range)`; snapshot `Held` |
 | `Unsubscribe(L)` | remove from set; nothing else (option-1 semantics: keep advertising until the app actually drops the data, at which point `AppGc` → shrinking snapshot ends it naturally) |
-| local append (standalone) / Dash Chat "authored" | `ext.ingest`; the resulting `HeldChanged` → `Held` is the router's only notification |
+| local append (standalone) / Dash Chat "authored" | `ext.ingest` (→ `HeldChanged` → `Held`), then router `Push(authored ranges)` — debounced/coalesced by the caller — whose `SendHave` hydrates and broadcasts as usual |
 
 Eviction policy (sim/shell): a pure function
 `eviction_candidates(usage, cap, relay_held, relay_payloads, recency) -> LogRanges`
@@ -393,8 +450,10 @@ One task per node, structured as `tokio::select!` over:
    `ArmWantTimer`/`ArmHaveTimer`. A `TickBuffer` discretises elapsed wall
    time into `Tick(RealTime)` before every action batch.
 3. **Command channel** (the embedding API): append, subscribe, unsubscribe.
-4. **`WatchableStorage::changed`** streams: on any tick, re-read `held()`
-   from both stores, snapshot `Held` to the router.
+4. **`WatchableStorage::changed`** streams: on a hint, `held_of` the named
+   logs (or `held_all` on an empty hint), patch the shell's per-log held
+   cache, snapshot `Held` to the router. The cache is derived state — it
+   never appears in the conformance projection.
 
 Startup sequence: load subscriptions from the embedder (their persistence is
 the app's job — Dash Chat re-subscribes on startup) → initial `Held`
@@ -420,13 +479,15 @@ topic name.
   under fair schedules; `NativeSync` racing an in-flight Want never
   double-delivers; migration preserves `held`.
 - **Sim**: existing scenarios rerun on the new composition; new metrics:
-  propagation latency of authored ops under pull-only (the §2.4
-  consequence, quantified), eviction churn under cap pressure.
+  push-path propagation latency vs. pull-path repair latency (now separable,
+  since push is an explicit `Push` action), eviction churn under cap
+  pressure.
 
 ## 9. Work plan
 
 1. **Core refactor**: storage-less `RouterState` (`held` with empty-key
-   interest), actions/effects per §2, delete `fresh` everywhere, rework
+   interest), actions/effects per §2 (incl. `Push` and the
+   `relayed` → `relayed_haves` rename), delete `fresh` everywhere, rework
    core tests to ranges-only. The biggest diff; almost all deletion.
 2. **`types`/`wire` modules**: move `Op` out of `router`; `WireMessage` +
    postcard round-trip tests.
@@ -441,9 +502,10 @@ topic name.
    `AppGc`/`RelayEvict` with policy); rerun scenarios, record the new
    baseline, quantify §2.4.
 7. **`dash-router-net`**: async traits, shell loop, standalone stores,
-   command API; lockstep conformance test.
-8. **DESIGN.md edit**: remove `fresh` from the message enum and §2, note
-   pull-only propagation.
+   command API; lockstep conformance test; the `dash-router-p2panda`
+   adapter (§3.5).
+8. **DESIGN.md edit**: remove `fresh` from the message enum and reword §2
+   (push survives unlabeled).
 
 Each step leaves the workspace green before the next begins.
 
@@ -455,6 +517,8 @@ Each step leaves the workspace green before the next begins.
   crate — decide at step 6 when the sim and shell both need it.
 - Streaming `fetch` for large hydrations — revisit if sim shows Have sizes
   that make `Vec` collection hurt.
-- Reintroducing an author-push path if measured propagation latency under
-  pull-only is unacceptable — a pure emission-policy change, deliberately
-  left out per YAGNI.
+- Whether current p2panda-store exposes any change-notification mechanism
+  (§3.5) — verify against the real API at step 7; fallback is a Dash
+  Chat-side write hook plus a coarse poll for native-sync writes.
+- Push debounce policy (how long to coalesce rapid appends before `Push`)
+  — a shell/sim tuning knob alongside the interval policies.
