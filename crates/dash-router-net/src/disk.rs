@@ -9,7 +9,11 @@
 //! single writer, small values, a cache we can afford to lose and rebuild
 //! by reopening. Revisit under profiling if that stops being true.
 
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::BTreeSet,
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use anyhow::Result;
 use dash_router_core::{EvictableStorage, LogRanges, Op, Ranges, Seq, Storage, Units};
@@ -104,13 +108,30 @@ fn set_log_entry<L: LogKey>(map: &mut LogRanges<L>, log: &L, ranges: Ranges) {
 }
 
 /// The relay's disk cache: a redb-backed [`AsyncEvictableStorage`].
+///
+/// Spec §3: relay-store errors are indistinguishable from sheds/evictions —
+/// a transient disk hiccup must not kill the node task. So every fallible
+/// redb call in the `Storage`/`EvictableStorage` impls below degrades
+/// rather than panics: a failed write is treated as a shed (dropped, cache
+/// left as-is), a failed read returns only what was readable. All summary
+/// reads (`held_of`/`held_all`/`held_payloads`/`usage`/`ingest_delta`)
+/// serve the in-memory cache directly and never touch redb at all, so they
+/// cannot fail. Every swallowed error is counted in `io_errors` so this
+/// degradation isn't silent.
 pub struct DiskRelayStore<L: LogKey> {
     db: Database,
     /// Maintained incrementally (single writer: this store); rebuilt by a
-    /// full scan in [`Self::open`]. Corruption here is repaired by reopen.
+    /// full scan in [`Self::open`]. A redb error during an update leaves
+    /// this cache exactly as it was (see the module-level note above) —
+    /// corruption or drift here is repaired by reopening.
     held: LogRanges<L>,
     payloads: LogRanges<L>,
     usage: Units,
+    /// Count of redb operations that failed and were swallowed (degraded
+    /// to a no-op/shed) rather than propagated. `AtomicU64` rather than a
+    /// plain field so `fetch`/`ingest_delta`-style `&self` reads can bump
+    /// it too; single store owner, so `Relaxed` ordering is enough.
+    io_errors: AtomicU64,
 }
 
 impl<L: LogKey> DiskRelayStore<L> {
@@ -158,13 +179,27 @@ impl<L: LogKey> DiskRelayStore<L> {
             held,
             payloads,
             usage,
+            io_errors: AtomicU64::new(0),
         })
+    }
+
+    /// Count of redb operations that failed and were degraded (dropped
+    /// write / partial read) rather than panicking. See the struct's
+    /// doc comment: this is the diagnostic surface for that degradation.
+    pub fn io_errors(&self) -> u64 {
+        self.io_errors.load(Ordering::Relaxed)
+    }
+
+    fn note_io_error(&self) {
+        self.io_errors.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Recompute `held`/`payloads` for exactly this log from a fresh
     /// prefix scan: eviction is rare, so recompute-per-touched-log keeps
     /// the incremental cache trivially correct rather than requiring a
-    /// delta-tracking eviction path.
+    /// delta-tracking eviction path. Returns `Err` on any redb failure
+    /// without touching `held`/`payloads` (they're only written after the
+    /// whole scan succeeds), so callers can leave the cache as-is on error.
     fn rebuild_log(&mut self, log: &L) -> Result<()> {
         let (lo, hi) = log_bounds(log);
         let mut seqs = vec![];
@@ -197,11 +232,15 @@ impl<L: LogKey> DiskRelayStore<L> {
 // comment for the same reasoning. Implementing the sync traits picks up
 // `AsyncStorage`/`AsyncEvictableStorage` "for free" via the blanket bridge.
 //
-// redb errors here (corruption, I/O failure) are treated as fatal for this
-// single-embedded-writer store, matching how `MemStore` treats mutex
-// poisoning: `.expect(...)`, not a recoverable `Result`, since the sync
-// `Storage` trait has no room for one. `open`'s `Result` remains the
-// fallible surface for construction (missing directory, bad file, etc).
+// Controller ruling (fix round 1): redb errors must degrade, never panic —
+// spec §3 treats relay-store errors as indistinguishable from sheds/
+// evictions, so a transient disk hiccup must not kill the node task. Every
+// fallible redb call below is therefore wrapped in a private `anyhow`
+// closure and handled with `.ok()`/`match`, not `?`/`.expect(...)`:
+// `ingest`/`evict`/`evict_payloads` drop the whole operation (cache
+// untouched) on any failure, and `fetch` returns whatever was readable
+// before the failure. `open`'s `Result` is still the fallible surface for
+// construction. Every swallowed error bumps `io_errors`.
 impl<L: LogKey> Storage<L> for DiskRelayStore<L> {
     fn held_of(&self, logs: &BTreeSet<L>) -> LogRanges<L> {
         LogRanges::from_pairs(logs.iter().map(|log| {
@@ -217,66 +256,99 @@ impl<L: LogKey> Storage<L> for DiskRelayStore<L> {
     }
 
     fn fetch(&self, ranges: &LogRanges<L>) -> Vec<(L, Seq, Op)> {
-        let read_txn = self.db.begin_read().expect("redb begin_read");
-        let table = read_txn.open_table(TABLE).expect("redb open_table");
         let mut out = vec![];
+        let read_txn = match self.db.begin_read() {
+            Ok(txn) => txn,
+            Err(_) => {
+                self.note_io_error();
+                return out;
+            }
+        };
+        let table = match read_txn.open_table(TABLE) {
+            Ok(t) => t,
+            Err(_) => {
+                self.note_io_error();
+                return out;
+            }
+        };
         for (log, r) in ranges.iter() {
             if r.is_empty() {
                 continue;
             }
             let (lo, hi) = log_bounds(log);
-            for row in table
-                .range(lo.as_slice()..=hi.as_slice())
-                .expect("redb range")
-            {
-                let (k, v) = row.expect("redb row");
+            let rows = match table.range(lo.as_slice()..=hi.as_slice()) {
+                Ok(rows) => rows,
+                Err(_) => {
+                    self.note_io_error();
+                    continue;
+                }
+            };
+            for row in rows {
+                let (k, v) = match row {
+                    Ok(kv) => kv,
+                    Err(_) => {
+                        self.note_io_error();
+                        continue;
+                    }
+                };
                 let seq = row_seq::<L>(k.value());
-                if r.contains(seq) {
-                    let op: Op = postcard::from_bytes(v.value()).expect("postcard decode");
-                    out.push((log.clone(), seq, op));
+                if !r.contains(seq) {
+                    continue;
+                }
+                match postcard::from_bytes::<Op>(v.value()) {
+                    Ok(op) => out.push((log.clone(), seq, op)),
+                    Err(_) => self.note_io_error(),
                 }
             }
         }
+        // Whatever was readable before any failure — indistinguishable
+        // from those rows having already been evicted.
         out
     }
 
     fn ingest(&mut self, log: L, seq: Seq, op: Op) {
         let key = row_key(&log, seq);
-        let mut is_new = false;
-        let mut upgraded = false;
-        let mut delta: Units = 0;
-        {
-            let write_txn = self.db.begin_write().expect("redb begin_write");
-            {
-                let mut table = write_txn.open_table(TABLE).expect("redb open_table");
+        // Do every fallible redb/postcard call inside this closure, and
+        // only touch `self.held`/`self.payloads`/`self.usage` if it fully
+        // succeeds: a failure anywhere here is a dropped write (a shed),
+        // not a partial one, so the cache must stay exactly as it was.
+        let outcome: anyhow::Result<(bool, bool, Units)> = (|| {
+            let write_txn = self.db.begin_write()?;
+            let (is_new, upgraded, delta) = {
+                let mut table = write_txn.open_table(TABLE)?;
                 let existing: Option<Op> = table
-                    .get(key.as_slice())
-                    .expect("redb get")
-                    .map(|v| postcard::from_bytes(v.value()).expect("postcard decode"));
+                    .get(key.as_slice())?
+                    .map(|v| postcard::from_bytes(v.value()))
+                    .transpose()?;
                 match existing {
                     None => {
-                        is_new = true;
-                        delta = if op.payload.is_some() { 2 } else { 1 };
-                        let bytes = postcard::to_stdvec(&op).expect("postcard encode");
-                        table
-                            .insert(key.as_slice(), bytes.as_slice())
-                            .expect("redb insert");
+                        let delta = if op.payload.is_some() { 2 } else { 1 };
+                        let bytes = postcard::to_stdvec(&op)?;
+                        table.insert(key.as_slice(), bytes.as_slice())?;
+                        (true, false, delta)
                     }
                     Some(e) if e.payload.is_none() && op.payload.is_some() => {
-                        upgraded = true;
-                        delta = 1;
-                        let bytes = postcard::to_stdvec(&op).expect("postcard encode");
-                        table
-                            .insert(key.as_slice(), bytes.as_slice())
-                            .expect("redb insert");
+                        let bytes = postcard::to_stdvec(&op)?;
+                        table.insert(key.as_slice(), bytes.as_slice())?;
+                        (false, true, 1)
                     }
                     Some(_) => {
                         // Duplicate: op already held at least as good. No write.
+                        (false, false, 0)
                     }
                 }
+            };
+            write_txn.commit()?;
+            Ok((is_new, upgraded, delta))
+        })();
+
+        let (is_new, upgraded, delta) = match outcome {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                self.note_io_error();
+                return;
             }
-            write_txn.commit().expect("redb commit");
-        }
+        };
         self.usage += delta;
         if is_new {
             let merged = self
@@ -302,24 +374,21 @@ impl<L: LogKey> EvictableStorage<L> for DiskRelayStore<L> {
         self.usage
     }
 
+    /// Served entirely from the `held`/`payloads` cache — never touches
+    /// redb, so this can't fail. This mirrors `OpsMap::ingest_delta`
+    /// exactly as long as the cache is accurate, which `ingest`/`evict`/
+    /// `evict_payloads` maintain as an invariant (falling back to a stale
+    /// cache, never a wrong one, on I/O failure — see their doc comments).
     fn ingest_delta(&self, log: &L, seq: Seq, op: &Op) -> Units {
-        let key = row_key(log, seq);
-        let read_txn = self.db.begin_read().expect("redb begin_read");
-        let table = read_txn.open_table(TABLE).expect("redb open_table");
-        let existing: Option<Op> = table
-            .get(key.as_slice())
-            .expect("redb get")
-            .map(|v| postcard::from_bytes(v.value()).expect("postcard decode"));
-        match existing {
-            None => {
-                if op.payload.is_some() {
-                    2
-                } else {
-                    1
-                }
-            }
-            Some(e) if e.payload.is_none() && op.payload.is_some() => 1,
-            Some(_) => 0,
+        let already_held = self.held.get(log).is_some_and(|r| r.contains(seq));
+        if !already_held {
+            return if op.payload.is_some() { 2 } else { 1 };
+        }
+        let has_payload = self.payloads.get(log).is_some_and(|r| r.contains(seq));
+        if !has_payload && op.payload.is_some() {
+            1
+        } else {
+            0
         }
     }
 
@@ -333,22 +402,20 @@ impl<L: LogKey> EvictableStorage<L> for DiskRelayStore<L> {
                 continue;
             }
             let (lo, hi) = log_bounds(log);
-            let mut units_removed: Units = 0;
-            {
-                let write_txn = self.db.begin_write().expect("redb begin_write");
+            // As in `ingest`: every fallible call is inside this closure,
+            // and `self.usage`/the cache are only touched on full success.
+            let outcome: anyhow::Result<Units> = (|| {
+                let write_txn = self.db.begin_write()?;
+                let mut units_removed: Units = 0;
                 {
-                    let mut table = write_txn.open_table(TABLE).expect("redb open_table");
+                    let mut table = write_txn.open_table(TABLE)?;
                     let mut updates = vec![];
-                    for row in table
-                        .range(lo.as_slice()..=hi.as_slice())
-                        .expect("redb range")
-                    {
-                        let (k, v) = row.expect("redb row");
+                    for row in table.range(lo.as_slice()..=hi.as_slice())? {
+                        let (k, v) = row?;
                         let key = k.value().to_vec();
                         let seq = row_seq::<L>(&key);
                         if r.contains(seq) {
-                            let op: Op =
-                                postcard::from_bytes(v.value()).expect("postcard decode");
+                            let op: Op = postcard::from_bytes(v.value())?;
                             if op.payload.is_some() {
                                 units_removed += 1;
                                 updates.push((
@@ -362,16 +429,27 @@ impl<L: LogKey> EvictableStorage<L> for DiskRelayStore<L> {
                         }
                     }
                     for (key, op) in updates {
-                        let bytes = postcard::to_stdvec(&op).expect("postcard encode");
-                        table
-                            .insert(key.as_slice(), bytes.as_slice())
-                            .expect("redb insert");
+                        let bytes = postcard::to_stdvec(&op)?;
+                        table.insert(key.as_slice(), bytes.as_slice())?;
                     }
                 }
-                write_txn.commit().expect("redb commit");
+                write_txn.commit()?;
+                Ok(units_removed)
+            })();
+
+            match outcome {
+                Ok(units_removed) => {
+                    self.usage -= units_removed;
+                    // The write already committed; a failure rebuilding the
+                    // cache leaves it stale (still shows the pre-eviction
+                    // payload range) rather than guessed-at — repaired by
+                    // the next reopen's full scan.
+                    if self.rebuild_log(log).is_err() {
+                        self.note_io_error();
+                    }
+                }
+                Err(_) => self.note_io_error(),
             }
-            self.usage -= units_removed;
-            self.rebuild_log(log).expect("rebuild_log");
         }
     }
 
@@ -381,34 +459,39 @@ impl<L: LogKey> EvictableStorage<L> for DiskRelayStore<L> {
                 continue;
             }
             let (lo, hi) = log_bounds(log);
-            let mut units_removed: Units = 0;
-            {
-                let write_txn = self.db.begin_write().expect("redb begin_write");
+            let outcome: anyhow::Result<Units> = (|| {
+                let write_txn = self.db.begin_write()?;
+                let mut units_removed: Units = 0;
                 {
-                    let mut table = write_txn.open_table(TABLE).expect("redb open_table");
+                    let mut table = write_txn.open_table(TABLE)?;
                     let mut removals = vec![];
-                    for row in table
-                        .range(lo.as_slice()..=hi.as_slice())
-                        .expect("redb range")
-                    {
-                        let (k, v) = row.expect("redb row");
+                    for row in table.range(lo.as_slice()..=hi.as_slice())? {
+                        let (k, v) = row?;
                         let key = k.value().to_vec();
                         let seq = row_seq::<L>(&key);
                         if r.contains(seq) {
-                            let op: Op =
-                                postcard::from_bytes(v.value()).expect("postcard decode");
+                            let op: Op = postcard::from_bytes(v.value())?;
                             units_removed += if op.payload.is_some() { 2 } else { 1 };
                             removals.push(key);
                         }
                     }
                     for key in removals {
-                        table.remove(key.as_slice()).expect("redb remove");
+                        table.remove(key.as_slice())?;
                     }
                 }
-                write_txn.commit().expect("redb commit");
+                write_txn.commit()?;
+                Ok(units_removed)
+            })();
+
+            match outcome {
+                Ok(units_removed) => {
+                    self.usage -= units_removed;
+                    if self.rebuild_log(log).is_err() {
+                        self.note_io_error();
+                    }
+                }
+                Err(_) => self.note_io_error(),
             }
-            self.usage -= units_removed;
-            self.rebuild_log(log).expect("rebuild_log");
         }
     }
 }
@@ -484,6 +567,75 @@ mod tests {
             dash_router_core::EvictableStorage::held_payloads(&oracle)
         );
         assert_eq!(store.usage().await.unwrap(), dash_router_core::EvictableStorage::usage(&oracle));
+    }
+
+    /// Fix round 1 (controller ruling): redb errors must degrade, never
+    /// panic, since spec §3 treats relay-store errors as indistinguishable
+    /// from sheds/evictions. Fakes a redb failure cheaply by writing a
+    /// non-postcard row directly through redb (bypassing `DiskRelayStore`
+    /// entirely, so its cache doesn't know the row exists) and checking
+    /// that `fetch` skips it instead of panicking, and that `ingest` over
+    /// the same corrupted row drops the write (leaving the cache and
+    /// `usage` exactly as they were) instead of panicking — both counted
+    /// in `io_errors` rather than silent.
+    #[tokio::test]
+    async fn degraded_redb_reads_are_swallowed_not_panicked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.redb");
+        let mut store = DiskRelayStore::<u32>::open(&path).unwrap();
+
+        store.ingest(1, 0, op(1, true)).await.unwrap();
+        assert_eq!(store.io_errors(), 0);
+
+        // Corrupt a second row directly through redb: `DiskRelayStore`
+        // never sees this write, so its `held`/`payloads` cache has no
+        // idea seq 1 exists at all.
+        let corrupt_key = super::row_key(&1u32, 1);
+        {
+            let write_txn = store.db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(super::TABLE).unwrap();
+                table
+                    .insert(corrupt_key.as_slice(), b"not valid postcard".as_slice())
+                    .unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        // `fetch` returns only what was readable — the corrupted row is
+        // skipped, not panicked on.
+        let all = LogRanges::from_pairs([(1u32, Ranges::full())]);
+        let got = store.fetch(&all).await.unwrap();
+        assert_eq!(got, vec![(1u32, 0, op(1, true))]);
+        assert!(store.io_errors() >= 1, "the decode failure was counted");
+
+        // `ingest` reading that same corrupted row as its "existing" value
+        // fails, so the whole write is dropped as a shed: cache and usage
+        // stay exactly as they were, no panic.
+        let held_before = store.held_all().await.unwrap();
+        let payloads_before = store.held_payloads().await.unwrap();
+        let usage_before = store.usage().await.unwrap();
+        let errors_before = store.io_errors();
+        store.ingest(1, 1, op(9, true)).await.unwrap();
+        assert_eq!(
+            store.held_all().await.unwrap(),
+            held_before,
+            "held cache untouched by a shed ingest"
+        );
+        assert_eq!(
+            store.held_payloads().await.unwrap(),
+            payloads_before,
+            "payload cache untouched by a shed ingest"
+        );
+        assert_eq!(
+            store.usage().await.unwrap(),
+            usage_before,
+            "usage untouched by a shed ingest"
+        );
+        assert!(
+            store.io_errors() > errors_before,
+            "the failed ingest was also counted"
+        );
     }
 
     /// Task 10's node task `tokio::spawn`s a future holding an
