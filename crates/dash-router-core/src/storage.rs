@@ -43,6 +43,10 @@ pub trait EvictableStorage<L: Ord>: Storage<L> {
     fn evict_payloads(&mut self, ranges: &LogRanges<L>);
     /// Drop ops (header and payload) within the given ranges.
     fn evict(&mut self, ranges: &LogRanges<L>);
+    /// The unit delta `ingest(log, seq, op)` would add: 0 duplicate, 1
+    /// payload-upgrade or new header-only, 2 new payload-bearing. Cap checks
+    /// must use the same arithmetic as the store (see [`OpsMap::ingest_delta`]).
+    fn ingest_delta(&self, log: &L, seq: Seq, op: &Op) -> Units;
 }
 
 /// A simple in-memory reference [`Storage`]/[`EvictableStorage`]: a
@@ -168,6 +172,10 @@ impl<L: Ord + Clone> EvictableStorage<L> for OpsMap<L> {
                 }
             }
         }
+    }
+
+    fn ingest_delta(&self, log: &L, seq: Seq, op: &Op) -> Units {
+        OpsMap::ingest_delta(self, log, seq, op)
     }
 }
 
