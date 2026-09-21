@@ -101,6 +101,28 @@ impl<L: Ord + Clone> Storage<L> for OpsMap<L> {
     }
 }
 
+impl<L: Ord> OpsMap<L> {
+    /// The unit delta that `ingest(log, seq, op)` would add: 0 for a
+    /// duplicate (op already held at least as good), 1 for a payload
+    /// upgrade over a held header-only op, 2/1 for a genuinely new
+    /// payload-bearing/header-only op. Shared by [`RelayStoreMachine`]'s cap
+    /// check and the node glue's shed check so the two cannot drift.
+    pub fn ingest_delta(&self, log: &L, seq: Seq, op: &Op) -> Units {
+        let existing = self.0.get(log).and_then(|ops| ops.get(&seq));
+        match existing {
+            None => {
+                if op.payload.is_some() {
+                    2
+                } else {
+                    1
+                }
+            }
+            Some(existing) if existing.payload.is_none() && op.payload.is_some() => 1,
+            Some(_) => 0,
+        }
+    }
+}
+
 impl<L: Ord + Clone> EvictableStorage<L> for OpsMap<L> {
     fn usage(&self) -> Units {
         self.0
@@ -191,18 +213,7 @@ impl<L: Id> Machine for RelayStoreMachine<L> {
         let mut fx = vec![];
         match action {
             RelayStoreAction::Ingest(log, seq, op) => {
-                let existing = s.0.0.get(&log).and_then(|ops| ops.get(&seq));
-                let delta: Units = match existing {
-                    None => {
-                        if op.payload.is_some() {
-                            2
-                        } else {
-                            1
-                        }
-                    }
-                    Some(existing) if existing.payload.is_none() && op.payload.is_some() => 1,
-                    Some(_) => 0,
-                };
+                let delta: Units = s.0.ingest_delta(&log, seq, &op);
                 ensure!(
                     self.cap >= s.0.usage() + delta,
                     "would exceed cap: not enabled"
