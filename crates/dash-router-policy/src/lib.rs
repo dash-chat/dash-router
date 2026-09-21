@@ -1,4 +1,4 @@
-//! Interval policies: the tuning subject.
+//! Pure timing policies: the tuning subject, shared by the simulator and the tokio shell.
 //!
 //! A policy is a pure sampling function from (rng, network size estimate)
 //! to a duration. The simulation feeds it the *true* network size as an
@@ -51,6 +51,27 @@ impl IntervalPolicy {
     }
 }
 
+/// When to flush pending pushed appends (spec §4). Pure: given the times,
+/// returns the flush deadline; the shell owns the clock.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PushDebouncePolicy {
+    /// Quiet window after the latest append before flushing.
+    pub window_ms: u64,
+    /// Hard cap after the OLDEST pending append, so a steady append
+    /// stream still pushes instead of re-arming forever.
+    pub max_latency_ms: u64,
+}
+
+impl PushDebouncePolicy {
+    /// The moment to flush, given when the oldest still-pending append
+    /// happened and when the latest one did.
+    pub fn deadline(&self, oldest_pending: Duration, latest_append: Duration) -> Duration {
+        let window = latest_append + Duration::from_millis(self.window_ms);
+        let cap = oldest_pending + Duration::from_millis(self.max_latency_ms);
+        window.min(cap)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,5 +106,21 @@ mod tests {
         let at_40 = p.sample(&mut rng, 40);
         assert_eq!(at_10, Duration::from_millis(100));
         assert_eq!(at_40, Duration::from_millis(400));
+    }
+
+    #[test]
+    fn debounce_extends_on_appends_but_the_max_latency_cap_wins() {
+        let p = PushDebouncePolicy {
+            window_ms: 100,
+            max_latency_ms: 250,
+        };
+        let ms = Duration::from_millis;
+        // One lone append: flush a window after it.
+        assert_eq!(p.deadline(ms(1000), ms(1000)), ms(1100));
+        // A later append extends the quiet window...
+        assert_eq!(p.deadline(ms(1000), ms(1120)), ms(1220));
+        // ...until the cap from the OLDEST pending append wins.
+        assert_eq!(p.deadline(ms(1000), ms(1200)), ms(1250));
+        assert_eq!(p.deadline(ms(1000), ms(1400)), ms(1250));
     }
 }
