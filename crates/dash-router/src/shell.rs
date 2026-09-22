@@ -83,8 +83,12 @@ pub struct NodeCore<N: Id, L: Log, E, R, I> {
     pub router: RouterStateMachine<N, L, RealTime>,
     pub ext: E,
     pub relay: R,
-    pub subscriptions: BTreeSet<L>,
-    /// Derived: last known ext ∪ relay ∪ empty markers for subscriptions.
+    /// Subscriptions by prefix (spec 2026-09-22 §3.5): a log is subscribed
+    /// iff its prefix is. Mirrors `NodeState::subscriptions`.
+    pub subscriptions: BTreeSet<L::Prefix>,
+    /// Derived: last known ext ∪ relay. No empty markers: a subscribed
+    /// prefix with nothing stored is advertised by the Want's `prefixes`
+    /// (the router's `open` set), not by a per-log marker.
     held_cache: LogRanges<L>,
     intervals: I,
     debounce: PushDebouncePolicy,
@@ -110,12 +114,15 @@ where
     pub fn new(
         id: N,
         config: CoreConfig,
-        subscriptions: BTreeSet<L>,
+        subscriptions: BTreeSet<L::Prefix>,
         ext: E,
         relay: R,
         intervals: I,
     ) -> Self {
-        let state = RouterState::new(id, LogRanges::empty());
+        // Mirrors `NodeState::new`: the router starts with the subscribed
+        // prefixes open.
+        let mut state = RouterState::new(id, LogRanges::empty());
+        state.open = subscriptions.clone();
         let machine = RouterMachine::new(config.router);
         let router = RouterStateMachine::new(machine, state);
         Self {
@@ -135,6 +142,11 @@ where
             dropped_msgs: 0,
             relay_errors: 0,
         }
+    }
+
+    /// A log is subscribed iff its prefix is (`NodeState::is_subscribed`).
+    pub fn is_subscribed(&self, log: &L) -> bool {
+        self.subscriptions.contains(&log.prefix())
     }
 
     /// Read the initial held snapshot from storage and arm the first Want
@@ -257,9 +269,11 @@ where
                 // Finding 8(a): an EMPTY Want must not arm the have timer —
                 // otherwise it arms a forever no-op fire/re-arm loop (fire
                 // finds nothing to reply to, re-arms, repeats). Gate on the
-                // received ranges being non-empty, mirrored exactly by the
-                // conformance driver (see tests/conformance.rs).
-                let ranges_nonempty = !ranges.is_empty();
+                // received Want naming something — ranges or prefixes (a
+                // prefix-only Want is a real request: it asks for every log
+                // under the prefix) — mirrored exactly by the conformance
+                // driver (see tests/conformance.rs).
+                let want_nonempty = !ranges.is_empty() || !prefixes.is_empty();
                 let fx = self.router.step(RouterAction::RecvWant {
                     from: msg.sender,
                     ranges,
@@ -270,7 +284,7 @@ where
                 // A witnessed Want is what makes arming the Have timer
                 // legal (mirrors the sim behavior's arm-on-recv): do it
                 // right after the Recv, in the same call.
-                if ranges_nonempty && self.router.have_timer.is_none() {
+                if want_nonempty && self.router.have_timer.is_none() {
                     let next = self.intervals.next_have();
                     self.router.step(RouterAction::ArmHaveTimer(next.into()))?;
                 }
@@ -326,41 +340,71 @@ where
         Ok(out)
     }
 
-    /// Start caring about a log: migrate any relay-side bytes for it to
-    /// `ext`, then evict it from the relay (`NodeAction::Subscribe`'s glue).
-    pub async fn on_subscribe(&mut self, now: Duration, log: L) -> Result<Vec<Out<N, L>>> {
+    /// Start caring about every log under a prefix (`NodeAction::Subscribe`'s
+    /// glue): migrate every relay-held log under it to `ext`, evict those
+    /// logs from the relay, then open the prefix on the router.
+    pub async fn on_subscribe(
+        &mut self,
+        now: Duration,
+        prefix: L::Prefix,
+    ) -> Result<Vec<Out<N, L>>> {
         let mut out = self.advance_to(now).await?;
-        self.subscriptions.insert(log);
-        let all = LogRanges::from_pairs([(log, Ranges::full())]);
-        match self.relay.fetch(&all).await {
-            Ok(ops) => {
-                for (l, seq, op) in ops {
-                    if let Err(e) = self.ext.ingest(l, seq, op).await {
-                        out.push(Out::Event(RouterEvent::StorageError(StorageErrorReport {
-                            context: "on_subscribe: ext.ingest",
-                            message: e.to_string(),
-                        })));
+        self.subscriptions.insert(prefix);
+        // `NodeState::relay_logs_under`: every relay-held log under the
+        // prefix, as full ranges.
+        let under: LogRanges<L> = match self.relay.held_all().await {
+            Ok(all) => LogRanges::from_pairs(
+                all.iter()
+                    .filter(|(log, _)| log.prefix() == prefix)
+                    .map(|(log, _)| (*log, Ranges::full())),
+            ),
+            Err(_) => {
+                self.relay_errors += 1;
+                LogRanges::empty()
+            }
+        };
+        if !under.is_empty() {
+            match self.relay.fetch(&under).await {
+                Ok(ops) => {
+                    for (l, seq, op) in ops {
+                        if let Err(e) = self.ext.ingest(l, seq, op).await {
+                            out.push(Out::Event(RouterEvent::StorageError(StorageErrorReport {
+                                context: "on_subscribe: ext.ingest",
+                                message: e.to_string(),
+                            })));
+                        }
                     }
                 }
+                Err(_) => self.relay_errors += 1,
             }
-            Err(_) => self.relay_errors += 1,
+            if self.relay.evict(&under).await.is_err() {
+                self.relay_errors += 1;
+            }
         }
-        if self.relay.evict(&all).await.is_err() {
-            self.relay_errors += 1;
-        }
-        let touched = BTreeSet::from([log]);
+        self.router
+            .step(RouterAction::Open(self.subscriptions.clone()))?;
+        let touched: BTreeSet<L> = under.iter().map(|(l, _)| *l).collect();
         self.reconcile_held(Some(&touched), &mut out).await?;
         Ok(out)
     }
 
-    /// Kept-as-is ruling (binding semantics #7): remove the subscription and
-    /// reconcile; still-held data keeps advertising and wanting until it is
-    /// otherwise evicted.
-    pub async fn on_unsubscribe(&mut self, now: Duration, log: L) -> Result<Vec<Out<N, L>>> {
+    /// Kept-as-is ruling (binding semantics #7): remove the subscription,
+    /// close the prefix on the router, and reconcile. Nothing is migrated
+    /// or forgotten: still-held data keeps advertising until it is
+    /// otherwise evicted, and later Haves under the prefix park in the
+    /// relay. The `Held` re-step is a full rebuild (there is no per-log
+    /// marker to drop any more) so the router sees the same snapshot the
+    /// reference's `reconcile_held` gives it.
+    pub async fn on_unsubscribe(
+        &mut self,
+        now: Duration,
+        prefix: L::Prefix,
+    ) -> Result<Vec<Out<N, L>>> {
         let mut out = self.advance_to(now).await?;
-        self.subscriptions.remove(&log);
-        let touched = BTreeSet::from([log]);
-        self.reconcile_held(Some(&touched), &mut out).await?;
+        self.subscriptions.remove(&prefix);
+        self.router
+            .step(RouterAction::Open(self.subscriptions.clone()))?;
+        self.reconcile_held(None, &mut out).await?;
         Ok(out)
     }
 
@@ -452,7 +496,7 @@ where
             match e {
                 Effect::Accept(novel) => {
                     for (log, r) in novel.iter() {
-                        if !self.subscriptions.contains(log) {
+                        if !self.is_subscribed(log) {
                             continue;
                         }
                         // Never iterate `Ranges` directly — it may be open;
@@ -556,7 +600,7 @@ where
                 let merged = ext_held.union(&relay_held);
                 for log in logs {
                     let m = merged.get(log).cloned().unwrap_or_else(Ranges::empty);
-                    if m.is_empty() && !self.subscriptions.contains(log) {
+                    if m.is_empty() {
                         self.held_cache.remove(log);
                     } else {
                         self.held_cache.insert(*log, m);
@@ -581,13 +625,7 @@ where
                         return Ok(());
                     }
                 };
-                let mut merged = ext_all.union(&relay_all);
-                for log in &self.subscriptions {
-                    if merged.get(log).is_none() {
-                        merged.insert(*log, Ranges::empty());
-                    }
-                }
-                self.held_cache = merged;
+                self.held_cache = ext_all.union(&relay_all);
             }
         }
         self.router
@@ -621,7 +659,7 @@ where
         // direction the disk store itself lives by.
         let mut usage: Option<Units> = None;
         for ((log, seq), op) in parked {
-            if self.subscriptions.contains(log) {
+            if self.is_subscribed(log) {
                 if let Err(e) = self.ext.ingest(*log, *seq, op.clone()).await {
                     failed.insert((*log, *seq));
                     out.push(Out::Event(RouterEvent::StorageError(StorageErrorReport {
@@ -675,7 +713,7 @@ pub fn spawn<N, L, E, R, T, I>(
     id: N,
     config: CoreConfig,
     maintain_interval: Duration,
-    subscriptions: BTreeSet<L>,
+    subscriptions: BTreeSet<L::Prefix>,
     ext: E,
     relay: R,
     transport: T,
@@ -741,17 +779,17 @@ where
                                 }
                             }
                         }
-                        Some(Command::Subscribe { log, reply }) => {
+                        Some(Command::Subscribe { prefix, reply }) => {
                             let now = epoch.elapsed();
-                            let out = core.on_subscribe(now, log).await?;
+                            let out = core.on_subscribe(now, prefix).await?;
                             let _ = reply.send(Ok(()));
                             if !route_outs(out, &mut transport, &event_tx).await? {
                                 break;
                             }
                         }
-                        Some(Command::Unsubscribe { log, reply }) => {
+                        Some(Command::Unsubscribe { prefix, reply }) => {
                             let now = epoch.elapsed();
-                            let out = core.on_unsubscribe(now, log).await?;
+                            let out = core.on_unsubscribe(now, prefix).await?;
                             let _ = reply.send(Ok(()));
                             if !route_outs(out, &mut transport, &event_tx).await? {
                                 break;
@@ -999,6 +1037,87 @@ mod tests {
         assert_eq!(groups[0].1.len(), 1, "hydration only finds the stored op");
     }
 
+    /// Mirror of core `prefix::subscribe_prefix_migrates_all_relay_logs_under_it`
+    /// and review focus 1, over the async core with `Pair` logs.
+    #[tokio::test]
+    async fn subscribe_prefix_migrates_relay_logs_and_delivers_new_authors() {
+        use dash_router_core::Pair;
+        // The module's `wire` helper is typed for `u8` logs; this test's
+        // logs are `Pair`, so encode the same LAN-sourced `Incoming` here.
+        let wire = |msg: WireMessage<u32, Pair>| Incoming {
+            remote: Some("192.168.0.9".parse().unwrap()),
+            bytes: msg.encode(),
+        };
+        let mut c: NodeCore<u32, Pair, OpsMap<Pair>, OpsMap<Pair>, Scripted> = NodeCore::new(
+            0,
+            config(1 << 20),
+            BTreeSet::new(),
+            OpsMap::default(),
+            OpsMap::default(),
+            Scripted::ms(&[1000]),
+        );
+        c.init().await.unwrap();
+        let a1 = Pair::new(1, 1);
+        let a2 = Pair::new(1, 2);
+        let have = |from: u32, log: Pair, seqs: &[u32]| {
+            WireMessage::have(
+                from,
+                vec![(log, seqs.iter().map(|&q| (q, op(q as u8, true))).collect())],
+            )
+        };
+        c.on_wire(Duration::from_millis(10), wire(have(7, a1, &[0])))
+            .await
+            .unwrap();
+        c.on_wire(Duration::from_millis(11), wire(have(7, a2, &[0, 1])))
+            .await
+            .unwrap();
+        assert!(
+            Storage::held_all(&c.ext).is_empty(),
+            "unsubscribed: relay only"
+        );
+
+        c.on_subscribe(Duration::from_millis(20), 1u8)
+            .await
+            .unwrap();
+        assert_eq!(
+            Storage::held_all(&c.ext).get(&a1),
+            Some(&Ranges::range(0, 1))
+        );
+        assert_eq!(
+            Storage::held_all(&c.ext).get(&a2),
+            Some(&Ranges::range(0, 2))
+        );
+        assert!(Storage::held_all(&c.relay).is_empty());
+        assert_eq!(c.router.open, BTreeSet::from([1u8]));
+
+        let a3 = Pair::new(1, 3);
+        let out = c
+            .on_wire(Duration::from_millis(30), wire(have(7, a3, &[0])))
+            .await
+            .unwrap();
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, Out::Event(RouterEvent::Delivered(l, 0)) if *l == a3))
+        );
+    }
+
+    /// Review focus 6: a Want naming no ranges and no prefixes must not arm
+    /// the have timer; a prefix-only Want must.
+    #[tokio::test]
+    async fn prefix_only_want_arms_have_timer_but_empty_want_does_not() {
+        let mut c = core(100, &[]).await;
+        let empty = WireMessage::want(7, LogRanges::<u8>::empty(), BTreeSet::new());
+        c.on_wire(Duration::from_millis(1), wire(empty))
+            .await
+            .unwrap();
+        assert!(c.router.have_timer.is_none(), "empty Want must not arm");
+        let prefix_only = WireMessage::want(7, LogRanges::<u8>::empty(), BTreeSet::from([0u8]));
+        c.on_wire(Duration::from_millis(2), wire(prefix_only))
+            .await
+            .unwrap();
+        assert!(c.router.have_timer.is_some(), "prefix-only Want arms");
+    }
+
     /// Push debounce: appends accumulate; the flush pushes one hydrated Have
     /// carrying every pending op; a steady stream is capped by max_latency.
     #[tokio::test]
@@ -1062,9 +1181,16 @@ mod tests {
 
         let out = c.advance_to(Duration::from_millis(100)).await.unwrap();
         let bs = broadcasts(&out);
+        // No empty per-log marker any more: a subscribed prefix with nothing
+        // stored is wanted through the Want's `prefixes`, not a `(0, full)`
+        // range.
         assert!(
-            matches!(&bs[0].body, WireBody::Want { ranges: r, .. } if r.get(&0) == Some(&Ranges::full())),
-            "fresh subscription wants the whole log"
+            matches!(
+                &bs[0].body,
+                WireBody::Want { ranges, prefixes }
+                    if prefixes.contains(&0) && ranges.get(&0).is_none()
+            ),
+            "fresh subscription wants the whole prefix"
         );
 
         // Seed storage: `held` updates immediately (before any debounced
