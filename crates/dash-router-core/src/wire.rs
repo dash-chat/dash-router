@@ -1,38 +1,56 @@
 //! The versioned LAN broadcast payload. postcard-encoded, matching
 //! p2panda's own serialization choice. See spec §6.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
+    log::{Log, WireLog},
     op::Op,
     ranges::{LogRanges, Seq},
 };
 
 /// Bump together with the gossip topic on breaking change.
-pub const WIRE_VERSION: u8 = 0;
+/// v1: Want carries prefixes (spec 2026-09-22 §3.5).
+pub const WIRE_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct WireMessage<N, L: Ord> {
+#[serde(bound(
+    serialize = "N: Serialize, L: Serialize, L::Prefix: Serialize",
+    deserialize = "N: Deserialize<'de>, L: Deserialize<'de>, L::Prefix: Deserialize<'de>"
+))]
+pub struct WireMessage<N, L: Log> {
     pub version: u8,
-    /// Gossip strips the transport sender; we carry our own.
+    /// Gossip strips the transport sender; we carry our own. Checked
+    /// against the transport's verified author when it has one (shell).
     pub sender: N,
     pub body: WireBody<L>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum WireBody<L: Ord> {
-    Want(LogRanges<L>),
+#[serde(bound(
+    serialize = "L: Serialize, L::Prefix: Serialize",
+    deserialize = "L: Deserialize<'de>, L::Prefix: Deserialize<'de>"
+))]
+pub enum WireBody<L: Log> {
+    /// `ranges`: gaps and open tails for logs the wanter already knows.
+    /// `prefixes`: "and every log under these that I did not name".
+    Want {
+        ranges: LogRanges<L>,
+        prefixes: BTreeSet<L::Prefix>,
+    },
     /// Hydrated ops grouped per log, in (log, seq) order; payloads may be
-    /// None (GC'd). Grouping avoids repeating the 32-byte log id per op.
+    /// None (GC'd). Grouping avoids repeating the log id per op.
     Have(Vec<(L, Vec<(Seq, Op)>)>),
 }
 
-impl<N: Serialize + DeserializeOwned, L: Ord + Serialize + DeserializeOwned> WireMessage<N, L> {
-    pub fn want(sender: N, ranges: LogRanges<L>) -> Self {
+impl<N: Serialize + DeserializeOwned, L: WireLog> WireMessage<N, L> {
+    pub fn want(sender: N, ranges: LogRanges<L>, prefixes: BTreeSet<L::Prefix>) -> Self {
         Self {
             version: WIRE_VERSION,
             sender,
-            body: WireBody::Want(ranges),
+            body: WireBody::Want { ranges, prefixes },
         }
     }
 
@@ -69,8 +87,15 @@ mod tests {
 
     #[test]
     fn wire_messages_round_trip_and_reject_unknown_versions() {
-        let want: WireMessage<u32, u8> =
-            WireMessage::want(7, LogRanges::from_pairs([(1u8, Ranges::from(3))]));
+        let want: WireMessage<u32, u8> = WireMessage::want(
+            7,
+            LogRanges::from_pairs([(1u8, Ranges::from(3))]),
+            BTreeSet::from([2u8]),
+        );
+        match &want.body {
+            WireBody::Want { prefixes, .. } => assert_eq!(prefixes, &BTreeSet::from([2u8])),
+            WireBody::Have(_) => unreachable!(),
+        }
         let have: WireMessage<u32, u8> = WireMessage::have(
             7,
             vec![(
@@ -89,7 +114,7 @@ mod tests {
             assert_eq!(WireMessage::decode(&bytes).unwrap(), msg);
         }
 
-        let mut bad = WireMessage::<u32, u8>::want(7, LogRanges::empty()).encode();
+        let mut bad = WireMessage::<u32, u8>::want(7, LogRanges::empty(), BTreeSet::new()).encode();
         bad[0] = WIRE_VERSION + 1; // version is the first postcard field (u8)
         assert!(WireMessage::<u32, u8>::decode(&bad).is_err());
     }

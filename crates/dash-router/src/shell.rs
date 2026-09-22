@@ -17,8 +17,8 @@ use std::time::Duration;
 use anyhow::Result;
 use dash_router_core::router::RouterStateMachine;
 use dash_router_core::{
-    Effect, LogRanges, Op, Ranges, RouterAction, RouterConfig, RouterMachine, RouterState, Seq,
-    Units, WireBody, WireMessage, eviction_candidates, group_ops, ranges_of,
+    Effect, Log, LogRanges, Op, Ranges, RouterAction, RouterConfig, RouterMachine, RouterState,
+    Seq, Units, WireBody, WireLog, WireMessage, eviction_candidates, group_ops, ranges_of,
 };
 use dash_router_policy::{IntervalPolicy, PushDebouncePolicy};
 use polestar::prelude::*;
@@ -71,7 +71,7 @@ pub struct CoreConfig {
 /// A single unit of shell output: either a wire message to broadcast, or an
 /// event for the embedder (spec §5).
 #[derive(Debug)]
-pub enum Out<N, L: Ord> {
+pub enum Out<N, L: Log> {
     Broadcast(WireMessage<N, L>),
     Event(RouterEvent<L>),
 }
@@ -79,7 +79,7 @@ pub enum Out<N, L: Ord> {
 /// The shell's routing table: one owner of the pure [`RouterState`] plus
 /// both async stores. See the module doc for the deliberate-duplication
 /// rationale relative to `NodeMachine`.
-pub struct NodeCore<N: Id, L: Id, E, R, I> {
+pub struct NodeCore<N: Id, L: Log, E, R, I> {
     pub router: RouterStateMachine<N, L, RealTime>,
     pub ext: E,
     pub relay: R,
@@ -102,7 +102,7 @@ pub struct NodeCore<N: Id, L: Id, E, R, I> {
 impl<N, L, E, R, I> NodeCore<N, L, E, R, I>
 where
     N: Id + serde::Serialize + serde::de::DeserializeOwned,
-    L: Id + serde::Serialize + serde::de::DeserializeOwned,
+    L: WireLog,
     E: AsyncStorage<L>,
     R: AsyncEvictableStorage<L>,
     I: IntervalSource,
@@ -253,7 +253,7 @@ where
             return Ok(out);
         }
         match msg.body {
-            WireBody::Want(ranges) => {
+            WireBody::Want { ranges, prefixes } => {
                 // Finding 8(a): an EMPTY Want must not arm the have timer —
                 // otherwise it arms a forever no-op fire/re-arm loop (fire
                 // finds nothing to reply to, re-arms, repeats). Gate on the
@@ -263,6 +263,7 @@ where
                 let fx = self.router.step(RouterAction::RecvWant {
                     from: msg.sender,
                     ranges,
+                    prefixes,
                 })?;
                 self.route_fx(fx, &BTreeMap::new(), &BTreeSet::new(), &mut out)
                     .await?;
@@ -466,8 +467,12 @@ where
                         }
                     }
                 }
-                Effect::SendWant(r) => {
-                    out.push(Out::Broadcast(WireMessage::want(self.router.id, r)));
+                Effect::SendWant { ranges, prefixes } => {
+                    out.push(Out::Broadcast(WireMessage::want(
+                        self.router.id,
+                        ranges,
+                        prefixes,
+                    )));
                 }
                 Effect::SendHave(r) => {
                     if let Some(msg) = self.hydrate(&r, out).await? {
@@ -682,7 +687,7 @@ pub fn spawn<N, L, E, R, T, I>(
 )
 where
     N: Id + serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
-    L: Id + serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    L: WireLog + Send + 'static,
     E: AsyncStorage<L> + WatchableStorage<L> + Send + 'static,
     R: AsyncEvictableStorage<L> + Send + 'static,
     T: Transport + Send + 'static,
@@ -827,7 +832,7 @@ async fn route_outs<N, L, T>(
 ) -> Result<bool>
 where
     N: serde::Serialize + serde::de::DeserializeOwned,
-    L: Ord + Clone + serde::Serialize + serde::de::DeserializeOwned,
+    L: WireLog,
     T: Transport,
 {
     for o in out {
@@ -1058,7 +1063,7 @@ mod tests {
         let out = c.advance_to(Duration::from_millis(100)).await.unwrap();
         let bs = broadcasts(&out);
         assert!(
-            matches!(&bs[0].body, WireBody::Want(r) if r.get(&0) == Some(&Ranges::full())),
+            matches!(&bs[0].body, WireBody::Want { ranges: r, .. } if r.get(&0) == Some(&Ranges::full())),
             "fresh subscription wants the whole log"
         );
 
@@ -1071,7 +1076,11 @@ mod tests {
             .await
             .unwrap();
 
-        let want = WireMessage::want(7, LogRanges::from_pairs([(0u8, Ranges::full())]));
+        let want = WireMessage::want(
+            7,
+            LogRanges::from_pairs([(0u8, Ranges::full())]),
+            BTreeSet::new(),
+        );
         let _out = c
             .on_wire(Duration::from_millis(150), wire(want))
             .await
@@ -1146,6 +1155,7 @@ mod tests {
         let echo = wire(WireMessage::want(
             0,
             LogRanges::from_pairs([(0u8, Ranges::full())]),
+            BTreeSet::new(),
         ));
         for inc in [foreign, garbage, echo] {
             assert!(c.on_wire(Duration::ZERO, inc).await.unwrap().is_empty());

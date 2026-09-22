@@ -411,7 +411,7 @@ impl Driver {
                 // the witnessing peer's entry in `wants` regardless of
                 // whether its ranges were empty).
                 let ranges_nonempty = !ranges.is_empty();
-                let msg: WireMessage<u32, u8> = WireMessage::want(from, ranges);
+                let msg: WireMessage<u32, u8> = WireMessage::want(from, ranges, BTreeSet::new());
                 sut_out = self
                     .core
                     .on_wire(self.now, incoming(&msg))

@@ -1,6 +1,6 @@
 //! Scenario tests driving whole networks, with bounded model types.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use dash_router_core::{
     LogRanges, NodeAction, NodeEffect, NodeMachine, NodeState, Op, RouterAction, RouterConfig,
@@ -233,6 +233,7 @@ fn absent_messages_and_smuggled_recvs_are_disabled() {
             NodeAction::Router(RouterAction::RecvWant {
                 from: n(0),
                 ranges: LogRanges::empty(),
+                prefixes: BTreeSet::new(),
             }),
         ),
     );

@@ -32,6 +32,7 @@ use crate::{
     Effect, EvictableStorage, LogRanges, Op, Ranges, RelayStoreAction, RelayStoreMachine,
     RelayStoreState, RouterAction, RouterConfig, RouterMachine, RouterState, Seq, Storage, Units,
     WireBody, WireMessage,
+    log::{Log, WireLog},
     storage::{ExtStoreAction, ExtStoreMachine, ExtStoreState},
 };
 
@@ -54,7 +55,7 @@ impl<N, L: Default, T> NodeMachine<N, L, T> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct NodeState<N: Id, L: Id, T: TimeInterval> {
+pub struct NodeState<N: Id, L: Log, T: TimeInterval> {
     pub router: SM<RouterMachine<N, L, T>>,
     pub relay: SM<RelayStoreMachine<L>>,
     pub ext: SM<ExtStoreMachine<L>>,
@@ -75,7 +76,7 @@ fn held_union<L: Id>(
     out
 }
 
-impl<N: Id, L: Id, T: polestar::time::TimeInterval> NodeState<N, L, T> {
+impl<N: Id, L: Log, T: polestar::time::TimeInterval> NodeState<N, L, T> {
     /// held snapshot = relay ∪ ext ∪ empty keys for subscriptions (§5: a
     /// subscription with nothing stored yet is still "known" and wants
     /// everything).
@@ -94,7 +95,7 @@ impl<N: Id, L: Id, T: polestar::time::TimeInterval> NodeState<N, L, T> {
     }
 }
 
-impl<N: Id, L: Id + Default, T: polestar::time::TimeInterval> NodeState<N, L, T> {
+impl<N: Id, L: Log + Default, T: polestar::time::TimeInterval> NodeState<N, L, T> {
     /// A fresh node with empty stores, subscribed to `subscriptions`; the
     /// router starts with the resulting held snapshot.
     pub fn new(
@@ -117,7 +118,7 @@ impl<N: Id, L: Id + Default, T: polestar::time::TimeInterval> NodeState<N, L, T>
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum NodeAction<N, L: Ord, T> {
+pub enum NodeAction<N, L: Log, T> {
     /// Any router action except receiving: those go through `Recv`, since
     /// parking wire bytes is the node's business, not the router's.
     Router(RouterAction<N, L, T>),
@@ -144,7 +145,7 @@ pub enum NodeAction<N, L: Ord, T> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum NodeEffect<N, L: Ord> {
+pub enum NodeEffect<N, L: Log> {
     Broadcast(WireMessage<N, L>),
     Deliver(L, Seq),
 }
@@ -195,7 +196,7 @@ pub fn eviction_candidates<L: Id>(
 impl<N, L, T> Machine for NodeMachine<N, L, T>
 where
     N: Id + Serialize + DeserializeOwned,
-    L: Id + Serialize + DeserializeOwned,
+    L: WireLog,
     T: polestar::time::TimeInterval,
 {
     type State = NodeState<N, L, T>;
@@ -215,18 +216,22 @@ where
                     "receiving is the node's business: use NodeAction::Recv"
                 );
                 ensure!(
-                    !matches!(a, RouterAction::Held(..) | RouterAction::Push(..)),
-                    "held/push are the node glue's business: reconcile_held/Authored are the \
+                    !matches!(
+                        a,
+                        RouterAction::Held(..) | RouterAction::Push(..) | RouterAction::Open(..)
+                    ),
+                    "held/push/open are the node glue's business: reconcile_held/Authored are the \
                      only legitimate writers, not a bare NodeAction::Router"
                 );
                 let fx = s.router.step(a)?;
                 self.route_router_fx(&mut s, fx, &BTreeMap::new(), &mut out)?;
             }
             NodeAction::Recv(wire) => match wire.body {
-                WireBody::Want(ranges) => {
+                WireBody::Want { ranges, prefixes } => {
                     let fx = s.router.step(RouterAction::RecvWant {
                         from: wire.sender,
                         ranges,
+                        prefixes,
                     })?;
                     self.route_router_fx(&mut s, fx, &BTreeMap::new(), &mut out)?;
                 }
@@ -292,7 +297,7 @@ where
 impl<N, L, T> NodeMachine<N, L, T>
 where
     N: Id + Serialize + DeserializeOwned,
-    L: Id + Serialize + DeserializeOwned,
+    L: WireLog,
     T: polestar::time::TimeInterval,
 {
     /// Cheap and unconditional after any storage change: `HeldChanged` fx
@@ -360,8 +365,12 @@ where
                         }
                     }
                 }
-                Effect::SendWant(r) => {
-                    out.push(NodeEffect::Broadcast(WireMessage::want(s.router.id, r)));
+                Effect::SendWant { ranges, prefixes } => {
+                    out.push(NodeEffect::Broadcast(WireMessage::want(
+                        s.router.id,
+                        ranges,
+                        prefixes,
+                    )));
                 }
                 Effect::SendHave(r) => {
                     let mut ops = s.relay.0.fetch(&r);

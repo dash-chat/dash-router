@@ -323,7 +323,7 @@ impl SimBehavior {
         }
         for flight in new {
             match &flight.message.body {
-                WireBody::Want(_) => self.metrics.want_msgs += 1,
+                WireBody::Want { .. } => self.metrics.want_msgs += 1,
                 WireBody::Have(_) => self.metrics.have_msgs += 1,
             }
             if matches!(flight.message.body, WireBody::Have(_))
@@ -415,7 +415,7 @@ impl Behavior for SimBehavior {
                     .binary_search(&flight)
                     .map_err(|_| anyhow::anyhow!("scheduled flight not in flight: {flight:?}"))?;
                 let to = flight.to;
-                let is_want = matches!(flight.message.body, WireBody::Want(_));
+                let is_want = matches!(flight.message.body, WireBody::Want { .. });
                 let held_before = state.node(&to).router.held.clone();
                 let origin = self.flight_origins.remove(&flight);
                 self.advance(state, to, &mut actions);

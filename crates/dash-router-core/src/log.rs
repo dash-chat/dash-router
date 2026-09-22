@@ -22,6 +22,19 @@ macro_rules! self_prefixed {
 }
 self_prefixed!(u8, u16, u32, u64, usize);
 
+/// The bounded ids polestar models and the core's own model tests use for
+/// `L`: self-prefixed like the integers, so model-checked scenarios keep
+/// their pre-prefix meaning.
+impl<const N: usize, const WRAP: bool> Log for polestar::id::UpTo<N, WRAP>
+where
+    Self: Id,
+{
+    type Prefix = Self;
+    fn prefix(&self) -> Self {
+        *self
+    }
+}
+
 /// `Log` plus the serde bounds the wire needs on both halves. Blanket:
 /// nothing implements this by hand.
 pub trait WireLog:
