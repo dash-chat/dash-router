@@ -52,7 +52,7 @@ fn tiny(cap: Units) -> Node {
 #[test]
 fn recv_have_routes_bytes_delivers_and_rebroadcasts_hydrated() {
     let m = machine(); // want_ttl/have_ttl = t(2), cap = 100
-    let s = NodeState::new(n(0), [l(0)]); // subscribed to log 0 only
+    let s = NodeState::new(n(0), m.clone(), [l(0)]); // subscribed to log 0 only
     let op0 = Op {
         header: vec![7],
         payload: Some(vec![7]),
@@ -106,7 +106,7 @@ fn recv_have_routes_bytes_delivers_and_rebroadcasts_hydrated() {
 #[test]
 fn authored_ops_push_and_the_echo_is_absorbed() {
     let m = machine();
-    let s = NodeState::new(n(0), [l(0)]);
+    let s = NodeState::new(n(0), m.clone(), [l(0)]);
     let op = Op {
         header: vec![7],
         payload: Some(vec![7]),
@@ -131,7 +131,7 @@ fn authored_ops_push_and_the_echo_is_absorbed() {
 #[test]
 fn subscribe_migrates_and_preserves_held() {
     let m = machine();
-    let s = NodeState::new(n(0), [l(0)]);
+    let s = NodeState::new(n(0), m.clone(), [l(0)]);
     let op = Op {
         header: vec![7],
         payload: Some(vec![7]),
@@ -161,7 +161,7 @@ fn subscribe_migrates_and_preserves_held() {
 #[test]
 fn relay_cap_sheds_then_eviction_reopens() {
     let m = tiny(2); // cap = 2 units
-    let s = NodeState::new(n(0), []); // pure relay
+    let s = NodeState::new(n(0), m.clone(), []); // pure relay
     let full = |b: u8| Op {
         header: vec![b],
         payload: Some(vec![b]),
@@ -210,14 +210,14 @@ fn relay_cap_sheds_then_eviction_reopens() {
 #[test]
 fn relay_cap_upgrade_over_header_only_fits_within_the_true_delta() {
     let m = tiny(2); // cap = 2 units
-    let mut s = NodeState::new(n(0), []); // pure relay, unsubscribed
+    let mut s = NodeState::new(n(0), m.clone(), []); // pure relay, unsubscribed
     let header_only = Op {
         header: vec![1],
         payload: None,
     };
     // Arrange the held-header-only state directly on storage, then
     // reconcile the router's snapshot via a no-op evict (public API).
-    s.relay.0.ingest(l(0), 0, header_only);
+    s.relay.state_mut().0.ingest(l(0), 0, header_only);
     let (s, _) = m
         .transition(s, NodeAction::RelayEvict(LogRanges::empty()))
         .unwrap();
@@ -251,7 +251,7 @@ fn relay_cap_upgrade_over_header_only_fits_within_the_true_delta() {
 #[test]
 fn unsubscribe_keeps_advertising_and_keeps_wanting() {
     let m = machine();
-    let s = NodeState::new(n(0), [l(0)]);
+    let s = NodeState::new(n(0), m.clone(), [l(0)]);
     let op = Op {
         header: vec![1],
         payload: Some(vec![1]),
@@ -294,7 +294,7 @@ fn unsubscribe_keeps_advertising_and_keeps_wanting() {
 #[test]
 fn ext_spontaneity_reconciles_and_smuggled_recvs_are_disabled() {
     let m = machine();
-    let s = NodeState::new(n(0), [l(0)]);
+    let s = NodeState::new(n(0), m.clone(), [l(0)]);
     let (s, _) = m
         .transition(s, NodeAction::NativeSync(l(0), 0, Op::default()))
         .unwrap();
@@ -354,9 +354,9 @@ fn send_have_hydration_prefers_the_payload_bearing_copy() {
     // header-only copy of the very same (log, seq). States are plain
     // values, so mutating the stores' `OpsMap`s directly (via the public
     // `Storage` trait) is the simplest way to arrange this.
-    let mut s = NodeState::new(n(0), [l(0)]);
-    s.ext.0.ingest(l(0), 0, full.clone());
-    s.relay.0.ingest(l(0), 0, header_only);
+    let mut s = NodeState::new(n(0), m.clone(), [l(0)]);
+    s.ext.state_mut().0.ingest(l(0), 0, full.clone());
+    s.relay.state_mut().0.ingest(l(0), 0, header_only);
 
     // Reconcile the router's held snapshot against the stores we just
     // mutated by hand (NativeSync-ing the same op again is idempotent).
@@ -398,7 +398,7 @@ fn send_have_hydration_prefers_the_payload_bearing_copy() {
 #[test]
 fn relay_evict_payloads_frees_units_and_keeps_advertising() {
     let m = machine();
-    let s = NodeState::new(n(0), std::iter::empty()); // no subscriptions: bytes land in the relay
+    let s = NodeState::new(n(0), m.clone(), std::iter::empty()); // no subscriptions: bytes land in the relay
     let op = |h: u8| Op {
         header: vec![h],
         payload: Some(vec![h; 4]),
@@ -437,7 +437,7 @@ fn relay_evict_payloads_frees_units_and_keeps_advertising() {
 #[test]
 fn eviction_candidates_cover_everything_when_nothing_is_wanted() {
     let m = machine();
-    let s = NodeState::new(n(0), std::iter::empty());
+    let s = NodeState::new(n(0), m.clone(), std::iter::empty());
     let op = Op {
         header: vec![9],
         payload: Some(vec![9]),

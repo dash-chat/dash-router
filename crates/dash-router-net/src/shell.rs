@@ -117,7 +117,7 @@ where
     ) -> Self {
         let state = RouterState::new(id, LogRanges::empty());
         let machine = RouterMachine::new(config.router);
-        let router = RouterStateMachine::new(machine.into(), state);
+        let router = RouterStateMachine::new(machine, state);
         Self {
             router,
             ext,
