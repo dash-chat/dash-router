@@ -1,10 +1,52 @@
 # Real World: the `dash-router-net` Tokio Shell — design draft
 
-**Status: DRAFT for review.** Expands §3.3, §3.5, §7, §8 and the §10 open
-questions of `2026-09-21-storage-and-shell-design.md` into a concrete
-design. Where §10 left a question open, this draft takes a position and
-marks it **[decision]** — each is up for challenge. Nothing here changes
-the pure world; the pure-world plan executes independently.
+**Status: ACCEPTED, implemented by docs/superpowers/plans/2026-09-21-real-world-shell.md.**
+Expands §3.3, §3.5, §7, §8 and the §10 open questions of
+`2026-09-21-storage-and-shell-design.md` into a concrete design. Where §10
+left a question open, this draft takes a position and marks it
+**[decision]** — each is up for challenge. Nothing here changes the pure
+world; the pure-world plan executes independently.
+
+## Resolved
+
+All five §9 open questions were approved as drafted, user-approved
+2026-09-21:
+
+1. **Error posture**: degrade-and-report, not crash-the-task, on storage
+   errors.
+2. **redb** (§6.2): kept as the relay store, no fjall/sqlite switch.
+3. **Unsigned wire messages** (§6.1): accepted for v1 under the LAN trust
+   boundary.
+4. **`Delivered(L, Seq)` without bytes** (§5): kept byte-less; consumers
+   re-read their own store.
+5. **`dash-router-policy` as a third crate** (§1): kept as a separate
+   crate rather than folded into `dash-router-net`.
+
+**Relay-pull ruling** (user-chosen 2026-09-21): DESIGN.md's wanting
+semantics are kept as-is; the shed-at-cap churn loop and `Unsubscribe`
+keep-wanting behavior are deferred, not implemented here.
+
+**Implementation deviations** from this draft, discovered during
+implementation:
+
+- §8 conformance uses plain `proptest` (not `proptest-state-machine`)
+  with a zero-debounce lockstep SUT, not the debounce-aware harness
+  originally sketched.
+- The concrete stores (`MemStore`, `DiskRelayStore`) implement the
+  synchronous storage traits and ride a blanket sync→async bridge, rather
+  than implementing `AsyncStorage`/`WatchableStorage` directly, for
+  coherence with the pure-world traits.
+- `NodeCore` self-arms its own timers: `init` arms the first `Want`, and
+  witnessing a `Want` arms the corresponding `Have`, rather than an
+  external driver arming them.
+- The p2panda transport (§6.1) additionally spawns `p2panda_net::Discovery`
+  alongside `MdnsDiscovery`: mDNS alone only resolves LAN transport
+  addresses, not topic membership, so `Gossip::stream` cannot bootstrap
+  a topic's overlay from mDNS-discovered peers without `Discovery`
+  walking those same peers to learn who shares the topic. LAN scoping is
+  preserved because `Discovery` only ever walks nodes the address book
+  already knows, and mDNS is the only source of those nodes. See
+  `crates/dash-router-net/src/panda.rs` module docs.
 
 ## 1. Shape and scope
 
@@ -214,6 +256,7 @@ crates/dash-router-net/src/
   handle.rs       RouterHandle, Command, RouterEvent
   transport.rs    Transport trait: broadcast/recv (p2panda impl + test loopback)
   lan.rs          LAN-boundary predicate
+  panda.rs        p2panda-net Transport impl, feature-gated ("p2panda")
 tests/
   conformance.rs  lockstep vs NodeMachine (proptest-state-machine)
   loop.rs         two shells over the loopback transport, end-to-end
