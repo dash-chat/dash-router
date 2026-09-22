@@ -71,7 +71,13 @@ impl<L: Send> RouterHandle<L> {
     }
 
     pub async fn append(&self, log: L, seq: Seq, op: Op) -> anyhow::Result<()> {
-        self.call(|reply| Command::Append { log, seq, op, reply }).await
+        self.call(|reply| Command::Append {
+            log,
+            seq,
+            op,
+            reply,
+        })
+        .await
     }
 
     pub async fn subscribe(&self, log: L) -> anyhow::Result<()> {

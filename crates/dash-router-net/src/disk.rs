@@ -646,7 +646,10 @@ mod tests {
                 store.held_payloads().await.unwrap(),
                 dash_router_core::EvictableStorage::held_payloads(&oracle)
             );
-            assert_eq!(store.usage().await.unwrap(), dash_router_core::EvictableStorage::usage(&oracle));
+            assert_eq!(
+                store.usage().await.unwrap(),
+                dash_router_core::EvictableStorage::usage(&oracle)
+            );
             let mut got = store.fetch(&oracle_held_all).await.unwrap();
             let mut want = dash_router_core::Storage::fetch(&oracle, &oracle_held_all);
             got.sort();
@@ -655,12 +658,18 @@ mod tests {
         }
         // Reopen: the startup scan rebuilds the same summaries.
         let store = DiskRelayStore::<u32>::open(&path).unwrap();
-        assert_eq!(store.held_all().await.unwrap(), dash_router_core::Storage::held_all(&oracle));
+        assert_eq!(
+            store.held_all().await.unwrap(),
+            dash_router_core::Storage::held_all(&oracle)
+        );
         assert_eq!(
             store.held_payloads().await.unwrap(),
             dash_router_core::EvictableStorage::held_payloads(&oracle)
         );
-        assert_eq!(store.usage().await.unwrap(), dash_router_core::EvictableStorage::usage(&oracle));
+        assert_eq!(
+            store.usage().await.unwrap(),
+            dash_router_core::EvictableStorage::usage(&oracle)
+        );
     }
 
     /// Fix round 1 (controller ruling): redb errors must degrade, never
@@ -835,10 +844,9 @@ mod tests {
     fn futures_are_send() {
         fn assert_send<T: Send>(_: T) {}
 
-        let mut store = DiskRelayStore::<u32>::open(
-            &tempfile::tempdir().unwrap().path().join("relay.redb"),
-        )
-        .unwrap();
+        let mut store =
+            DiskRelayStore::<u32>::open(&tempfile::tempdir().unwrap().path().join("relay.redb"))
+                .unwrap();
         assert_send(AsyncStorage::ingest(&mut store, 0, 0, Op::default()));
         assert_send(AsyncEvictableStorage::usage(&store));
     }
@@ -870,15 +878,33 @@ mod tests {
     /// show up here.
     #[derive(Clone, Debug)]
     enum Step {
-        Ingest { log: u32, seq: Seq, payload: bool, h: u8 },
-        EvictPayloads { log: u32, start: Seq, end: Seq },
-        Evict { log: u32, start: Seq, end: Seq },
+        Ingest {
+            log: u32,
+            seq: Seq,
+            payload: bool,
+            h: u8,
+        },
+        EvictPayloads {
+            log: u32,
+            start: Seq,
+            end: Seq,
+        },
+        Evict {
+            log: u32,
+            start: Seq,
+            end: Seq,
+        },
     }
 
     fn step_strategy() -> impl Strategy<Value = Step> {
         prop_oneof![
             (0..4u32, 0..8u32, any::<bool>(), any::<u8>()).prop_map(|(log, seq, payload, h)| {
-                Step::Ingest { log, seq, payload, h }
+                Step::Ingest {
+                    log,
+                    seq,
+                    payload,
+                    h,
+                }
             }),
             (0..4u32, 0..8u32, 0..8u32).prop_map(|(log, start, end)| Step::EvictPayloads {
                 log,

@@ -5,7 +5,9 @@ pub mod router;
 pub mod storage;
 pub mod wire;
 
-pub use node::{eviction_candidates, group_ops, ranges_of, NodeAction, NodeEffect, NodeMachine, NodeState};
+pub use node::{
+    NodeAction, NodeEffect, NodeMachine, NodeState, eviction_candidates, group_ops, ranges_of,
+};
 pub use op::Op;
 pub use ranges::{LogRanges, Ranges, Seq};
 pub use router::{Effect, RouterAction, RouterConfig, RouterMachine, RouterState};
