@@ -139,6 +139,7 @@ fn wire_op(log: u8, seq: Seq, has_payload: bool) -> Op {
 fn incoming(msg: &WireMessage<u32, u8>) -> dash_router::Incoming {
     dash_router::Incoming {
         remote: Some("192.168.0.9".parse().unwrap()),
+        author: None,
         bytes: msg.encode(),
     }
 }

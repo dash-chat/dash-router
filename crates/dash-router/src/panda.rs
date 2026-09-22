@@ -46,7 +46,26 @@ use p2panda_net::iroh_mdns::MdnsDiscoveryMode;
 use p2panda_net::{AddressBook, Discovery, Endpoint, Gossip, MdnsDiscovery};
 use tokio::sync::{broadcast, watch};
 
-use crate::transport::{Incoming, Transport};
+use crate::transport::{Incoming, PeerIdentity, PeerKey, Transport};
+
+impl From<VerifyingKey> for PeerKey {
+    fn from(k: VerifyingKey) -> Self {
+        PeerKey(*k.as_bytes())
+    }
+}
+
+impl TryFrom<PeerKey> for VerifyingKey {
+    type Error = anyhow::Error;
+    fn try_from(k: PeerKey) -> Result<Self> {
+        VerifyingKey::from_bytes(&k.0).map_err(|e| anyhow::anyhow!("invalid peer key: {e}"))
+    }
+}
+
+impl PeerIdentity for VerifyingKey {
+    fn peer_key(&self) -> Option<PeerKey> {
+        Some((*self).into())
+    }
+}
 
 /// The well-known gossip topic name for this application's wire protocol.
 /// Bump the suffix together with [`WIRE_VERSION`] on any breaking wire
@@ -216,6 +235,10 @@ impl Transport for PandaTransport {
                         // The overlay membership is the LAN boundary; see
                         // module docs.
                         remote: None,
+                        // p2panda-net's gossip subscription hands us bytes,
+                        // not a verified envelope; the sender check in
+                        // `NodeCore::on_wire` is a no-op here.
+                        author: None,
                         bytes,
                     });
                 }
