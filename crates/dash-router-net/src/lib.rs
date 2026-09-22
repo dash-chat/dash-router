@@ -13,7 +13,7 @@ pub mod storage;
 pub mod transport;
 
 pub use disk::{DiskRelayStore, LogKey};
-pub use handle::{Command, RouterEvent, RouterHandle, StorageErrorReport};
+pub use handle::{Command, RouterEvent, RouterHandle, StatsSnapshot, StorageErrorReport};
 pub use lan::is_lan;
 pub use mem::MemStore;
 pub use shell::{CoreConfig, IntervalSource, NodeCore, Out, PolicyIntervals, spawn};

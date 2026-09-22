@@ -47,6 +47,18 @@ pub trait EvictableStorage<L: Ord>: Storage<L> {
     /// payload-upgrade or new header-only, 2 new payload-bearing. Cap checks
     /// must use the same arithmetic as the store (see [`OpsMap::ingest_delta`]).
     fn ingest_delta(&self, log: &L, seq: Seq, op: &Op) -> Units;
+    /// Count of store-internal errors this store has swallowed and
+    /// degraded from rather than propagated. Defaults to 0: the sync
+    /// `Storage`/`EvictableStorage` traits are total (their methods can't
+    /// fail), so a pure in-memory store like `OpsMap` has nothing to count.
+    /// A store with a fallible backing layer (e.g. `dash-router-net`'s
+    /// redb-backed `DiskRelayStore`) overrides this with its real count.
+    /// `dash-router-net`'s async `AsyncEvictableStorage::error_count`
+    /// bridges to this exact method for any sync store used via the
+    /// blanket sync→async impl.
+    fn error_count(&self) -> u64 {
+        0
+    }
 }
 
 /// A simple in-memory reference [`Storage`]/[`EvictableStorage`]: a

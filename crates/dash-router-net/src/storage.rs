@@ -30,6 +30,21 @@ pub trait AsyncEvictableStorage<L: Ord>: AsyncStorage<L> {
     async fn held_payloads(&self) -> Result<LogRanges<L>>;
     async fn evict_payloads(&mut self, ranges: &LogRanges<L>) -> Result<()>;
     async fn evict(&mut self, ranges: &LogRanges<L>) -> Result<()>;
+    /// Count of store-internal errors this store has swallowed and
+    /// degraded from rather than propagated (spec §3's degrade-and-report
+    /// posture, finding 3: degrade-and-report is only honest if something
+    /// actually observes the report). Plain sync `fn`, not part of the
+    /// async/fallible surface above — reading a counter can't fail.
+    /// Defaults to 0 for stores with nothing to count (e.g. the in-memory
+    /// `OpsMap`, which never degrades because sync `Storage` is infallible).
+    /// The blanket bridge below forwards this to the sync
+    /// `EvictableStorage::error_count`, so `DiskRelayStore` — which can't
+    /// hand-implement this async trait directly (coherence, see this
+    /// module's blanket impl and `disk.rs`'s doc comment) — overrides it by
+    /// overriding the SYNC method instead, returning its real `io_errors`.
+    fn error_count(&self) -> u64 {
+        0
+    }
 }
 
 /// Lossy change hints from a store with writers of its own (spec §2).
@@ -75,6 +90,9 @@ impl<L: Ord + Clone + Send + Sync, S: EvictableStorage<L> + Send + Sync> AsyncEv
     async fn evict(&mut self, ranges: &LogRanges<L>) -> Result<()> {
         EvictableStorage::evict(self, ranges);
         Ok(())
+    }
+    fn error_count(&self) -> u64 {
+        EvictableStorage::error_count(self)
     }
 }
 

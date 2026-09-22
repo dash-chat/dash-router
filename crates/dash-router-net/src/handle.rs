@@ -39,7 +39,24 @@ pub enum Command<L> {
         log: L,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
+    /// Finding 3 (spec §3's degrade-and-report posture, made observable):
+    /// snapshot the node's degrade counters. No `now`/state mutation — a
+    /// plain read of already-maintained counters.
+    Stats {
+        reply: oneshot::Sender<StatsSnapshot>,
+    },
     Shutdown,
+}
+
+/// A point-in-time read of the degrade counters a spawned node task
+/// maintains (spec §3): dropped wire messages, relay-store call failures
+/// the shell degraded from, and the relay store's own internally-swallowed
+/// errors (e.g. `DiskRelayStore::io_errors`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatsSnapshot {
+    pub dropped_msgs: u64,
+    pub relay_errors: u64,
+    pub relay_store_errors: u64,
 }
 
 /// The embedder's handle to a spawned node task (spec §5). Cloning shares
@@ -86,6 +103,18 @@ impl<L: Send> RouterHandle<L> {
 
     pub async fn unsubscribe(&self, log: L) -> anyhow::Result<()> {
         self.call(|reply| Command::Unsubscribe { log, reply }).await
+    }
+
+    /// Finding 3: read the node task's degrade counters.
+    pub async fn stats(&self) -> anyhow::Result<StatsSnapshot> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Command::Stats { reply: reply_tx })
+            .await
+            .map_err(|_| anyhow::anyhow!("router task is gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("router task dropped the reply"))
     }
 
     /// A closed channel means the task is already down — that's not a
