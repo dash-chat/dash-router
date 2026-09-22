@@ -3,9 +3,13 @@
 //! docs/superpowers/specs/2026-09-21-real-world-shell-design.md.
 
 pub mod disk;
+pub mod lan;
 pub mod mem;
 pub mod storage;
+pub mod transport;
 
 pub use disk::{DiskRelayStore, LogKey};
+pub use lan::is_lan;
 pub use mem::MemStore;
 pub use storage::{AsyncEvictableStorage, AsyncStorage, WatchableStorage};
+pub use transport::{Incoming, LoopbackHub, LoopbackTransport, Transport};
