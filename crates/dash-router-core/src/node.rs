@@ -312,16 +312,25 @@ where
         s: &mut NodeState<N, L, T>,
         parked: &BTreeMap<(L, Seq), Op>,
     ) -> anyhow::Result<()> {
+        // `usage()` is O(store) (a full walk of `OpsMap`; a derived sum over
+        // every log's ranges for the disk store), so read it once and track
+        // it across the batch: each accepted ingest grows usage by exactly
+        // the `ingest_delta` it was checked against, by that method's
+        // contract. The relay machine still enforces the cap itself on every
+        // `Ingest`; this is only the pre-check that turns a would-be error
+        // into a silent shed.
+        let mut usage: Units = s.relay.0.usage();
         for ((log, seq), op) in parked {
             if s.subscriptions.contains(log) {
                 s.ext.step(ExtStoreAction::Ingest(*log, *seq, op.clone()))?;
             } else {
                 let units: Units = s.relay.0.ingest_delta(log, *seq, op);
-                if s.relay.0.usage() + units > self.relay.cap {
+                if usage + units > self.relay.cap {
                     continue; // shed: no room, and no eviction happened yet
                 }
                 s.relay
                     .step(RelayStoreAction::Ingest(*log, *seq, op.clone()))?;
+                usage += units;
             }
         }
         Ok(())
