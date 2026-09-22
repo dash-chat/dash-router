@@ -179,11 +179,19 @@ impl<N: Id, L: Log, T: TimeInterval> RouterState<N, L, T> {
     /// DESIGN.md §1, plus this node's open prefixes. Prefixes are never
     /// suppressed by others' prefixes: two nodes' explicit knowledge under
     /// the same prefix differs, so one node's answer is not the other's.
+    /// Logs under this node's own open prefixes stay named even when another
+    /// peer already wants them, so an answerer never sends them wholesale
+    /// (spec §3.5: a wanter that already knows a log names it explicitly).
     pub fn next_want(&self) -> (LogRanges<L>, BTreeSet<L::Prefix>) {
-        (
-            self.wanted().difference(&self.others_wants()),
-            self.open.clone(),
-        )
+        let wanted = self.wanted();
+        let suppressed = wanted.difference(&self.others_wants());
+        let named_under_open = LogRanges::from_pairs(
+            wanted
+                .iter()
+                .filter(|(log, _)| self.open.contains(&log.prefix()))
+                .map(|(log, r)| (*log, r.clone())),
+        );
+        (suppressed.union(&named_under_open), self.open.clone())
     }
 
     /// DESIGN.md §3 — now ranges, not ops; hydration happens above.
@@ -388,11 +396,19 @@ impl<N: Id, L: Log, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                 // DESIGN.md: every received message is re-transmitted:
                 // simple flooding, terminated by the seen-set. Relay only
                 // the not-yet-relayed portion, re-signed.
-                let relay_ranges = ranges.difference(&s.relayed_want_ranges());
                 let relay_prefixes: BTreeSet<L::Prefix> = prefixes
                     .difference(&s.relayed_want_prefixes())
                     .copied()
                     .collect();
+                // Prefixes are relayed once per want_ttl, so carrying the
+                // full named ranges with them is bounded, and it keeps the
+                // naming that stops answerers from sending named logs
+                // wholesale.
+                let relay_ranges = if relay_prefixes.is_empty() {
+                    ranges.difference(&s.relayed_want_ranges())
+                } else {
+                    ranges.clone()
+                };
                 if !relay_ranges.is_empty() || !relay_prefixes.is_empty() {
                     s.note_relayed_wants(
                         relay_ranges.clone(),
