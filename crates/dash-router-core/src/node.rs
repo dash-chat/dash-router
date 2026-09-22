@@ -151,7 +151,7 @@ pub enum NodeEffect<N, L: Ord> {
 
 /// Fold a sorted, deduplicated flat op list into the wire's grouped shape.
 ///
-/// `pub` so the tokio shell's async routing table (`dash-router-net`) can
+/// `pub` so the tokio shell's async routing table (`dash-router`) can
 /// reuse it byte-for-byte rather than re-implementing the grouping and
 /// risking drift between the model and the real shell.
 pub fn group_ops<L: PartialEq>(ops: Vec<(L, Seq, Op)>) -> Vec<(L, Vec<(Seq, Op)>)> {
