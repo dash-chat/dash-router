@@ -23,11 +23,13 @@ use dash_router_policy::{IntervalPolicy, PushDebouncePolicy};
 use polestar::prelude::*;
 use polestar::time::RealTime;
 use rand::rngs::StdRng;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
-use crate::handle::{RouterEvent, StorageErrorReport};
+use crate::handle::{Command, RouterEvent, RouterHandle, StorageErrorReport};
 use crate::lan::is_lan;
-use crate::storage::{AsyncEvictableStorage, AsyncStorage};
-use crate::transport::Incoming;
+use crate::storage::{AsyncEvictableStorage, AsyncStorage, WatchableStorage};
+use crate::transport::{Incoming, Transport};
 
 /// Where a `NodeCore` gets its randomized Want/Have re-arm intervals from.
 /// Production uses [`PolicyIntervals`]; tests use a scripted sequence so the
@@ -67,6 +69,7 @@ pub struct CoreConfig {
 
 /// A single unit of shell output: either a wire message to broadcast, or an
 /// event for the embedder (spec §5).
+#[derive(Debug)]
 pub enum Out<N, L: Ord> {
     Broadcast(WireMessage<N, L>),
     Event(RouterEvent<L>),
@@ -619,6 +622,170 @@ where
         }
         Ok(())
     }
+}
+
+/// The thin rind (spec §2, §5): one tokio task running [`NodeCore`] behind
+/// a [`RouterHandle`] and an event stream, wired to a real [`Transport`].
+///
+/// `hints = ext.changed()` is taken before `ext` moves into the `NodeCore`
+/// (the core's stored sender keeps the broadcast channel alive, so `hints`
+/// never sees `Closed` while the task runs).
+pub fn spawn<N, L, E, R, T, I>(
+    id: N,
+    config: CoreConfig,
+    maintain_interval: Duration,
+    subscriptions: BTreeSet<L>,
+    ext: E,
+    relay: R,
+    transport: T,
+    intervals: I,
+) -> (
+    RouterHandle<L>,
+    mpsc::Receiver<RouterEvent<L>>,
+    JoinHandle<Result<()>>,
+)
+where
+    N: Id + serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    L: Id + serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    E: AsyncStorage<L> + WatchableStorage<L> + Send + 'static,
+    R: AsyncEvictableStorage<L> + Send + 'static,
+    T: Transport + Send + 'static,
+    I: IntervalSource + Send + 'static,
+{
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command<L>>(64);
+    let (event_tx, event_rx) = mpsc::channel::<RouterEvent<L>>(64);
+
+    let mut hints = ext.changed();
+    let mut core = NodeCore::new(id, config, subscriptions, ext, relay, intervals);
+    let mut transport = transport;
+
+    let task = tokio::spawn(async move {
+        let epoch = tokio::time::Instant::now();
+        let mut maintain = tokio::time::interval(maintain_interval);
+        maintain.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        let init_out = core.init().await?;
+        route_outs(init_out, &mut transport, &event_tx).await?;
+
+        loop {
+            let deadline = core
+                .next_deadline()
+                .unwrap_or_else(|| Duration::from_secs(60 * 60 * 24 * 365));
+            let sleep = tokio::time::sleep_until(epoch + deadline);
+
+            tokio::select! {
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        None | Some(Command::Shutdown) => break,
+                        Some(Command::Append { log, seq, op, reply }) => {
+                            let now = epoch.elapsed();
+                            match core.on_append(now, log, seq, op).await {
+                                Ok(out) => {
+                                    let _ = reply.send(Ok(()));
+                                    if !route_outs(out, &mut transport, &event_tx).await? {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = reply.send(Err(e));
+                                    continue;
+                                }
+                            }
+                        }
+                        Some(Command::Subscribe { log, reply }) => {
+                            let now = epoch.elapsed();
+                            let out = core.on_subscribe(now, log).await?;
+                            let _ = reply.send(Ok(()));
+                            if !route_outs(out, &mut transport, &event_tx).await? {
+                                break;
+                            }
+                        }
+                        Some(Command::Unsubscribe { log, reply }) => {
+                            let now = epoch.elapsed();
+                            let out = core.on_unsubscribe(now, log).await?;
+                            let _ = reply.send(Ok(()));
+                            if !route_outs(out, &mut transport, &event_tx).await? {
+                                break;
+                            }
+                        }
+                    }
+                }
+                inc = transport.recv() => {
+                    match inc {
+                        None => break,
+                        Some(inc) => {
+                            let now = epoch.elapsed();
+                            let out = core.on_wire(now, inc).await?;
+                            if !route_outs(out, &mut transport, &event_tx).await? {
+                                break;
+                            }
+                        }
+                    }
+                }
+                hint = hints.recv() => {
+                    let now = epoch.elapsed();
+                    let out = match hint {
+                        Ok(logs) => core.on_hint(now, logs).await?,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            core.on_hint(now, BTreeSet::new()).await?
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            unreachable!("the core holds the sending store alive")
+                        }
+                    };
+                    if !route_outs(out, &mut transport, &event_tx).await? {
+                        break;
+                    }
+                }
+                _ = sleep => {
+                    let now = epoch.elapsed();
+                    let out = core.advance_to(now).await?;
+                    if !route_outs(out, &mut transport, &event_tx).await? {
+                        break;
+                    }
+                }
+                _ = maintain.tick() => {
+                    let now = epoch.elapsed();
+                    let out = core.on_maintain(now).await?;
+                    if !route_outs(out, &mut transport, &event_tx).await? {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    });
+
+    (RouterHandle::new(cmd_tx), event_rx, task)
+}
+
+/// Route a batch of [`Out`] values: broadcasts go to the transport, events
+/// go to the embedder's stream (ignoring a closed receiver — an embedder
+/// that dropped the stream still gets gossip). Returns `false` if the
+/// transport is gone and the loop should end.
+async fn route_outs<N, L, T>(
+    out: Vec<Out<N, L>>,
+    transport: &mut T,
+    event_tx: &mpsc::Sender<RouterEvent<L>>,
+) -> Result<bool>
+where
+    N: serde::Serialize + serde::de::DeserializeOwned,
+    L: Ord + Clone + serde::Serialize + serde::de::DeserializeOwned,
+    T: Transport,
+{
+    for o in out {
+        match o {
+            Out::Broadcast(msg) => {
+                if transport.broadcast(msg.encode()).await.is_err() {
+                    return Ok(false);
+                }
+            }
+            Out::Event(e) => {
+                let _ = event_tx.send(e).await;
+            }
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

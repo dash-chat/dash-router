@@ -11,9 +11,9 @@ pub mod storage;
 pub mod transport;
 
 pub use disk::{DiskRelayStore, LogKey};
-pub use handle::{RouterEvent, StorageErrorReport};
+pub use handle::{Command, RouterEvent, RouterHandle, StorageErrorReport};
 pub use lan::is_lan;
 pub use mem::MemStore;
-pub use shell::{CoreConfig, IntervalSource, NodeCore, Out, PolicyIntervals};
+pub use shell::{CoreConfig, IntervalSource, NodeCore, Out, PolicyIntervals, spawn};
 pub use storage::{AsyncEvictableStorage, AsyncStorage, WatchableStorage};
 pub use transport::{Incoming, LoopbackHub, LoopbackTransport, Transport};
