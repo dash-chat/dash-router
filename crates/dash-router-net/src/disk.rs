@@ -1,9 +1,13 @@
 //! Redb-backed disk relay store (spec §6.2): a single `ops` table keyed
 //! `log bytes ++ seq BE`, so both `held_all` and `fetch` are ordered
-//! prefix scans per log. `held`/`payloads`/`usage` are the same summaries
-//! `OpsMap` computes on the fly, but here they are scanned once at `open`
-//! and then maintained incrementally, since this store is always the sole
-//! writer to its file.
+//! prefix scans per log. `held`/`payloads` are the same summaries `OpsMap`
+//! computes on the fly, but here they are scanned once at `open` and then
+//! maintained incrementally, since this store is always the sole writer to
+//! its file. `usage` (fix round 3, finding 2) is NOT an independently
+//! maintained counter: it is derived from `held`/`payloads` on every call
+//! (see [`DiskRelayStore::usage`]), so it can never drift from them or keep
+//! phantom units alive after a degraded `rebuild_log` drops a log from the
+//! cache.
 //!
 //! redb calls run inline in these `async fn`s (not via `spawn_blocking`):
 //! single writer, small values, a cache we can afford to lose and rebuild
@@ -149,7 +153,6 @@ pub struct DiskRelayStore<L: LogKey> {
     /// corruption or drift here is repaired by reopening.
     held: LogRanges<L>,
     payloads: LogRanges<L>,
-    usage: Units,
     /// Count of redb operations that failed and were swallowed (degraded
     /// to a no-op/shed) rather than propagated. `AtomicU64` rather than a
     /// plain field so `fetch`/`ingest_delta`-style `&self` reads can bump
@@ -169,7 +172,6 @@ impl<L: LogKey> DiskRelayStore<L> {
 
         let mut per_log: std::collections::BTreeMap<L, (Vec<Seq>, Vec<Seq>)> =
             std::collections::BTreeMap::new();
-        let mut usage: Units = 0;
         let mut io_errors: u64 = 0;
         {
             let read_txn = db.begin_read()?;
@@ -204,7 +206,6 @@ impl<L: LogKey> DiskRelayStore<L> {
                         continue;
                     }
                 };
-                usage += if op.payload.is_some() { 2 } else { 1 };
                 let entry = per_log.entry(log).or_default();
                 entry.0.push(seq);
                 if op.payload.is_some() {
@@ -226,7 +227,6 @@ impl<L: LogKey> DiskRelayStore<L> {
             db,
             held,
             payloads,
-            usage,
             io_errors: AtomicU64::new(io_errors),
         })
     }
@@ -414,14 +414,16 @@ impl<L: LogKey> Storage<L> for DiskRelayStore<L> {
             Ok((is_new, upgraded, delta))
         })();
 
-        let (is_new, upgraded, delta) = match outcome {
+        // `usage` is derived (finding 2), not maintained here; the delta
+        // computed above only decides `is_new`/`upgraded` (already folded
+        // into the tuple) — the third field is dropped.
+        let (is_new, upgraded, _delta) = match outcome {
             Ok(outcome) => outcome,
             Err(_) => {
                 self.note_io_error();
                 return;
             }
         };
-        self.usage += delta;
         if is_new {
             let merged = self
                 .held
@@ -442,8 +444,33 @@ impl<L: LogKey> Storage<L> for DiskRelayStore<L> {
 }
 
 impl<L: LogKey> EvictableStorage<L> for DiskRelayStore<L> {
+    /// Derived, not maintained (fix round 3, finding 2): 1 unit per held op
+    /// plus 1 more per payload-bearing op — exactly `OpsMap::usage`'s
+    /// arithmetic — summed fresh from `held`/`payloads` every call. An
+    /// independent counter could drift from those two maps (e.g. a
+    /// committed evict whose post-write `rebuild_log` fails used to leave
+    /// phantom units in a separately-tracked `usage`, forever un-freeable
+    /// by maintenance); deriving it makes that drift structurally
+    /// impossible, since `drop_log_from_cache`/`rebuild_log` already keep
+    /// `held`/`payloads` correct.
+    ///
+    /// `Ranges::len()` is `None` only for an open (unbounded) range; every
+    /// range this store ever inserts is built from `Ranges::from_seqs`
+    /// (finite), so `None` is unreachable in practice. Never panics on it
+    /// regardless (Ruling B: trait methods here never panic) — an
+    /// unreachable `None` is treated as contributing 0, not as an error.
     fn usage(&self) -> Units {
-        self.usage
+        let held: Units = self
+            .held
+            .iter()
+            .map(|(_, r)| r.len().unwrap_or(0) as Units)
+            .sum();
+        let payloads: Units = self
+            .payloads
+            .iter()
+            .map(|(_, r)| r.len().unwrap_or(0) as Units)
+            .sum();
+        held + payloads
     }
 
     /// Served entirely from the `held`/`payloads` cache — never touches
@@ -518,8 +545,11 @@ impl<L: LogKey> EvictableStorage<L> for DiskRelayStore<L> {
             })();
 
             match outcome {
-                Ok((units_removed, malformed)) => {
-                    self.usage -= units_removed;
+                // `units_removed` no longer feeds a maintained `usage`
+                // counter (finding 2): it stays local to this write's
+                // success/failure decision, and `usage()` derives its
+                // answer from `held`/`payloads` below instead.
+                Ok((_units_removed, malformed)) => {
                     for _ in 0..malformed {
                         self.note_io_error();
                     }
@@ -528,7 +558,10 @@ impl<L: LogKey> EvictableStorage<L> for DiskRelayStore<L> {
                     // trust the pre-eviction entries for this log (they may
                     // now over-report), so drop it from the cache entirely
                     // instead — under-reporting is always the safe
-                    // direction (see the struct doc's invariant).
+                    // direction (see the struct doc's invariant). Either
+                    // way `usage()` self-corrects by construction, since it
+                    // is derived from `held`/`payloads`, not tracked
+                    // independently.
                     if self.rebuild_log(log).is_err() {
                         self.note_io_error();
                         self.drop_log_from_cache(log);
@@ -574,8 +607,7 @@ impl<L: LogKey> EvictableStorage<L> for DiskRelayStore<L> {
             })();
 
             match outcome {
-                Ok((units_removed, malformed)) => {
-                    self.usage -= units_removed;
+                Ok((_units_removed, malformed)) => {
                     for _ in 0..malformed {
                         self.note_io_error();
                     }
@@ -587,6 +619,14 @@ impl<L: LogKey> EvictableStorage<L> for DiskRelayStore<L> {
                 Err(_) => self.note_io_error(),
             }
         }
+    }
+
+    /// Finding 3: the async blanket bridge forwards `error_count` to this
+    /// sync method (see `storage.rs`'s doc comment on the trait default),
+    /// so overriding it here is how `DiskRelayStore` reports its real
+    /// swallowed-error count through `AsyncEvictableStorage`/`RouterHandle::stats`.
+    fn error_count(&self) -> u64 {
+        self.io_errors()
     }
 }
 
@@ -833,6 +873,16 @@ mod tests {
             "a failed rebuild drops the log from held_payloads rather than over-reporting"
         );
         assert!(store.io_errors() > 0, "the failed rebuild was counted");
+        // Finding 2: `usage` used to be an independently-maintained counter
+        // that kept the dropped log's phantom units alive forever (never
+        // freeable by maintenance). Now it's derived from `held`/
+        // `payloads`, so dropping log 2 from the cache above must also
+        // drop its units from `usage` — not leave them stranded.
+        assert_eq!(
+            store.usage().await.unwrap(),
+            0,
+            "usage no longer counts the log that the failed rebuild dropped from the cache"
+        );
     }
 
     /// Task 10's node task `tokio::spawn`s a future holding an
