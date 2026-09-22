@@ -51,10 +51,10 @@ use crate::transport::{Incoming, Transport};
 /// The well-known gossip topic name for this application's wire protocol.
 /// Bump the suffix together with [`WIRE_VERSION`] on any breaking wire
 /// change -- see the compile-time reminder below.
-const TOPIC_NAME: &str = "dash-router/v0";
+const TOPIC_NAME: &str = "dash-router/v1";
 
 const _: () = assert!(
-    WIRE_VERSION == 0,
+    WIRE_VERSION == 1,
     "bump the gossip topic suffix with the wire version"
 );
 

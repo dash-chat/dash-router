@@ -35,7 +35,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::ensure;
-use dash_router_core::{NodeAction, NodeEffect, NodeMachine, NodeState, WireMessage};
+use dash_router_core::{Log, NodeAction, NodeEffect, NodeMachine, NodeState, WireLog, WireMessage};
 use polestar::{machine::absorb_fx, prelude::*, time::TimeInterval};
 
 use crate::topology::Topology;
@@ -60,13 +60,13 @@ impl<N: Ord + Copy, L, T, const K: usize> NetMachine<N, L, T, K> {
 
 /// A wire message on its way to one node. The sender is inside the message.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Flight<N, L: Ord> {
+pub struct Flight<N, L: Log> {
     pub to: N,
     pub message: WireMessage<N, L>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct NetState<N: Id, L: Id, T: TimeInterval> {
+pub struct NetState<N: Id, L: Log, T: TimeInterval> {
     pub nodes: BTreeMap<N, NodeState<N, L, T>>,
 
     /// In-flight messages, kept sorted: a canonical multiset, so state
@@ -75,7 +75,7 @@ pub struct NetState<N: Id, L: Id, T: TimeInterval> {
     pub inflight: Vec<Flight<N, L>>,
 }
 
-impl<N: Id, L: Id, T: TimeInterval> NetState<N, L, T> {
+impl<N: Id, L: Log, T: TimeInterval> NetState<N, L, T> {
     pub fn new(nodes: impl IntoIterator<Item = NodeState<N, L, T>>) -> Self {
         Self {
             nodes: nodes.into_iter().map(|s| (s.router.id, s)).collect(),
@@ -100,7 +100,7 @@ impl<N: Id, L: Id, T: TimeInterval> NetState<N, L, T> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum NetAction<N, L: Ord, T, const K: usize> {
+pub enum NetAction<N, L: Log, T, const K: usize> {
     /// A node acts on its own: anything but `Recv`, which only
     /// [`NetAction::Deliver`] may cause.
     Node(N, NodeAction<N, L, T>),
@@ -115,7 +115,7 @@ pub enum NetAction<N, L: Ord, T, const K: usize> {
 impl<N, L, T, const K: usize> NetMachine<N, L, T, K>
 where
     N: Id + serde::Serialize + serde::de::DeserializeOwned,
-    L: Id + serde::Serialize + serde::de::DeserializeOwned,
+    L: WireLog,
     T: TimeInterval,
 {
     /// Run one node action on one node. `Broadcast` effects are absorbed
@@ -159,7 +159,7 @@ fn insert_sorted<T: Ord>(vec: &mut Vec<T>, value: T) {
 impl<N, L, T, const K: usize> Machine for NetMachine<N, L, T, K>
 where
     N: Id + serde::Serialize + serde::de::DeserializeOwned,
-    L: Id + serde::Serialize + serde::de::DeserializeOwned,
+    L: WireLog,
     T: TimeInterval,
 {
     type State = NetState<N, L, T>;

@@ -2,6 +2,8 @@
 //! router with the relay/ext stores into a single routing table over the
 //! wire. See task-4-brief.md.
 
+use std::collections::BTreeSet;
+
 use dash_router_core::{
     EvictableStorage, LogRanges, NodeAction, NodeEffect, NodeMachine, NodeState, Op, Ranges,
     RouterAction, RouterConfig, Storage, Units, WireBody, WireMessage,
@@ -281,7 +283,7 @@ fn unsubscribe_keeps_advertising_and_keeps_wanting() {
         })
         .unwrap();
     match &want.body {
-        WireBody::Want(ranges) => assert!(
+        WireBody::Want { ranges, .. } => assert!(
             ranges.get(&l(0)).is_some_and(|r| r.contains(1)),
             "still wants the log's open tail after unsubscribe"
         ),
@@ -309,6 +311,7 @@ fn ext_spontaneity_reconciles_and_smuggled_recvs_are_disabled() {
             NodeAction::Router(RouterAction::RecvWant {
                 from: n(1),
                 ranges: lr([(0, Ranges::full())]),
+                prefixes: BTreeSet::new(),
             })
         )
         .is_err()
@@ -369,7 +372,11 @@ fn send_have_hydration_prefers_the_payload_bearing_copy() {
     let (s, _) = m
         .transition(
             s,
-            NodeAction::Recv(WireMessage::want(n(1), lr([(0, Ranges::full())]))),
+            NodeAction::Recv(WireMessage::want(
+                n(1),
+                lr([(0, Ranges::full())]),
+                BTreeSet::new(),
+            )),
         )
         .unwrap();
     let (s, _) = m
@@ -408,7 +415,7 @@ fn relay_evict_payloads_frees_units_and_keeps_advertising() {
     assert_eq!(s.relay.0.usage(), 4);
 
     // Peer 2 wants seq 0: its payload must survive to answer the Want.
-    let want = WireMessage::want(n(2), lr([(1, Ranges::range(0, 1))]));
+    let want = WireMessage::want(n(2), lr([(1, Ranges::range(0, 1))]), BTreeSet::new());
     let (s, _) = m.transition(s, NodeAction::Recv(want)).unwrap();
     let candidates = s.eviction_candidates();
     assert_eq!(
