@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::ensure;
-use polestar::prelude::*;
+use polestar::{machine::SM, prelude::*, time::TimeInterval};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
@@ -54,11 +54,25 @@ impl<N, L: Default, T> NodeMachine<N, L, T> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct NodeState<N: Ord, L: Ord, T> {
-    pub router: RouterState<N, L, T>,
-    pub relay: RelayStoreState<L>,
-    pub ext: ExtStoreState<L>,
+pub struct NodeState<N: Id, L: Id, T: TimeInterval> {
+    pub router: SM<RouterMachine<N, L, T>>,
+    pub relay: SM<RelayStoreMachine<L>>,
+    pub ext: SM<ExtStoreMachine<L>>,
     pub subscriptions: BTreeSet<L>,
+}
+
+fn held_union<L: Id>(
+    relay: &RelayStoreState<L>,
+    ext: &ExtStoreState<L>,
+    subscriptions: &BTreeSet<L>,
+) -> LogRanges<L> {
+    let mut out = relay.0.held_all().union(&ext.0.held_all());
+    for log in subscriptions {
+        if out.get(log).is_none() {
+            out.insert(*log, Ranges::empty());
+        }
+    }
+    out
 }
 
 impl<N: Id, L: Id, T: polestar::time::TimeInterval> NodeState<N, L, T> {
@@ -66,13 +80,7 @@ impl<N: Id, L: Id, T: polestar::time::TimeInterval> NodeState<N, L, T> {
     /// subscription with nothing stored yet is still "known" and wants
     /// everything).
     pub fn held_union(&self) -> LogRanges<L> {
-        let mut out = self.relay.0.held_all().union(&self.ext.0.held_all());
-        for log in &self.subscriptions {
-            if out.get(log).is_none() {
-                out.insert(*log, Ranges::empty());
-            }
-        }
-        out
+        held_union(&self.relay, &self.ext, &self.subscriptions)
     }
 
     /// Whether either storage side currently holds this exact `(log, seq)`.
@@ -89,15 +97,22 @@ impl<N: Id, L: Id, T: polestar::time::TimeInterval> NodeState<N, L, T> {
 impl<N: Id, L: Id + Default, T: polestar::time::TimeInterval> NodeState<N, L, T> {
     /// A fresh node with empty stores, subscribed to `subscriptions`; the
     /// router starts with the resulting held snapshot.
-    pub fn new(id: N, subscriptions: impl IntoIterator<Item = L>) -> Self {
-        let mut s = Self {
-            router: RouterState::new(id, LogRanges::empty()),
-            relay: RelayStoreState::default(),
-            ext: ExtStoreState::default(),
-            subscriptions: subscriptions.into_iter().collect(),
-        };
-        s.router.held = s.held_union();
-        s
+    pub fn new(
+        id: N,
+        machine: NodeMachine<N, L, T>,
+        subscriptions: impl IntoIterator<Item = L>,
+    ) -> Self {
+        let relay = RelayStoreState::default();
+        let ext = ExtStoreState::default();
+        let subscriptions = subscriptions.into_iter().collect();
+        let held = held_union(&relay, &ext, &subscriptions);
+        let router = RouterState::new(id, held);
+        Self {
+            router: SM::new(machine.router, router),
+            relay: SM::new(machine.relay, relay),
+            ext: SM::new(machine.ext, ext),
+            subscriptions,
+        }
     }
 }
 
@@ -204,18 +219,15 @@ where
                     "held/push are the node glue's business: reconcile_held/Authored are the \
                      only legitimate writers, not a bare NodeAction::Router"
                 );
-                let fx = self.router_step(&mut s, a)?;
+                let fx = s.router.step(a)?;
                 self.route_router_fx(&mut s, fx, &BTreeMap::new(), &mut out)?;
             }
             NodeAction::Recv(wire) => match wire.body {
                 WireBody::Want(ranges) => {
-                    let fx = self.router_step(
-                        &mut s,
-                        RouterAction::RecvWant {
-                            from: wire.sender,
-                            ranges,
-                        },
-                    )?;
+                    let fx = s.router.step(RouterAction::RecvWant {
+                        from: wire.sender,
+                        ranges,
+                    })?;
                     self.route_router_fx(&mut s, fx, &BTreeMap::new(), &mut out)?;
                 }
                 WireBody::Have(ops) => {
@@ -224,13 +236,10 @@ where
                         .flat_map(|(log, seqs)| seqs.into_iter().map(move |(q, o)| ((log, q), o)))
                         .collect();
                     let ranges = ranges_of(&parked);
-                    let fx = self.router_step(
-                        &mut s,
-                        RouterAction::RecvHave {
-                            from: wire.sender,
-                            ranges,
-                        },
-                    )?;
+                    let fx = s.router.step(RouterAction::RecvHave {
+                        from: wire.sender,
+                        ranges,
+                    })?;
                     // Ingest ALL parked bytes first (idempotent; payload
                     // upgrades are invisible to the router's novelty check
                     // — spec §5).
@@ -240,19 +249,19 @@ where
                 }
             },
             NodeAction::Authored(log, seq, op) => {
-                self.ext_step(&mut s, ExtStoreAction::Ingest(log, seq, op))?;
+                s.ext.step(ExtStoreAction::Ingest(log, seq, op))?;
                 self.reconcile_held(&mut s)?;
                 let ranges = LogRanges::from_pairs([(log, Ranges::from_seqs([seq]))]);
-                let fx = self.router_step(&mut s, RouterAction::Push(ranges))?;
+                let fx = s.router.step(RouterAction::Push(ranges))?;
                 self.route_router_fx(&mut s, fx, &BTreeMap::new(), &mut out)?;
             }
             NodeAction::Subscribe(log) => {
                 s.subscriptions.insert(log);
                 let all = LogRanges::from_pairs([(log, Ranges::full())]);
                 for (log, seq, op) in s.relay.0.fetch(&all) {
-                    self.ext_step(&mut s, ExtStoreAction::Ingest(log, seq, op))?;
+                    s.ext.step(ExtStoreAction::Ingest(log, seq, op))?;
                 }
-                self.relay_step(&mut s, RelayStoreAction::Evict(all))?;
+                s.relay.step(RelayStoreAction::Evict(all))?;
                 self.reconcile_held(&mut s)?;
             }
             NodeAction::Unsubscribe(log) => {
@@ -260,19 +269,19 @@ where
                 self.reconcile_held(&mut s)?;
             }
             NodeAction::NativeSync(log, seq, op) => {
-                self.ext_step(&mut s, ExtStoreAction::NativeSync(log, seq, op))?;
+                s.ext.step(ExtStoreAction::NativeSync(log, seq, op))?;
                 self.reconcile_held(&mut s)?;
             }
             NodeAction::AppGc(ranges) => {
-                self.ext_step(&mut s, ExtStoreAction::AppGc(ranges))?;
+                s.ext.step(ExtStoreAction::AppGc(ranges))?;
                 self.reconcile_held(&mut s)?;
             }
             NodeAction::RelayEvict(ranges) => {
-                self.relay_step(&mut s, RelayStoreAction::Evict(ranges))?;
+                s.relay.step(RelayStoreAction::Evict(ranges))?;
                 self.reconcile_held(&mut s)?;
             }
             NodeAction::RelayEvictPayloads(ranges) => {
-                self.relay_step(&mut s, RelayStoreAction::EvictPayloads(ranges))?;
+                s.relay.step(RelayStoreAction::EvictPayloads(ranges))?;
                 self.reconcile_held(&mut s)?;
             }
         }
@@ -286,45 +295,12 @@ where
     L: Id + Serialize + DeserializeOwned,
     T: polestar::time::TimeInterval,
 {
-    fn router_step(
-        &self,
-        s: &mut NodeState<N, L, T>,
-        action: RouterAction<N, L, T>,
-    ) -> anyhow::Result<Vec<Effect<L>>> {
-        let router = s.router.clone();
-        let (router, fx) = self.router.transition(router, action)?;
-        s.router = router;
-        Ok(fx)
-    }
-
-    fn relay_step(
-        &self,
-        s: &mut NodeState<N, L, T>,
-        action: RelayStoreAction<L>,
-    ) -> anyhow::Result<()> {
-        let relay = s.relay.clone();
-        let (relay, _fx) = self.relay.transition(relay, action)?;
-        s.relay = relay;
-        Ok(())
-    }
-
-    fn ext_step(
-        &self,
-        s: &mut NodeState<N, L, T>,
-        action: ExtStoreAction<L>,
-    ) -> anyhow::Result<()> {
-        let ext = s.ext.clone();
-        let (ext, _fx) = self.ext.transition(ext, action)?;
-        s.ext = ext;
-        Ok(())
-    }
-
     /// Cheap and unconditional after any storage change: `HeldChanged` fx
     /// from the storage machines are consumed by this call (dropped — the
     /// snapshot below supersedes any delta).
     fn reconcile_held(&self, s: &mut NodeState<N, L, T>) -> anyhow::Result<()> {
         let snap = s.held_union();
-        self.router_step(s, RouterAction::Held(snap))?;
+        s.router.step(RouterAction::Held(snap))?;
         Ok(())
     }
 
@@ -338,13 +314,14 @@ where
     ) -> anyhow::Result<()> {
         for ((log, seq), op) in parked {
             if s.subscriptions.contains(log) {
-                self.ext_step(s, ExtStoreAction::Ingest(*log, *seq, op.clone()))?;
+                s.ext.step(ExtStoreAction::Ingest(*log, *seq, op.clone()))?;
             } else {
                 let units: Units = s.relay.0.ingest_delta(log, *seq, op);
                 if s.relay.0.usage() + units > self.relay.cap {
                     continue; // shed: no room, and no eviction happened yet
                 }
-                self.relay_step(s, RelayStoreAction::Ingest(*log, *seq, op.clone()))?;
+                s.relay
+                    .step(RelayStoreAction::Ingest(*log, *seq, op.clone()))?;
             }
         }
         Ok(())

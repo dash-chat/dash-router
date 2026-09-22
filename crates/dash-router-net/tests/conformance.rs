@@ -224,7 +224,7 @@ impl Driver {
             .map_err(|e| TestCaseError::fail(format!("SUT init failed: {e}")))?;
 
         let ref_machine = NodeMachine::new(router_config, relay_cap);
-        let ref_state = NodeState::new(0u32, subs);
+        let ref_state = NodeState::new(0u32, ref_machine.clone(), subs);
         let mut d = Self {
             core,
             ref_machine,

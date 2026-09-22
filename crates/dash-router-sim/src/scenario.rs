@@ -264,7 +264,7 @@ impl ScenarioSpec {
                 .copied()
                 .filter(|&log| self.subscribers_of(log).contains(&id))
                 .collect();
-            NodeState::new(id, subs)
+            NodeState::new(id, node_machine.clone(), subs)
         }));
         let params = SimParams {
             n: self.nodes as usize,

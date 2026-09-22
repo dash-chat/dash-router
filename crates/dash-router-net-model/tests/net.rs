@@ -53,13 +53,13 @@ fn machine(topology: Topology<N>) -> Arc<Net> {
 }
 
 /// One node per id, all subscribed to log 0.
-fn nodes(count: usize) -> impl Iterator<Item = NodeState<N, L, T>> {
-    (0..count).map(|id| NodeState::new(n(id), [l(0)]))
+fn nodes(m: NodeMachine<N, L, T>, count: usize) -> impl Iterator<Item = NodeState<N, L, T>> {
+    (0..count).map(move |id| NodeState::new(n(id), m.clone(), [l(0)]))
 }
 
 /// A network where every node subscribes to log 0.
 fn network(m: &Arc<Net>, count: usize) -> StateMachine<Net> {
-    m.state_machine(State::new(nodes(count)))
+    m.state_machine(State::new(nodes(m.node_machine.clone(), count)))
 }
 
 fn disabled(m: &Net, s: &State, action: A) {
@@ -248,13 +248,17 @@ fn absent_messages_and_smuggled_recvs_are_disabled() {
 /// Fairness is a harness's choice, made by wrapping, not the network's.
 #[test]
 fn the_fair_wrapper_bounds_consecutive_drops() {
+    let node_machine = node_machine();
     let m = Arc::new(Fair::new(
-        NetMachine::<N, L, T, K>::new(Topology::star([n(0), n(1), n(2), n(3)]), node_machine()),
+        NetMachine::<N, L, T, K>::new(
+            Topology::star([n(0), n(1), n(2), n(3)]),
+            node_machine.clone(),
+        ),
         |a| matches!(a, A::Drop(_)),
         |a| matches!(a, A::Deliver(_)),
         2,
     ));
-    let mut net = m.state_machine((State::new(nodes(4)), 0));
+    let mut net = m.state_machine((State::new(nodes(node_machine, 4)), 0));
 
     net.step(A::Node(n(0), NodeAction::Authored(l(0), 0, op(1))))
         .unwrap();
@@ -272,11 +276,12 @@ fn the_fair_wrapper_bounds_consecutive_drops() {
 fn the_inflight_cap_disables_overflowing_actions() {
     type TinyNet = NetMachine<N, L, T, 2>;
     type TinyA = NetAction<N, L, T, 2>;
+    let node_machine = node_machine();
     let m = Arc::new(TinyNet::new(
         Topology::star([n(0), n(1), n(2), n(3)]),
-        node_machine(),
+        node_machine.clone(),
     ));
-    let mut net = m.state_machine(NetState::new(nodes(4)));
+    let mut net = m.state_machine(NetState::new(nodes(node_machine, 4)));
 
     // Fan-out of 3 cannot fit in a bag of 2.
     assert!(
