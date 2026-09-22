@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use dash_router_core::{
-    eviction_candidates, group_ops, ranges_of, Effect, LogRanges, Op, Ranges, RouterAction,
-    RouterConfig, RouterMachine, RouterState, Seq, Units, WireBody, WireMessage,
+    Effect, LogRanges, Op, Ranges, RouterAction, RouterConfig, RouterMachine, RouterState, Seq,
+    Units, WireBody, WireMessage, eviction_candidates, group_ops, ranges_of,
 };
 use dash_router_policy::{IntervalPolicy, PushDebouncePolicy};
 use polestar::prelude::*;
@@ -813,7 +813,10 @@ mod tests {
     struct Scripted(Vec<Duration>, usize);
     impl Scripted {
         fn ms(script: &[u64]) -> Self {
-            Scripted(script.iter().map(|&m| Duration::from_millis(m)).collect(), 0)
+            Scripted(
+                script.iter().map(|&m| Duration::from_millis(m)).collect(),
+                0,
+            )
         }
         fn next(&mut self) -> Duration {
             let i = self.1.min(self.0.len() - 1);
@@ -840,7 +843,10 @@ mod tests {
             },
             relay_cap: cap,
             evict_at: 0.75,
-            debounce: PushDebouncePolicy { window_ms: 100, max_latency_ms: 250 },
+            debounce: PushDebouncePolicy {
+                window_ms: 100,
+                max_latency_ms: 250,
+            },
         }
     }
 
@@ -858,11 +864,17 @@ mod tests {
     }
 
     fn op(h: u8, payload: bool) -> Op {
-        Op { header: vec![h], payload: payload.then(|| vec![h; 4]) }
+        Op {
+            header: vec![h],
+            payload: payload.then(|| vec![h; 4]),
+        }
     }
 
     fn wire(msg: WireMessage<u32, u8>) -> Incoming {
-        Incoming { remote: Some("192.168.0.9".parse().unwrap()), bytes: msg.encode() }
+        Incoming {
+            remote: Some("192.168.0.9".parse().unwrap()),
+            bytes: msg.encode(),
+        }
     }
 
     fn broadcasts(out: &[Out<u32, u8>]) -> Vec<&WireMessage<u32, u8>> {
@@ -893,10 +905,16 @@ mod tests {
             vec![(0u8, vec![(0, op(1, true))]), (1u8, vec![(0, op(2, true))])],
         );
         let out = c.on_wire(Duration::ZERO, wire(have)).await.unwrap();
-        assert_eq!(delivered(&out), vec![(0, 0)], "only the subscribed log delivers");
+        assert_eq!(
+            delivered(&out),
+            vec![(0, 0)],
+            "only the subscribed log delivers"
+        );
         let bs = broadcasts(&out);
         assert_eq!(bs.len(), 1, "the flood relays once, hydrated");
-        let WireBody::Have(groups) = &bs[0].body else { panic!("expected Have") };
+        let WireBody::Have(groups) = &bs[0].body else {
+            panic!("expected Have")
+        };
         assert_eq!(groups.len(), 2, "both logs rebroadcast");
         // Subscribed bytes in ext, the rest in the relay.
         assert!(Storage::held_all(&c.ext).contains(&0, 0));
@@ -910,9 +928,15 @@ mod tests {
         let mut c = core(2, &[]).await; // room for exactly one payload op
         let have = WireMessage::have(7, vec![(1u8, vec![(0, op(1, true)), (1, op(2, true))])]);
         let out = c.on_wire(Duration::ZERO, wire(have)).await.unwrap();
-        assert_eq!(EvictableStorage::usage(&c.relay), 2, "one op stored, one shed");
+        assert_eq!(
+            EvictableStorage::usage(&c.relay),
+            2,
+            "one op stored, one shed"
+        );
         let bs = broadcasts(&out);
-        let WireBody::Have(groups) = &bs[0].body else { panic!() };
+        let WireBody::Have(groups) = &bs[0].body else {
+            panic!()
+        };
         assert_eq!(groups[0].1.len(), 1, "hydration only finds the stored op");
     }
 
@@ -926,14 +950,20 @@ mod tests {
         assert!(broadcasts(&out).is_empty(), "no immediate push");
         let out = c.on_append(ms(50), 0, 1, op(2, true)).await.unwrap();
         assert!(broadcasts(&out).is_empty());
-        assert_eq!(c.next_deadline(), Some(ms(100)), "want timer at 100 ties the flush window 50+100; flush due at 150");
+        assert_eq!(
+            c.next_deadline(),
+            Some(ms(100)),
+            "want timer at 100 ties the flush window 50+100; flush due at 150"
+        );
         let out = c.advance_to(ms(150)).await.unwrap();
         let haves: Vec<_> = broadcasts(&out)
             .into_iter()
             .filter(|m| matches!(m.body, WireBody::Have(_)))
             .collect();
         assert_eq!(haves.len(), 1, "one flush for the whole batch");
-        let WireBody::Have(groups) = &haves[0].body else { panic!() };
+        let WireBody::Have(groups) = &haves[0].body else {
+            panic!()
+        };
         assert_eq!(groups[0].1.len(), 2, "both appends carried");
     }
 
@@ -949,9 +979,15 @@ mod tests {
             "fresh subscription wants the whole log"
         );
         // Seed storage, then a peer wants it.
-        let _ = c.on_append(Duration::from_millis(100), 0, 0, op(1, true)).await.unwrap();
+        let _ = c
+            .on_append(Duration::from_millis(100), 0, 0, op(1, true))
+            .await
+            .unwrap();
         let want = WireMessage::want(7, LogRanges::from_pairs([(0u8, Ranges::full())]));
-        let _out = c.on_wire(Duration::from_millis(110), wire(want)).await.unwrap();
+        let _out = c
+            .on_wire(Duration::from_millis(110), wire(want))
+            .await
+            .unwrap();
         // NOTE (deviation from the brief's literal assertion, see task-9
         // report): RouterMachine's RecvWant relays only the range NOT
         // already in `relayed_want_ranges()` (the flood's seen-set,
@@ -963,11 +999,19 @@ mod tests {
         // per the seen-set's own accounting. This is core, unmodified
         // behavior (verified directly against `RouterMachine::transition`),
         // not a shell bug.
-        assert!(c.router.wants.contains_key(&7), "the peer's want is witnessed");
-        assert!(c.router.have_timer.is_some(), "witnessed Want arms the have timer");
+        assert!(
+            c.router.wants.contains_key(&7),
+            "the peer's want is witnessed"
+        );
+        assert!(
+            c.router.have_timer.is_some(),
+            "witnessed Want arms the have timer"
+        );
         let out = c.advance_to(Duration::from_millis(400)).await.unwrap();
         assert!(
-            broadcasts(&out).iter().any(|m| matches!(&m.body, WireBody::Have(g) if !g.is_empty())),
+            broadcasts(&out)
+                .iter()
+                .any(|m| matches!(&m.body, WireBody::Have(g) if !g.is_empty())),
             "the reply is hydrated"
         );
     }
@@ -980,9 +1024,16 @@ mod tests {
         let _ = c.on_wire(Duration::ZERO, wire(have)).await.unwrap();
         assert_eq!(EvictableStorage::usage(&c.relay), 4);
         let _ = c.on_maintain(Duration::from_millis(1)).await.unwrap();
-        assert_eq!(EvictableStorage::usage(&c.relay), 2, "payloads evicted, headers kept");
+        assert_eq!(
+            EvictableStorage::usage(&c.relay),
+            2,
+            "payloads evicted, headers kept"
+        );
         assert!(EvictableStorage::held_payloads(&c.relay).is_empty());
-        assert!(!Storage::held_all(&c.relay).is_empty(), "still advertising headers");
+        assert!(
+            !Storage::held_all(&c.relay).is_empty(),
+            "still advertising headers"
+        );
     }
 
     /// Non-LAN senders, garbage bytes, and own echoes are dropped statelessly.
@@ -994,8 +1045,14 @@ mod tests {
             remote: Some("8.8.8.8".parse().unwrap()),
             bytes: WireMessage::have(7, vec![(0u8, vec![(0, op(1, true))])]).encode(),
         };
-        let garbage = Incoming { remote: Some("192.168.0.9".parse().unwrap()), bytes: vec![0xff, 0x00] };
-        let echo = wire(WireMessage::want(0, LogRanges::from_pairs([(0u8, Ranges::full())])));
+        let garbage = Incoming {
+            remote: Some("192.168.0.9".parse().unwrap()),
+            bytes: vec![0xff, 0x00],
+        };
+        let echo = wire(WireMessage::want(
+            0,
+            LogRanges::from_pairs([(0u8, Ranges::full())]),
+        ));
         for inc in [foreign, garbage, echo] {
             assert!(c.on_wire(Duration::ZERO, inc).await.unwrap().is_empty());
         }

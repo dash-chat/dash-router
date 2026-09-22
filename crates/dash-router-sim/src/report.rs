@@ -77,7 +77,9 @@ impl ScenarioReport {
             inflight_max: runs.iter().map(|r| r.inflight_max).max().unwrap_or(0),
             push_share: ratio(
                 runs.iter().map(|r| r.push_deliveries).sum(),
-                runs.iter().map(|r| r.push_deliveries + r.pull_deliveries).sum(),
+                runs.iter()
+                    .map(|r| r.push_deliveries + r.pull_deliveries)
+                    .sum(),
             ),
         };
         let sometimes = Sometimes {

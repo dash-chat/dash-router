@@ -420,7 +420,10 @@ fn relay_evict_payloads_frees_units_and_keeps_advertising() {
     let (s, fx) = m
         .transition(s, NodeAction::RelayEvictPayloads(candidates))
         .unwrap();
-    assert!(fx.is_empty(), "headers survive: nothing broadcast or delivered");
+    assert!(
+        fx.is_empty(),
+        "headers survive: nothing broadcast or delivered"
+    );
     assert_eq!(s.relay.0.usage(), 3, "one payload unit freed");
     assert_eq!(s.relay.0.held_payloads(), lr([(1, Ranges::range(0, 1))]));
     assert_eq!(

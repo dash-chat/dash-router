@@ -43,7 +43,10 @@ struct Scripted(Vec<Duration>, usize);
 
 impl Scripted {
     fn ms(script: &[u64]) -> Self {
-        Scripted(script.iter().map(|&m| Duration::from_millis(m)).collect(), 0)
+        Scripted(
+            script.iter().map(|&m| Duration::from_millis(m)).collect(),
+            0,
+        )
     }
     fn next(&mut self) -> Duration {
         let i = self.1.min(self.0.len() - 1);
@@ -65,9 +68,20 @@ impl IntervalSource for Scripted {
 
 #[derive(Clone, Debug)]
 enum Step {
-    RecvWant { from: u32, log: u8, start: u32, end: u32 },
-    RecvHave { from: u32, log: u8, seqs: Vec<(u32, bool)> },
-    Append { log: u8 },
+    RecvWant {
+        from: u32,
+        log: u8,
+        start: u32,
+        end: u32,
+    },
+    RecvHave {
+        from: u32,
+        log: u8,
+        seqs: Vec<(u32, bool)>,
+    },
+    Append {
+        log: u8,
+    },
     Subscribe(u8),
     Unsubscribe(u8),
     Advance(u64),
@@ -91,13 +105,19 @@ fn step_strategy() -> impl Strategy<Value = Step> {
 /// Locally authored op (brief's fixture): `header = [log, seq as u8]`,
 /// always carries a payload.
 fn authored_op(log: u8, seq: Seq) -> Op {
-    Op { header: vec![log, seq as u8], payload: Some(vec![seq as u8]) }
+    Op {
+        header: vec![log, seq as u8],
+        payload: Some(vec![seq as u8]),
+    }
 }
 
 /// A wire-carried op for `RecvHave`, with payload presence controlled by the
 /// generated bool.
 fn wire_op(log: u8, seq: Seq, has_payload: bool) -> Op {
-    Op { header: vec![log, seq as u8], payload: has_payload.then(|| vec![seq as u8]) }
+    Op {
+        header: vec![log, seq as u8],
+        payload: has_payload.then(|| vec![seq as u8]),
+    }
 }
 
 fn incoming(msg: &WireMessage<u32, u8>) -> dash_router_net::Incoming {
@@ -128,8 +148,18 @@ fn assert_router_matches(
     check!(idx, "held", sut.held, refr.held);
     check!(idx, "wants", sut.wants, refr.wants);
     check!(idx, "haves", sut.haves, refr.haves);
-    check!(idx, "relayed_want_ranges", sut.relayed_want_ranges(), refr.relayed_want_ranges());
-    check!(idx, "relayed_have_ranges", sut.relayed_have_ranges(), refr.relayed_have_ranges());
+    check!(
+        idx,
+        "relayed_want_ranges",
+        sut.relayed_want_ranges(),
+        refr.relayed_want_ranges()
+    );
+    check!(
+        idx,
+        "relayed_have_ranges",
+        sut.relayed_have_ranges(),
+        refr.relayed_have_ranges()
+    );
     check!(idx, "want_timer", sut.want_timer, refr.want_timer);
     check!(idx, "have_timer", sut.have_timer, refr.have_timer);
     Ok(())
@@ -163,7 +193,10 @@ impl Driver {
             router: router_config.clone(),
             relay_cap,
             evict_at: 0.75,
-            debounce: PushDebouncePolicy { window_ms: 0, max_latency_ms: 0 },
+            debounce: PushDebouncePolicy {
+                window_ms: 0,
+                max_latency_ms: 0,
+            },
         };
         let mut core = NodeCore::new(
             0u32,
@@ -191,7 +224,10 @@ impl Driver {
         // interval; mirror it on the reference with the SAME script, so both
         // consume scripted intervals in identical order from here on.
         let next = d.ref_script.next_want();
-        d.ref_step(0, NodeAction::Router(RouterAction::ArmWantTimer(next.into())))?;
+        d.ref_step(
+            0,
+            NodeAction::Router(RouterAction::ArmWantTimer(next.into())),
+        )?;
         Ok(d)
     }
 
@@ -235,8 +271,10 @@ impl Driver {
                 let fx = self.ref_step(idx, NodeAction::Router(RouterAction::FireWant))?;
                 out.extend(fx);
                 let next = self.ref_script.next_want();
-                let fx2 =
-                    self.ref_step(idx, NodeAction::Router(RouterAction::ArmWantTimer(next.into())))?;
+                let fx2 = self.ref_step(
+                    idx,
+                    NodeAction::Router(RouterAction::ArmWantTimer(next.into())),
+                )?;
                 out.extend(fx2);
                 continue;
             }
@@ -251,8 +289,10 @@ impl Driver {
                 out.extend(fx);
                 if !self.ref_state.router.wants.is_empty() {
                     let next = self.ref_script.next_have();
-                    let fx2 = self
-                        .ref_step(idx, NodeAction::Router(RouterAction::ArmHaveTimer(next.into())))?;
+                    let fx2 = self.ref_step(
+                        idx,
+                        NodeAction::Router(RouterAction::ArmHaveTimer(next.into())),
+                    )?;
                     out.extend(fx2);
                 }
                 continue;
@@ -261,9 +301,12 @@ impl Driver {
                 break;
             }
             let mut step = target - now;
-            for t in [&self.ref_state.router.want_timer, &self.ref_state.router.have_timer]
-                .into_iter()
-                .flatten()
+            for t in [
+                &self.ref_state.router.want_timer,
+                &self.ref_state.router.have_timer,
+            ]
+            .into_iter()
+            .flatten()
             {
                 step = step.min(*t.remaining);
             }
@@ -280,19 +323,15 @@ impl Driver {
         let ref_fx: Vec<NodeEffect<u32, u8>>;
         match step.clone() {
             Step::Subscribe(log) => {
-                sut_out = self
-                    .core
-                    .on_subscribe(self.now, log)
-                    .await
-                    .map_err(|e| TestCaseError::fail(format!("step {idx}: SUT on_subscribe: {e}")))?;
+                sut_out = self.core.on_subscribe(self.now, log).await.map_err(|e| {
+                    TestCaseError::fail(format!("step {idx}: SUT on_subscribe: {e}"))
+                })?;
                 ref_fx = self.ref_step(idx, NodeAction::Subscribe(log))?;
             }
             Step::Unsubscribe(log) => {
-                sut_out = self
-                    .core
-                    .on_unsubscribe(self.now, log)
-                    .await
-                    .map_err(|e| TestCaseError::fail(format!("step {idx}: SUT on_unsubscribe: {e}")))?;
+                sut_out = self.core.on_unsubscribe(self.now, log).await.map_err(|e| {
+                    TestCaseError::fail(format!("step {idx}: SUT on_unsubscribe: {e}"))
+                })?;
                 ref_fx = self.ref_step(idx, NodeAction::Unsubscribe(log))?;
             }
             Step::Append { log } => {
@@ -307,54 +346,67 @@ impl Driver {
                 // Zero-debounce ruling: force the flush within this step so
                 // it maps to the reference's atomic `Authored`, not a
                 // pending push that leaks into a later step.
-                let flushed = self
-                    .core
-                    .advance_to(self.now)
-                    .await
-                    .map_err(|e| TestCaseError::fail(format!("step {idx}: SUT post-append advance_to: {e}")))?;
+                let flushed = self.core.advance_to(self.now).await.map_err(|e| {
+                    TestCaseError::fail(format!("step {idx}: SUT post-append advance_to: {e}"))
+                })?;
                 out.extend(flushed);
                 sut_out = out;
                 ref_fx = self.ref_step(idx, NodeAction::Authored(log, seq, op))?;
             }
-            Step::RecvWant { from, log, start, end } => {
-                let msg: WireMessage<u32, u8> =
-                    WireMessage::want(from, LogRanges::from_pairs([(log, Ranges::range(start, end))]));
+            Step::RecvWant {
+                from,
+                log,
+                start,
+                end,
+            } => {
+                let msg: WireMessage<u32, u8> = WireMessage::want(
+                    from,
+                    LogRanges::from_pairs([(log, Ranges::range(start, end))]),
+                );
                 sut_out = self
                     .core
                     .on_wire(self.now, incoming(&msg))
                     .await
-                    .map_err(|e| TestCaseError::fail(format!("step {idx}: SUT on_wire(Want): {e}")))?;
+                    .map_err(|e| {
+                        TestCaseError::fail(format!("step {idx}: SUT on_wire(Want): {e}"))
+                    })?;
                 let mut fx = self.ref_step(idx, NodeAction::Recv(msg))?;
                 // Binding semantics #1: a witnessed Want arms the Have timer
                 // when none is armed. Mirror the SUT's arm-on-recv, in the
                 // same call.
-                if self.ref_state.router.have_timer.is_none() && !self.ref_state.router.wants.is_empty()
+                if self.ref_state.router.have_timer.is_none()
+                    && !self.ref_state.router.wants.is_empty()
                 {
                     let next = self.ref_script.next_have();
-                    let more = self
-                        .ref_step(idx, NodeAction::Router(RouterAction::ArmHaveTimer(next.into())))?;
+                    let more = self.ref_step(
+                        idx,
+                        NodeAction::Router(RouterAction::ArmHaveTimer(next.into())),
+                    )?;
                     fx.extend(more);
                 }
                 ref_fx = fx;
             }
             Step::RecvHave { from, log, seqs } => {
-                let group: Vec<(Seq, Op)> =
-                    seqs.iter().map(|&(s, has)| (s, wire_op(log, s, has))).collect();
+                let group: Vec<(Seq, Op)> = seqs
+                    .iter()
+                    .map(|&(s, has)| (s, wire_op(log, s, has)))
+                    .collect();
                 let msg: WireMessage<u32, u8> = WireMessage::have(from, vec![(log, group)]);
                 sut_out = self
                     .core
                     .on_wire(self.now, incoming(&msg))
                     .await
-                    .map_err(|e| TestCaseError::fail(format!("step {idx}: SUT on_wire(Have): {e}")))?;
+                    .map_err(|e| {
+                        TestCaseError::fail(format!("step {idx}: SUT on_wire(Have): {e}"))
+                    })?;
                 ref_fx = self.ref_step(idx, NodeAction::Recv(msg))?;
             }
             Step::Advance(ms) => {
                 let target = self.now + Duration::from_millis(ms);
-                sut_out = self
-                    .core
-                    .advance_to(target)
-                    .await
-                    .map_err(|e| TestCaseError::fail(format!("step {idx}: SUT advance_to: {e}")))?;
+                sut_out =
+                    self.core.advance_to(target).await.map_err(|e| {
+                        TestCaseError::fail(format!("step {idx}: SUT advance_to: {e}"))
+                    })?;
                 ref_fx = self.ref_advance_to(idx, target)?;
             }
         }
@@ -378,7 +430,12 @@ impl Driver {
         let ref_relay = self.ref_state.relay.0.held_all();
         check!(idx, "relay.held_all", sut_relay, ref_relay);
 
-        check!(idx, "subscriptions", self.core.subscriptions, self.ref_state.subscriptions);
+        check!(
+            idx,
+            "subscriptions",
+            self.core.subscriptions,
+            self.ref_state.subscriptions
+        );
 
         let mut sut_bc: Vec<WireMessage<u32, u8>> = sut_out
             .iter()
@@ -445,10 +502,23 @@ fn fixed_regression_sequence() {
         Step::Subscribe(0),
         Step::Append { log: 0 },
         Step::Advance(150), // past the initial 100ms want interval
-        Step::RecvWant { from: 1, log: 1, start: 0, end: 5 },
+        Step::RecvWant {
+            from: 1,
+            log: 1,
+            start: 0,
+            end: 5,
+        },
         Step::Advance(150), // past the ~90-110ms have interval
-        Step::RecvHave { from: 2, log: 1, seqs: vec![(0, true), (1, false)] }, // log 1: unsubscribed
-        Step::RecvHave { from: 3, log: 0, seqs: vec![(5, true)] },            // log 0: subscribed, delivers
+        Step::RecvHave {
+            from: 2,
+            log: 1,
+            seqs: vec![(0, true), (1, false)],
+        }, // log 1: unsubscribed
+        Step::RecvHave {
+            from: 3,
+            log: 0,
+            seqs: vec![(5, true)],
+        }, // log 0: subscribed, delivers
         Step::Unsubscribe(0),
         Step::Advance(700), // past want_ttl/have_ttl (500ms) expiry
     ];

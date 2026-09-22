@@ -98,9 +98,17 @@ mod tests {
         let mut store = MemStore::<u8>::new();
         let handle = store.clone();
         let mut hints = store.changed();
-        AsyncStorage::ingest(&mut store, 3, 0, Op { header: vec![1], payload: None })
-            .await
-            .unwrap();
+        AsyncStorage::ingest(
+            &mut store,
+            3,
+            0,
+            Op {
+                header: vec![1],
+                payload: None,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(hints.recv().await.unwrap(), BTreeSet::from([3]));
         assert!(
             Storage::held_all(&handle.snapshot()).contains(&3, 0),

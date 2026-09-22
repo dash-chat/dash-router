@@ -92,10 +92,14 @@ mod tests {
             header: vec![1],
             payload: Some(vec![2]),
         };
-        AsyncStorage::ingest(&mut m, 0, 0, op.clone()).await.unwrap();
+        AsyncStorage::ingest(&mut m, 0, 0, op.clone())
+            .await
+            .unwrap();
         assert_eq!(AsyncEvictableStorage::usage(&m).await.unwrap(), 2);
         assert_eq!(
-            AsyncEvictableStorage::ingest_delta(&m, &0, 0, &op).await.unwrap(),
+            AsyncEvictableStorage::ingest_delta(&m, &0, 0, &op)
+                .await
+                .unwrap(),
             0,
             "duplicate"
         );
