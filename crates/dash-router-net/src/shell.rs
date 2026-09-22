@@ -26,7 +26,7 @@ use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::handle::{Command, RouterEvent, RouterHandle, StorageErrorReport};
+use crate::handle::{Command, RouterEvent, RouterHandle, StatsSnapshot, StorageErrorReport};
 use crate::lan::is_lan;
 use crate::storage::{AsyncEvictableStorage, AsyncStorage, WatchableStorage};
 use crate::transport::{Incoming, Transport};
@@ -175,7 +175,8 @@ where
                 && self.debounce.deadline(oldest, self.latest_append) <= self.now
             {
                 let fx = self.flush_push()?;
-                self.route_fx(fx, &BTreeMap::new(), &mut out).await?;
+                self.route_fx(fx, &BTreeMap::new(), &BTreeSet::new(), &mut out)
+                    .await?;
                 continue;
             }
             if self
@@ -185,7 +186,8 @@ where
                 .is_some_and(|t| t.remaining.is_zero())
             {
                 let fx = self.router_step(RouterAction::FireWant)?;
-                self.route_fx(fx, &BTreeMap::new(), &mut out).await?;
+                self.route_fx(fx, &BTreeMap::new(), &BTreeSet::new(), &mut out)
+                    .await?;
                 let next = self.intervals.next_want();
                 self.router_step(RouterAction::ArmWantTimer(next.into()))?;
                 continue;
@@ -197,7 +199,8 @@ where
                 .is_some_and(|t| t.remaining.is_zero())
             {
                 let fx = self.router_step(RouterAction::FireHave)?;
-                self.route_fx(fx, &BTreeMap::new(), &mut out).await?;
+                self.route_fx(fx, &BTreeMap::new(), &BTreeSet::new(), &mut out)
+                    .await?;
                 if !self.router.wants.is_empty() {
                     let next = self.intervals.next_have();
                     self.router_step(RouterAction::ArmHaveTimer(next.into()))?;
@@ -249,15 +252,22 @@ where
         }
         match msg.body {
             WireBody::Want(ranges) => {
+                // Finding 8(a): an EMPTY Want must not arm the have timer —
+                // otherwise it arms a forever no-op fire/re-arm loop (fire
+                // finds nothing to reply to, re-arms, repeats). Gate on the
+                // received ranges being non-empty, mirrored exactly by the
+                // conformance driver (see tests/conformance.rs).
+                let ranges_nonempty = !ranges.is_empty();
                 let fx = self.router_step(RouterAction::RecvWant {
                     from: msg.sender,
                     ranges,
                 })?;
-                self.route_fx(fx, &BTreeMap::new(), &mut out).await?;
+                self.route_fx(fx, &BTreeMap::new(), &BTreeSet::new(), &mut out)
+                    .await?;
                 // A witnessed Want is what makes arming the Have timer
                 // legal (mirrors the sim behavior's arm-on-recv): do it
                 // right after the Recv, in the same call.
-                if self.router.have_timer.is_none() {
+                if ranges_nonempty && self.router.have_timer.is_none() {
                     let next = self.intervals.next_have();
                     self.router_step(RouterAction::ArmHaveTimer(next.into()))?;
                 }
@@ -274,10 +284,12 @@ where
                 })?;
                 // Ingest ALL parked bytes first (idempotent; payload
                 // upgrades are invisible to the router's novelty check).
-                self.ingest_parked(&parked, &mut out).await?;
+                // Keys whose ext.ingest failed must not be reported as
+                // Delivered below (finding 1: Delivered must not lie).
+                let failed = self.ingest_parked(&parked, &mut out).await?;
                 let touched: BTreeSet<L> = parked.keys().map(|(l, _)| *l).collect();
                 self.reconcile_held(Some(&touched), &mut out).await?;
-                self.route_fx(fx, &parked, &mut out).await?;
+                self.route_fx(fx, &parked, &failed, &mut out).await?;
             }
         }
         Ok(out)
@@ -440,6 +452,7 @@ where
         &mut self,
         fx: Vec<Effect<L>>,
         parked: &BTreeMap<(L, Seq), Op>,
+        failed: &BTreeSet<(L, Seq)>,
         out: &mut Vec<Out<N, L>>,
     ) -> Result<()> {
         for e in fx {
@@ -452,7 +465,10 @@ where
                         // Never iterate `Ranges` directly — it may be open;
                         // walk the parked keys instead.
                         for (pl, seq) in parked.keys() {
-                            if pl == log && r.contains(*seq) {
+                            // Finding 1: a key whose ext.ingest failed did
+                            // NOT land in ext, so it must not be reported as
+                            // Delivered — Delivered must not lie.
+                            if pl == log && r.contains(*seq) && !failed.contains(&(*pl, *seq)) {
                                 out.push(Out::Event(RouterEvent::Delivered(*log, *seq)));
                             }
                         }
@@ -588,10 +604,12 @@ where
         &mut self,
         parked: &BTreeMap<(L, Seq), Op>,
         out: &mut Vec<Out<N, L>>,
-    ) -> Result<()> {
+    ) -> Result<BTreeSet<(L, Seq)>> {
+        let mut failed = BTreeSet::new();
         for ((log, seq), op) in parked {
             if self.subscriptions.contains(log) {
                 if let Err(e) = self.ext.ingest(*log, *seq, op.clone()).await {
+                    failed.insert((*log, *seq));
                     out.push(Out::Event(RouterEvent::StorageError(StorageErrorReport {
                         context: "ingest_parked: ext.ingest",
                         message: e.to_string(),
@@ -620,7 +638,7 @@ where
                 }
             }
         }
-        Ok(())
+        Ok(failed)
     }
 }
 
@@ -657,6 +675,12 @@ where
     let (event_tx, event_rx) = mpsc::channel::<RouterEvent<L>>(64);
 
     let mut hints = ext.changed();
+    // Finding 8(b): once the hints channel reports `Closed`, `hints.recv()`
+    // returns `Closed` immediately forever, which would busy-loop `select!`
+    // if the arm stayed enabled. Guard the arm with this flag instead of
+    // panicking (the core holds the sending store alive, so `Closed` isn't
+    // expected in practice, but a trait method here must never panic).
+    let mut hints_open = true;
     let mut core = NodeCore::new(id, config, subscriptions, ext, relay, intervals);
     let mut transport = transport;
 
@@ -711,6 +735,13 @@ where
                                 break;
                             }
                         }
+                        Some(Command::Stats { reply }) => {
+                            let _ = reply.send(StatsSnapshot {
+                                dropped_msgs: core.dropped_msgs,
+                                relay_errors: core.relay_errors,
+                                relay_store_errors: core.relay.error_count(),
+                            });
+                        }
                     }
                 }
                 inc = transport.recv() => {
@@ -725,7 +756,7 @@ where
                         }
                     }
                 }
-                hint = hints.recv() => {
+                hint = hints.recv(), if hints_open => {
                     let now = epoch.elapsed();
                     let out = match hint {
                         Ok(logs) => core.on_hint(now, logs).await?,
@@ -733,7 +764,13 @@ where
                             core.on_hint(now, BTreeSet::new()).await?
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            unreachable!("the core holds the sending store alive")
+                            // Not expected (the core holds the sending store
+                            // alive) but never panic on it: disable further
+                            // hint polling so a `Closed` receiver (which
+                            // would otherwise be immediately ready forever)
+                            // can't busy-loop the select.
+                            hints_open = false;
+                            Vec::new()
                         }
                     };
                     if !route_outs(out, &mut transport, &event_tx).await? {
@@ -969,23 +1006,57 @@ mod tests {
 
     /// The want timer fires on schedule and a peer's Want arms the have timer;
     /// the eventual Have reply is hydrated from storage.
+    ///
+    /// Finding 6 (test honesty): the original version of this test appended
+    /// at t=100 and only advanced to t=400 afterward, so its final
+    /// assertion ("the reply is hydrated") was actually satisfied by the
+    /// *debounce flush* at t=200 (the append's own push), not by the
+    /// have-timer fire it claimed to exercise — the have timer's fire found
+    /// `recent_haves` already noting that range (from the flush) and
+    /// emitted nothing. Restructured (small option from the brief): push
+    /// the debounce window far out of reach for this test (so the append's
+    /// own flush can never race the have timer), then show the have-timer's
+    /// fire is what genuinely hydrates and replies to the peer's Want.
     #[tokio::test]
     async fn want_fire_and_have_reply_flow() {
-        let mut c = core(100, &[0]).await; // empty subscribed log: wants everything
+        let mut config = config(100);
+        config.debounce = PushDebouncePolicy {
+            window_ms: 100_000,
+            max_latency_ms: 100_000,
+        }; // never flushes within this test's timeline
+        // Scripted intervals consumed in order: [0] the initial Want-timer
+        // arm (fires at t=100); [1] that fire's re-arm, made huge so a
+        // second Want fire can't interfere; [2] the Have-timer arm on
+        // witnessing the peer's Want (fires 100ms later, at t=250).
+        let mut c: Core = NodeCore::new(
+            0u32,
+            config,
+            BTreeSet::from([0u8]),
+            OpsMap::default(),
+            OpsMap::default(),
+            Scripted::ms(&[100, 100_000, 100]),
+        );
+        c.init().await.unwrap();
+
         let out = c.advance_to(Duration::from_millis(100)).await.unwrap();
         let bs = broadcasts(&out);
         assert!(
             matches!(&bs[0].body, WireBody::Want(r) if r.get(&0) == Some(&Ranges::full())),
             "fresh subscription wants the whole log"
         );
-        // Seed storage, then a peer wants it.
+
+        // Seed storage: `held` updates immediately (before any debounced
+        // push flushes — which, per the config above, won't happen within
+        // this test at all), so the have timer below sees genuinely fresh,
+        // never-yet-sent data.
         let _ = c
-            .on_append(Duration::from_millis(100), 0, 0, op(1, true))
+            .on_append(Duration::from_millis(110), 0, 0, op(1, true))
             .await
             .unwrap();
+
         let want = WireMessage::want(7, LogRanges::from_pairs([(0u8, Ranges::full())]));
         let _out = c
-            .on_wire(Duration::from_millis(110), wire(want))
+            .on_wire(Duration::from_millis(150), wire(want))
             .await
             .unwrap();
         // NOTE (deviation from the brief's literal assertion, see task-9
@@ -993,7 +1064,7 @@ mod tests {
         // already in `relayed_want_ranges()` (the flood's seen-set,
         // DESIGN.md-mandated termination). Our own FireWant at t=100
         // already flooded the full range for log 0 with a 500ms want_ttl,
-        // so a peer's identical want at t=110 is witnessed (recorded in
+        // so a peer's identical want at t=150 is witnessed (recorded in
         // `wants`, which is what legalizes arming the have timer) but is
         // correctly NOT re-flooded — re-broadcasting it would be redundant
         // per the seen-set's own accounting. This is core, unmodified
@@ -1007,12 +1078,18 @@ mod tests {
             c.router.have_timer.is_some(),
             "witnessed Want arms the have timer"
         );
+        // The push from the append is still pending (not yet flushed) and,
+        // by construction (window/max_latency both 100s), cannot flush
+        // within this test's timeline — so the broadcast captured below can
+        // only be the have-timer's own fire.
+        assert!(c.pending_since.is_some(), "the push has not flushed");
         let out = c.advance_to(Duration::from_millis(400)).await.unwrap();
         assert!(
             broadcasts(&out)
                 .iter()
                 .any(|m| matches!(&m.body, WireBody::Have(g) if !g.is_empty())),
-            "the reply is hydrated"
+            "the have-timer's own fire hydrates and replies — the debounced push, by \
+             construction, could not have produced this broadcast"
         );
     }
 
@@ -1058,5 +1135,90 @@ mod tests {
         }
         assert_eq!(c.dropped_msgs, 3);
         assert_eq!(c.router.held, held, "no state change from dropped input");
+    }
+
+    /// A test-local `ext` store that fails `ingest` for chosen `(log, seq)`
+    /// keys. Implements the ASYNC `AsyncStorage` trait directly (not the
+    /// sync `Storage` trait): a type that had both a hand-written async impl
+    /// and the sync `Storage` impl would fight the blanket sync→async bridge
+    /// in `storage.rs` for coherence (E0119), so this must NOT implement
+    /// `Storage`.
+    struct FailingExt {
+        inner: OpsMap<u8>,
+        fail: BTreeSet<(u8, Seq)>,
+    }
+
+    impl AsyncStorage<u8> for FailingExt {
+        async fn held_of(&self, logs: &BTreeSet<u8>) -> Result<LogRanges<u8>> {
+            Ok(Storage::held_of(&self.inner, logs))
+        }
+        async fn held_all(&self) -> Result<LogRanges<u8>> {
+            Ok(Storage::held_all(&self.inner))
+        }
+        async fn fetch(&self, ranges: &LogRanges<u8>) -> Result<Vec<(u8, Seq, Op)>> {
+            Ok(Storage::fetch(&self.inner, ranges))
+        }
+        async fn ingest(&mut self, log: u8, seq: Seq, op: Op) -> Result<()> {
+            if self.fail.contains(&(log, seq)) {
+                anyhow::bail!("FailingExt: ingest({log}, {seq}) deliberately fails");
+            }
+            Storage::ingest(&mut self.inner, log, seq, op);
+            Ok(())
+        }
+    }
+
+    /// Finding 1: a `Have` containing a subscribed op whose `ext.ingest`
+    /// fails must produce a `StorageError` and NOT a `Delivered` for that
+    /// key — `Delivered` must not lie about bytes actually landing in the
+    /// embedder's store. A later, successful re-receive of the same key
+    /// does deliver (the failed ingest left `held` unchanged, so the op is
+    /// still novel to the router).
+    #[tokio::test]
+    async fn failed_ext_ingest_is_not_reported_delivered() {
+        let ext = FailingExt {
+            inner: OpsMap::default(),
+            fail: BTreeSet::from([(0u8, 0u32)]),
+        };
+        let mut c: NodeCore<u32, u8, FailingExt, OpsMap<u8>, Scripted> = NodeCore::new(
+            0u32,
+            config(100),
+            BTreeSet::from([0u8]),
+            ext,
+            OpsMap::default(),
+            Scripted::ms(&[100]),
+        );
+        c.init().await.unwrap();
+
+        let have = WireMessage::have(7, vec![(0u8, vec![(0, op(1, true))])]);
+        let out = c.on_wire(Duration::ZERO, wire(have.clone())).await.unwrap();
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, Out::Event(RouterEvent::StorageError(_)))),
+            "the failed ingest is reported"
+        );
+        assert!(
+            delivered(&out).is_empty(),
+            "Delivered must not lie: ext.ingest failed, so no Delivered for (0, 0)"
+        );
+        assert!(
+            !AsyncStorage::held_all(&c.ext)
+                .await
+                .unwrap()
+                .contains(&0, 0),
+            "the bytes really aren't in ext"
+        );
+
+        // Stop failing, then re-receive the same key: still novel to the
+        // router (held never advanced), so it delivers this time.
+        c.ext.fail.clear();
+        let out2 = c
+            .on_wire(Duration::from_millis(1), wire(have))
+            .await
+            .unwrap();
+        assert_eq!(
+            delivered(&out2),
+            vec![(0, 0)],
+            "a later successful re-receive delivers"
+        );
     }
 }
