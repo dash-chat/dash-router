@@ -22,12 +22,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use dash_router::{CoreConfig, IntervalSource, NodeCore, Out, RouterEvent};
 use dash_router_core::{
     EvictableStorage, LogRanges, NodeAction, NodeEffect, NodeMachine, NodeState, Op, OpsMap,
-    Ranges, RouterAction, RouterConfig, RouterState, Seq, Storage, Units, WireMessage,
+    Ranges, RouterAction, RouterConfig, RouterState, Seq, Storage, Units, WireBody, WireMessage,
     eviction_candidates,
 };
-use dash_router::{CoreConfig, IntervalSource, NodeCore, Out, RouterEvent};
 use dash_router_policy::PushDebouncePolicy;
 use polestar::prelude::*;
 use polestar::time::RealTime;
@@ -75,6 +75,12 @@ enum Step {
         start: u32,
         end: u32,
     },
+    /// A Want naming no ranges, only a prefix: "every log under it".
+    /// `u8` logs are their own prefix.
+    RecvPrefixWant {
+        from: u32,
+        prefix: u8,
+    },
     RecvHave {
         from: u32,
         log: u8,
@@ -83,6 +89,7 @@ enum Step {
     Append {
         log: u8,
     },
+    /// Subscribe to a prefix (`u8`'s `Prefix = Self`).
     Subscribe(u8),
     Unsubscribe(u8),
     Advance(u64),
@@ -98,6 +105,7 @@ fn step_strategy() -> impl Strategy<Value = Step> {
     prop_oneof![
         3 => (1u32..4, 0u8..3, 0u32..8, 0u32..8)
             .prop_map(|(from, log, start, end)| Step::RecvWant { from, log, start, end }),
+        1 => (1u32..4, 0u8..3).prop_map(|(from, prefix)| Step::RecvPrefixWant { from, prefix }),
         3 => (1u32..4, 0u8..3, proptest::collection::vec((0u32..8, any::<bool>()), 0..4))
             .prop_map(|(from, log, seqs)| Step::RecvHave { from, log, seqs }),
         2 => (0u8..3).prop_map(|log| Step::Append { log }),
@@ -154,6 +162,7 @@ fn assert_router_matches(
     refr: &RouterState<u32, u8, RealTime>,
 ) -> Result<(), TestCaseError> {
     check!(idx, "held", sut.held, refr.held);
+    check!(idx, "open", sut.open, refr.open);
     check!(idx, "wants", sut.wants, refr.wants);
     check!(idx, "haves", sut.haves, refr.haves);
     check!(
@@ -403,35 +412,13 @@ impl Driver {
                 end,
             } => {
                 let ranges = LogRanges::from_pairs([(log, Ranges::range(start, end))]);
-                // Finding 8(a): the SUT only arms the have timer when the
-                // RECEIVED ranges are non-empty (an empty Want must not arm
-                // a forever no-op fire/re-arm loop) — mirror that exact
-                // gate here, not `wants.is_empty()` (which is always false
-                // after this Recv, since `RouterAction::RecvWant` records
-                // the witnessing peer's entry in `wants` regardless of
-                // whether its ranges were empty).
-                let ranges_nonempty = !ranges.is_empty();
                 let msg: WireMessage<u32, u8> = WireMessage::want(from, ranges, BTreeSet::new());
-                sut_out = self
-                    .core
-                    .on_wire(self.now, incoming(&msg))
-                    .await
-                    .map_err(|e| {
-                        TestCaseError::fail(format!("step {idx}: SUT on_wire(Want): {e}"))
-                    })?;
-                let mut fx = self.ref_step(idx, NodeAction::Recv(msg))?;
-                // Binding semantics #1: a witnessed non-empty Want arms the
-                // Have timer when none is armed. Mirror the SUT's
-                // arm-on-recv, in the same call.
-                if ranges_nonempty && self.ref_state.router.have_timer.is_none() {
-                    let next = self.ref_script.next_have();
-                    let more = self.ref_step(
-                        idx,
-                        NodeAction::Router(RouterAction::ArmHaveTimer(next.into())),
-                    )?;
-                    fx.extend(more);
-                }
-                ref_fx = fx;
+                (sut_out, ref_fx) = self.recv_want(idx, msg).await?;
+            }
+            Step::RecvPrefixWant { from, prefix } => {
+                let msg: WireMessage<u32, u8> =
+                    WireMessage::want(from, LogRanges::empty(), BTreeSet::from([prefix]));
+                (sut_out, ref_fx) = self.recv_want(idx, msg).await?;
             }
             Step::RecvHave { from, log, seqs } => {
                 let group: Vec<(Seq, Op)> = seqs
@@ -465,6 +452,44 @@ impl Driver {
         }
         self.compare(idx, &sut_out, &ref_fx)?;
         Ok(())
+    }
+
+    /// Deliver a Want to both machines, mirroring the SUT's arm-on-recv.
+    ///
+    /// Finding 8(a) / review focus 6: the SUT only arms the have timer when
+    /// the RECEIVED Want names something — ranges or prefixes (an empty
+    /// Want must not arm a forever no-op fire/re-arm loop; a prefix-only
+    /// Want is a real request and must arm). Mirror that exact gate here,
+    /// not `wants.is_empty()` (which is always false after this Recv, since
+    /// `RouterAction::RecvWant` records the witnessing peer's entry in
+    /// `wants` regardless of whether its ranges were empty).
+    async fn recv_want(
+        &mut self,
+        idx: usize,
+        msg: WireMessage<u32, u8>,
+    ) -> Result<(Vec<Out<u32, u8>>, Vec<NodeEffect<u32, u8>>), TestCaseError> {
+        let WireBody::Want { ranges, prefixes } = &msg.body else {
+            unreachable!("recv_want is only called with a Want");
+        };
+        let want_nonempty = !ranges.is_empty() || !prefixes.is_empty();
+        let sut_out = self
+            .core
+            .on_wire(self.now, incoming(&msg))
+            .await
+            .map_err(|e| TestCaseError::fail(format!("step {idx}: SUT on_wire(Want): {e}")))?;
+        let mut fx = self.ref_step(idx, NodeAction::Recv(msg))?;
+        // Binding semantics #1: a witnessed non-empty Want arms the Have
+        // timer when none is armed. Mirror the SUT's arm-on-recv, in the
+        // same call.
+        if want_nonempty && self.ref_state.router.have_timer.is_none() {
+            let next = self.ref_script.next_have();
+            let more = self.ref_step(
+                idx,
+                NodeAction::Router(RouterAction::ArmHaveTimer(next.into())),
+            )?;
+            fx.extend(more);
+        }
+        Ok((sut_out, fx))
     }
 
     fn compare(
