@@ -147,3 +147,25 @@ async fn late_joiner_repairs_via_want() {
     got.insert(next_delivery(&mut c_events).await);
     assert_eq!(got, BTreeSet::from([(0u8, 0u32), (0, 1)]));
 }
+
+/// Finding 3: the degrade-and-report counters must be observable, not just
+/// maintained internally. A freshly spawned, idle node's stats snapshot
+/// comes back `Ok` with all-zero counters (nothing has degraded yet).
+#[tokio::test(start_paused = true)]
+async fn stats_reports_a_zeroed_snapshot_for_a_fresh_node() {
+    let hub = LoopbackHub::new();
+    let (a, _a_events, _a_task) = spawn(
+        1u32,
+        config(),
+        Duration::from_secs(1),
+        BTreeSet::from([0u8]),
+        MemStore::new(),
+        OpsMap::default(),
+        hub.join("192.168.0.1".parse().unwrap()),
+        intervals(1),
+    );
+    let snapshot = a.stats().await.expect("stats command round-trips");
+    assert_eq!(snapshot.dropped_msgs, 0);
+    assert_eq!(snapshot.relay_errors, 0);
+    assert_eq!(snapshot.relay_store_errors, 0);
+}
