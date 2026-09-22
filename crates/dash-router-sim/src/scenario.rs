@@ -151,8 +151,10 @@ pub struct PolicySpec {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkloadSpec {
-    /// Number of writer nodes; writer `w` authors log `w`, and every
-    /// node subscribes to every log.
+    /// Number of writer nodes; writer `w` authors log `w`. Every node
+    /// subscribes to every log only when `subscribers` (below) is `None`;
+    /// otherwise each log `w` is subscribed by exactly `subscribers` nodes
+    /// per the `(w + i) % nodes` scheme documented on that field.
     pub writers: u8,
     /// Poisson arrival rate of appends, summed across all writers.
     pub appends_per_sec: f64,

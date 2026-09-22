@@ -32,6 +32,14 @@ implementation:
 - §8 conformance uses plain `proptest` (not `proptest-state-machine`)
   with a zero-debounce lockstep SUT, not the debounce-aware harness
   originally sketched.
+- §3's `held_of`/`held_all` error handling has no retry/backoff, unlike
+  this draft's original text: a failed read simply leaves the stale
+  `held_cache` standing until the next hint/append/Have touches the
+  affected log and runs `reconcile_held` again. Under-advertising in the
+  meantime is safe (the protocol already treats un-advertised data as
+  absent and repairs it via the normal Want/Have cycle), so this is still
+  honest degrade-and-report, just without the backoff machinery the
+  original text implied.
 - The concrete stores (`MemStore`, `DiskRelayStore`) implement the
   synchronous storage traits and ride a blanket sync→async bridge, rather
   than implementing `AsyncStorage`/`WatchableStorage` directly, for
@@ -90,15 +98,15 @@ shell is a thin imperative rind around the same pure `RouterMachine`
 transitions the model uses:
 
 ```rust
-pub struct NodeShell<L, E, R> {
+pub struct NodeShell<L, E, R> {  // [implemented as NodeCore with advance_to and self-armed timers — see Resolved]
     router: RouterMachine<PublicKey, L, RealTime>,   // config
     state: RouterState<PublicKey, L, RealTime>,      // the pure state, verbatim
     ext: E,            // AsyncStorage + WatchableStorage (Dash Chat's, or standalone)
     relay: R,          // AsyncStorage + AsyncEvictableStorage (disk)
     subscriptions: BTreeSet<L>,
     held_cache: LogRanges<L>,   // derived: last known ext ∪ relay ∪ empty-sub keys
-    ticks: TickBuffer,          // wall clock → Tick(RealTime) discretisation
-    timers: TimerMap<TimerKind> // Want / Have / PushDebounce deadlines
+    ticks: TickBuffer,          // wall clock → Tick(RealTime) discretisation [implemented via advance_to's tick loop — see Resolved]
+    timers: TimerMap<TimerKind> // Want / Have / PushDebounce deadlines [implemented as plain Option<Timer> fields on RouterState plus NodeCore's pending_push/pending_since — see Resolved]
 }
 ```
 
@@ -154,9 +162,13 @@ skip that op (shedding is already legal, so a failed relay write is
 indistinguishable from a shed); an error on the **ext** store is the
 embedder's data path failing and is surfaced on the event stream as
 `RouterEvent::StorageError` while the node keeps gossiping from what it
-has. `held_of`/`held_all` errors retry with backoff; until a read
-succeeds the stale `held_cache` stands (honest-eventually, same weakened
-invariant the spec already accepts). **[decision]** — the alternative
+has. `held_of`/`held_all` errors — as implemented, a deviation from this
+draft's original text (recorded below): there is no retry/backoff; the
+stale `held_cache` simply stands until the next hint, append, or Have that
+touches the affected log runs `reconcile_held` again. Under-advertising in
+the meantime is safe (the protocol already treats un-advertised data as
+absent and repairs it via the normal Want/Have cycle), so this is honest
+degrade-and-report, not silent data loss. **[decision]** — the alternative
 (crash the node task on any storage error) is cleaner but turns a
 transient disk hiccup into a LAN-visible outage.
 
@@ -252,13 +264,13 @@ crates/dash-router-net/src/
   storage.rs      AsyncStorage/AsyncEvictableStorage/WatchableStorage + blanket sync impl
   mem.rs          in-memory selfish store + changed() stream
   disk.rs         redb relay store
-  shell.rs        NodeShell: select loop, routing table, TickBuffer/TimerMap
+  shell.rs        NodeShell [implemented as NodeCore with advance_to and self-armed timers — see Resolved]: select loop, routing table, TickBuffer/TimerMap
   handle.rs       RouterHandle, Command, RouterEvent
   transport.rs    Transport trait: broadcast/recv (p2panda impl + test loopback)
   lan.rs          LAN-boundary predicate
   panda.rs        p2panda-net Transport impl, feature-gated ("p2panda")
 tests/
-  conformance.rs  lockstep vs NodeMachine (proptest-state-machine)
+  conformance.rs  lockstep vs NodeMachine (plain proptest — see Resolved)
   loop.rs         two shells over the loopback transport, end-to-end
 ```
 
@@ -268,8 +280,9 @@ the blanket sync→async stores, no p2panda anywhere in the test.
 
 ## 8. Conformance
 
-`proptest-state-machine` lockstep per spec §8: reference =
-`NodeMachine`; SUT = `NodeShell` on a current-thread runtime, driven by
+Plain `proptest` lockstep (not the `proptest-state-machine` crate — see
+Resolved): reference = `NodeMachine`; SUT = `NodeShell` on a current-thread
+runtime, driven by
 the same action sequence (commands, injected wire messages, manually
 stepped time — the `TickBuffer` accepts a test clock). Projection:
 `(router state, ext held, relay held, subscriptions)` — `held_cache` and
