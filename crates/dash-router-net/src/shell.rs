@@ -599,6 +599,22 @@ where
         out: &mut Vec<Out<N, L>>,
     ) -> Result<BTreeSet<(L, Seq)>> {
         let mut failed = BTreeSet::new();
+        // Mirrors `NodeMachine::ingest_parked`: `usage()` is O(store) (for
+        // `DiskRelayStore` a derived sum over every log's ranges — see its
+        // `usage` doc), so read it once and track it across the batch rather
+        // than re-reading per op. `None` means "unknown, re-read before the
+        // next check": initially, and after any relay error, since the
+        // trait doesn't promise a failed ingest left the store untouched.
+        // A usage read that fails still sheds just that one op, as before.
+        //
+        // Tracking can only over-count, never under-count: `ingest_delta`
+        // is served from the store's cache, which may under-report what is
+        // really on disk (after a degraded rebuild), in which case the real
+        // ingest is a duplicate and adds less than `units`. Over-counting
+        // only sheds a little early within this batch, and the next batch's
+        // fresh read corrects it — the same under-report-not-over-report
+        // direction the disk store itself lives by.
+        let mut usage: Option<Units> = None;
         for ((log, seq), op) in parked {
             if self.subscriptions.contains(log) {
                 if let Err(e) = self.ext.ingest(*log, *seq, op.clone()).await {
@@ -613,21 +629,29 @@ where
                     Ok(u) => u,
                     Err(_) => {
                         self.relay_errors += 1;
+                        usage = None;
                         continue;
                     }
                 };
-                let usage = match self.relay.usage().await {
-                    Ok(u) => u,
-                    Err(_) => {
-                        self.relay_errors += 1;
-                        continue;
-                    }
+                let current = match usage {
+                    Some(u) => u,
+                    None => match self.relay.usage().await {
+                        Ok(u) => u,
+                        Err(_) => {
+                            self.relay_errors += 1;
+                            continue;
+                        }
+                    },
                 };
-                if usage + units > self.relay_cap {
+                if current + units > self.relay_cap {
+                    usage = Some(current);
                     continue; // shed: no room, and no eviction happened yet
                 }
                 if self.relay.ingest(*log, *seq, op.clone()).await.is_err() {
                     self.relay_errors += 1;
+                    usage = None;
+                } else {
+                    usage = Some(current + units);
                 }
             }
         }
