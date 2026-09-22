@@ -2,7 +2,7 @@
 //! against the pure `NodeMachine` reference (`dash-router-core`).
 //!
 //! `NodeCore` is a deliberate, async transcription of `NodeMachine`'s
-//! transition logic (see the module doc on `dash_router_net::shell`), kept
+//! transition logic (see the module doc on `dash_router::shell`), kept
 //! separate because the pure core machine has no way to `.await` a fallible
 //! store. This test drives an identical action sequence into both, over the
 //! same synchronous `OpsMap` stores (via the blanket sync-to-async bridge),
@@ -27,7 +27,7 @@ use dash_router_core::{
     Ranges, RouterAction, RouterConfig, RouterState, Seq, Storage, Units, WireMessage,
     eviction_candidates,
 };
-use dash_router_net::{CoreConfig, IntervalSource, NodeCore, Out, RouterEvent};
+use dash_router::{CoreConfig, IntervalSource, NodeCore, Out, RouterEvent};
 use dash_router_policy::PushDebouncePolicy;
 use polestar::prelude::*;
 use polestar::time::RealTime;
@@ -38,7 +38,7 @@ use proptest::test_runner::TestCaseError;
 // not reachable from an integration test) -----------------------------------
 
 /// Deterministic intervals: pops from the front, repeats the last entry
-/// forever. Mirrors `dash_router_net::shell`'s private test-only `Scripted`.
+/// forever. Mirrors `dash_router::shell`'s private test-only `Scripted`.
 #[derive(Clone)]
 struct Scripted(Vec<Duration>, usize);
 
@@ -128,8 +128,8 @@ fn wire_op(log: u8, seq: Seq, has_payload: bool) -> Op {
     }
 }
 
-fn incoming(msg: &WireMessage<u32, u8>) -> dash_router_net::Incoming {
-    dash_router_net::Incoming {
+fn incoming(msg: &WireMessage<u32, u8>) -> dash_router::Incoming {
+    dash_router::Incoming {
         remote: Some("192.168.0.9".parse().unwrap()),
         bytes: msg.encode(),
     }

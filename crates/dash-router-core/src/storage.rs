@@ -51,9 +51,9 @@ pub trait EvictableStorage<L: Ord>: Storage<L> {
     /// degraded from rather than propagated. Defaults to 0: the sync
     /// `Storage`/`EvictableStorage` traits are total (their methods can't
     /// fail), so a pure in-memory store like `OpsMap` has nothing to count.
-    /// A store with a fallible backing layer (e.g. `dash-router-net`'s
+    /// A store with a fallible backing layer (e.g. `dash-router`'s
     /// redb-backed `DiskRelayStore`) overrides this with its real count.
-    /// `dash-router-net`'s async `AsyncEvictableStorage::error_count`
+    /// `dash-router`'s async `AsyncEvictableStorage::error_count`
     /// bridges to this exact method for any sync store used via the
     /// blanket sync→async impl.
     fn error_count(&self) -> u64 {

@@ -234,7 +234,7 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "binds real sockets and mDNS; run manually: cargo test -p dash-router-net --features p2panda -- --ignored"]
+    #[ignore = "binds real sockets and mDNS; run manually: cargo test -p dash-router --features p2panda -- --ignored"]
     async fn two_panda_nodes_gossip_on_localhost() {
         let (mut a, _a_key) = spawn_panda(SigningKey::generate())
             .await

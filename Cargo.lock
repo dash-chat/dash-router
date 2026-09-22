@@ -734,18 +734,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dash-router-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "polestar",
- "postcard",
- "proptest",
- "serde",
-]
-
-[[package]]
-name = "dash-router-net"
+name = "dash-router"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -764,6 +753,17 @@ dependencies = [
  "tempfile",
  "tokio",
  "trait-variant",
+]
+
+[[package]]
+name = "dash-router-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "polestar",
+ "postcard",
+ "proptest",
+ "serde",
 ]
 
 [[package]]

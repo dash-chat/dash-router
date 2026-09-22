@@ -19,3 +19,8 @@ pub use mem::MemStore;
 pub use shell::{CoreConfig, IntervalSource, NodeCore, Out, PolicyIntervals, spawn};
 pub use storage::{AsyncEvictableStorage, AsyncStorage, WatchableStorage};
 pub use transport::{Incoming, LoopbackHub, LoopbackTransport, Transport};
+
+/// The pure protocol core, re-exported so an embedder depends on one crate.
+pub use dash_router_core as core;
+/// The interval/debounce policies, likewise.
+pub use dash_router_policy as policy;

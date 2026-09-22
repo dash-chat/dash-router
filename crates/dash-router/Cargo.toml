@@ -1,5 +1,5 @@
 [package]
-name = "dash-router-net"
+name = "dash-router"
 description = "The tokio shell: a real Dash Router node over async storage and a LAN transport"
 version.workspace = true
 edition.workspace = true

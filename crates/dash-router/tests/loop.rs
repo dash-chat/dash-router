@@ -7,7 +7,7 @@ use std::time::Duration;
 use dash_router_core::{Op, OpsMap, RouterConfig, Storage, Units};
 // The relay store is a plain OpsMap through the blanket sync bridge:
 // MemStore is the *watchable ext* store and implements no eviction.
-use dash_router_net::{CoreConfig, LoopbackHub, MemStore, PolicyIntervals, RouterEvent, spawn};
+use dash_router::{CoreConfig, LoopbackHub, MemStore, PolicyIntervals, RouterEvent, spawn};
 use dash_router_policy::{IntervalPolicy, PushDebouncePolicy};
 use rand::SeedableRng;
 
