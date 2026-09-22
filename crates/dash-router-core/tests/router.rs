@@ -418,4 +418,100 @@ mod prefix {
             .unwrap();
         assert_eq!(s.others_wants().get(&a1), Some(&Ranges::range(0, 10)));
     }
+
+    /// Spec §3.5: a log this node knows under its own open prefix stays
+    /// named in its Want even when a peer already wants the same ranges,
+    /// or answerers would treat it as unnamed and send it wholesale. Logs
+    /// under other prefixes are still suppressed as before.
+    #[test]
+    fn logs_under_own_open_prefix_stay_named_when_suppressed() {
+        let m = machine();
+        let a1 = Pair::new(1, 1);
+        let b1 = Pair::new(2, 1);
+        let s = RouterState::new(
+            0u32,
+            held(&[(a1, Ranges::range(0, 4)), (b1, Ranges::range(0, 4))]),
+        );
+        let (s, _) = m.transition(s, A::Open(BTreeSet::from([1u8]))).unwrap();
+        // Peer Y already wants both open tails, with no prefixes.
+        let (s, _) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 7,
+                    ranges: held(&[(a1, Ranges::from(4)), (b1, Ranges::from(4))]),
+                    prefixes: BTreeSet::new(),
+                },
+            )
+            .unwrap();
+        let (s, _) = m
+            .transition(s, A::ArmWantTimer(Duration::ZERO.into()))
+            .unwrap();
+        let (_, fx) = m.transition(s, A::FireWant).unwrap();
+        let (ranges, prefixes) = sent_want(&fx).expect("a Want is sent");
+        assert_eq!(prefixes, BTreeSet::from([1u8]));
+        assert_eq!(
+            ranges.get(&a1),
+            Some(&Ranges::from(4)),
+            "log under own open prefix stays named"
+        );
+        assert_eq!(
+            ranges.get(&b1),
+            None,
+            "log under another prefix is suppressed"
+        );
+    }
+
+    /// A relayed prefix Want keeps the wanter's named ranges, even ranges
+    /// this relayer already relayed for someone else, so a two-hop
+    /// answerer never sends a named log wholesale.
+    #[test]
+    fn relayed_prefixes_carry_the_wanters_named_ranges() {
+        let m = machine();
+        let a1 = Pair::new(1, 1);
+        let s = RouterState::new(0u32, LogRanges::empty());
+        let tail = || held(&[(a1, Ranges::from(4))]);
+        // Y's Want for a1's tail is relayed first.
+        let (s, fx) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 1,
+                    ranges: tail(),
+                    prefixes: BTreeSet::new(),
+                },
+            )
+            .unwrap();
+        assert!(sent_want(&fx).is_some(), "Y's Want is relayed");
+        // X names the same tail and adds prefix 1.
+        let (s, fx) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 2,
+                    ranges: tail(),
+                    prefixes: BTreeSet::from([1u8]),
+                },
+            )
+            .unwrap();
+        let (ranges, prefixes) = sent_want(&fx).expect("X's Want is relayed");
+        assert_eq!(prefixes, BTreeSet::from([1u8]));
+        assert_eq!(
+            ranges.get(&a1),
+            Some(&Ranges::from(4)),
+            "named ranges travel with the prefixes"
+        );
+        // Z repeats X's Want: both halves already relayed.
+        let (_, fx) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 3,
+                    ranges: tail(),
+                    prefixes: BTreeSet::from([1u8]),
+                },
+            )
+            .unwrap();
+        assert!(sent_want(&fx).is_none(), "already relayed within want_ttl");
+    }
 }
