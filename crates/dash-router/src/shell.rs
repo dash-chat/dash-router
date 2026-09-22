@@ -363,22 +363,40 @@ where
                 LogRanges::empty()
             }
         };
+        // Shell-only error handling (the core's stores cannot fail, so
+        // `NodeMachine` evicts `under` wholesale and conformance is
+        // unaffected): evict from the relay only what provably landed in
+        // ext. A failed relay fetch evicts nothing; an op whose ext ingest
+        // failed stays parked in the relay. Either way the bytes survive in
+        // one store instead of vanishing from both — which a prefix-wide
+        // migration would otherwise do to every log under the prefix.
         if !under.is_empty() {
             match self.relay.fetch(&under).await {
                 Ok(ops) => {
+                    let mut ingested: BTreeMap<L, Vec<Seq>> = BTreeMap::new();
                     for (l, seq, op) in ops {
-                        if let Err(e) = self.ext.ingest(l, seq, op).await {
-                            out.push(Out::Event(RouterEvent::StorageError(StorageErrorReport {
-                                context: "on_subscribe: ext.ingest",
-                                message: e.to_string(),
-                            })));
+                        match self.ext.ingest(l, seq, op).await {
+                            Ok(()) => ingested.entry(l).or_default().push(seq),
+                            Err(e) => {
+                                out.push(Out::Event(RouterEvent::StorageError(
+                                    StorageErrorReport {
+                                        context: "on_subscribe: ext.ingest",
+                                        message: e.to_string(),
+                                    },
+                                )));
+                            }
                         }
                     }
+                    let ingested = LogRanges::from_pairs(
+                        ingested
+                            .into_iter()
+                            .map(|(l, seqs)| (l, Ranges::from_seqs(seqs))),
+                    );
+                    if !ingested.is_empty() && self.relay.evict(&ingested).await.is_err() {
+                        self.relay_errors += 1;
+                    }
                 }
-                Err(_) => self.relay_errors += 1,
-            }
-            if self.relay.evict(&under).await.is_err() {
-                self.relay_errors += 1;
+                Err(_) => self.relay_errors += 1, // nothing evicted
             }
         }
         self.router
@@ -1296,28 +1314,208 @@ mod tests {
     /// and the sync `Storage` impl would fight the blanket sync→async bridge
     /// in `storage.rs` for coherence (E0119), so this must NOT implement
     /// `Storage`.
-    struct FailingExt {
-        inner: OpsMap<u8>,
-        fail: BTreeSet<(u8, Seq)>,
+    struct FailingExt<L: Ord> {
+        inner: OpsMap<L>,
+        fail: BTreeSet<(L, Seq)>,
     }
 
-    impl AsyncStorage<u8> for FailingExt {
-        async fn held_of(&self, logs: &BTreeSet<u8>) -> Result<LogRanges<u8>> {
+    // Concrete impls per log type: a generic `impl<L> AsyncStorage<L> for
+    // FailingExt<L>` overlaps the blanket sync→async bridge (E0119).
+    macro_rules! failing_ext_impl {
+        ($($l:ty),*) => {$(
+    impl AsyncStorage<$l> for FailingExt<$l> {
+        async fn held_of(&self, logs: &BTreeSet<$l>) -> Result<LogRanges<$l>> {
             Ok(Storage::held_of(&self.inner, logs))
         }
-        async fn held_all(&self) -> Result<LogRanges<u8>> {
+        async fn held_all(&self) -> Result<LogRanges<$l>> {
             Ok(Storage::held_all(&self.inner))
         }
-        async fn fetch(&self, ranges: &LogRanges<u8>) -> Result<Vec<(u8, Seq, Op)>> {
+        async fn fetch(&self, ranges: &LogRanges<$l>) -> Result<Vec<($l, Seq, Op)>> {
             Ok(Storage::fetch(&self.inner, ranges))
         }
-        async fn ingest(&mut self, log: u8, seq: Seq, op: Op) -> Result<()> {
+        async fn ingest(&mut self, log: $l, seq: Seq, op: Op) -> Result<()> {
             if self.fail.contains(&(log, seq)) {
-                anyhow::bail!("FailingExt: ingest({log}, {seq}) deliberately fails");
+                anyhow::bail!("FailingExt: ingest({log:?}, {seq}) deliberately fails");
             }
             Storage::ingest(&mut self.inner, log, seq, op);
             Ok(())
         }
+    }
+        )*};
+    }
+    failing_ext_impl!(u8, dash_router_core::Pair);
+
+    /// A test-local relay whose `fetch` fails while `fail_fetch` is set;
+    /// everything else delegates to an `OpsMap`. Async-only for the same
+    /// coherence reason as [`FailingExt`].
+    struct FailingRelay<L: Ord> {
+        inner: OpsMap<L>,
+        fail_fetch: bool,
+    }
+
+    macro_rules! failing_relay_impl {
+        ($($l:ty),*) => {$(
+    impl AsyncStorage<$l> for FailingRelay<$l> {
+        async fn held_of(&self, logs: &BTreeSet<$l>) -> Result<LogRanges<$l>> {
+            Ok(Storage::held_of(&self.inner, logs))
+        }
+        async fn held_all(&self) -> Result<LogRanges<$l>> {
+            Ok(Storage::held_all(&self.inner))
+        }
+        async fn fetch(&self, ranges: &LogRanges<$l>) -> Result<Vec<($l, Seq, Op)>> {
+            if self.fail_fetch {
+                anyhow::bail!("FailingRelay: fetch deliberately fails");
+            }
+            Ok(Storage::fetch(&self.inner, ranges))
+        }
+        async fn ingest(&mut self, log: $l, seq: Seq, op: Op) -> Result<()> {
+            Storage::ingest(&mut self.inner, log, seq, op);
+            Ok(())
+        }
+    }
+
+    impl AsyncEvictableStorage<$l> for FailingRelay<$l> {
+        async fn usage(&self) -> Result<Units> {
+            Ok(EvictableStorage::usage(&self.inner))
+        }
+        async fn ingest_delta(&self, log: &$l, seq: Seq, op: &Op) -> Result<Units> {
+            Ok(EvictableStorage::ingest_delta(&self.inner, log, seq, op))
+        }
+        async fn held_payloads(&self) -> Result<LogRanges<$l>> {
+            Ok(EvictableStorage::held_payloads(&self.inner))
+        }
+        async fn evict_payloads(&mut self, ranges: &LogRanges<$l>) -> Result<()> {
+            EvictableStorage::evict_payloads(&mut self.inner, ranges);
+            Ok(())
+        }
+        async fn evict(&mut self, ranges: &LogRanges<$l>) -> Result<()> {
+            EvictableStorage::evict(&mut self.inner, ranges);
+            Ok(())
+        }
+    }
+        )*};
+    }
+    failing_relay_impl!(dash_router_core::Pair);
+
+    fn pair_wire(msg: WireMessage<u32, dash_router_core::Pair>) -> Incoming {
+        Incoming {
+            remote: Some("192.168.0.9".parse().unwrap()),
+            bytes: msg.encode(),
+        }
+    }
+
+    fn pair_have(
+        log: dash_router_core::Pair,
+        seqs: &[u32],
+    ) -> WireMessage<u32, dash_router_core::Pair> {
+        WireMessage::have(
+            7,
+            vec![(log, seqs.iter().map(|&q| (q, op(q as u8, true))).collect())],
+        )
+    }
+
+    /// Finding (controller ruling): a failed relay fetch during Subscribe
+    /// must evict nothing — the ops stay parked in the relay rather than
+    /// vanishing from both stores — while the prefix still opens.
+    #[tokio::test]
+    async fn subscribe_keeps_relay_ops_when_fetch_fails() {
+        use dash_router_core::Pair;
+        let relay = FailingRelay {
+            inner: OpsMap::default(),
+            fail_fetch: false,
+        };
+        let mut c: NodeCore<u32, Pair, OpsMap<Pair>, FailingRelay<Pair>, Scripted> = NodeCore::new(
+            0,
+            config(1 << 20),
+            BTreeSet::new(),
+            OpsMap::default(),
+            relay,
+            Scripted::ms(&[1000]),
+        );
+        c.init().await.unwrap();
+        let a1 = Pair::new(1, 1);
+        c.on_wire(Duration::from_millis(10), pair_wire(pair_have(a1, &[0, 1])))
+            .await
+            .unwrap();
+        let before = Storage::held_all(&c.relay.inner);
+        assert_eq!(before.get(&a1), Some(&Ranges::range(0, 2)));
+        let errors_before = c.relay_errors;
+
+        c.relay.fail_fetch = true;
+        c.on_subscribe(Duration::from_millis(20), 1u8)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            Storage::held_all(&c.relay.inner),
+            before,
+            "nothing evicted after a failed fetch"
+        );
+        assert!(
+            Storage::held_all(&c.ext).get(&a1).is_none(),
+            "nothing reached ext"
+        );
+        assert_eq!(
+            c.relay_errors,
+            errors_before + 1,
+            "the fetch error is counted"
+        );
+        assert!(c.router.open.contains(&1u8), "the prefix still opens");
+        assert_eq!(
+            c.router.held.get(&a1),
+            Some(&Ranges::range(0, 2)),
+            "still held (in the relay), still advertised"
+        );
+    }
+
+    /// Finding (controller ruling): an op whose ext ingest fails during
+    /// Subscribe stays in the relay; its siblings under the same prefix
+    /// migrate.
+    #[tokio::test]
+    async fn subscribe_keeps_relay_ops_whose_ingest_fails() {
+        use dash_router_core::Pair;
+        let a1 = Pair::new(1, 1);
+        let a2 = Pair::new(1, 2);
+        let ext = FailingExt {
+            inner: OpsMap::default(),
+            fail: BTreeSet::from([(a1, 0u32), (a1, 1u32)]),
+        };
+        let mut c: NodeCore<u32, Pair, FailingExt<Pair>, OpsMap<Pair>, Scripted> = NodeCore::new(
+            0,
+            config(1 << 20),
+            BTreeSet::new(),
+            ext,
+            OpsMap::default(),
+            Scripted::ms(&[1000]),
+        );
+        c.init().await.unwrap();
+        c.on_wire(Duration::from_millis(10), pair_wire(pair_have(a1, &[0, 1])))
+            .await
+            .unwrap();
+        c.on_wire(Duration::from_millis(11), pair_wire(pair_have(a2, &[0])))
+            .await
+            .unwrap();
+
+        let out = c
+            .on_subscribe(Duration::from_millis(20), 1u8)
+            .await
+            .unwrap();
+
+        let failures = out
+            .iter()
+            .filter(|o| matches!(o, Out::Event(RouterEvent::StorageError(_))))
+            .count();
+        assert_eq!(failures, 2, "one StorageError per failed ingest");
+        let relay = Storage::held_all(&c.relay);
+        assert_eq!(
+            relay.get(&a1),
+            Some(&Ranges::range(0, 2)),
+            "a1's ops failed to ingest, so they stay in the relay"
+        );
+        assert!(relay.get(&a2).is_none(), "a2 migrated out of the relay");
+        let ext = Storage::held_all(&c.ext.inner);
+        assert_eq!(ext.get(&a2), Some(&Ranges::range(0, 1)), "a2 is in ext");
+        assert!(ext.get(&a1).is_none(), "a1 never reached ext");
     }
 
     /// Finding 1: a `Have` containing a subscribed op whose `ext.ingest`
@@ -1332,7 +1530,7 @@ mod tests {
             inner: OpsMap::default(),
             fail: BTreeSet::from([(0u8, 0u32)]),
         };
-        let mut c: NodeCore<u32, u8, FailingExt, OpsMap<u8>, Scripted> = NodeCore::new(
+        let mut c: NodeCore<u32, u8, FailingExt<u8>, OpsMap<u8>, Scripted> = NodeCore::new(
             0u32,
             config(100),
             BTreeSet::from([0u8]),
