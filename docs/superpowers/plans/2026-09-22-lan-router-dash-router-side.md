@@ -48,14 +48,14 @@ Spec §3.0. Mechanical; no behaviour change.
 - Modify: every file that names the crate: `crates/dash-router-sim/Cargo.toml`, `crates/dash-router-sim/src/{lib,scenario,behavior}.rs`, `crates/dash-router-core/src/{node,storage}.rs`, `crates/dash-router-net-model/Cargo.toml` (only if it dev-depends on the shell; check), `crates/dash-router/src/panda.rs` (doc comment run instructions), `crates/dash-router/tests/*.rs`, `docs/superpowers/specs/*.md`, `docs/superpowers/plans/*.md`, `README.md` if it mentions the crate.
 
 **Interfaces:**
-- Produces: crate `dash-router` with `pub use dash_router_core as core; pub use dash_router_policy as policy;` in addition to everything `dash-router` exported. `dash-router-net-model` keeps its name.
+- Produces: crate `dash-router` with `pub use dash_router_core as core; pub use dash_router_policy as policy;` in addition to everything `dash-router-net` exported. `dash-router-net-model` keeps its name.
 
 - [ ] **Step 1: Move the directory and rename the package**
 
 ```bash
 cd /home/michael/work/dash-router
-git mv crates/dash-router crates/dash-router
-sed -i 's/^name = "dash-router"$/name = "dash-router"/' crates/dash-router/Cargo.toml
+git mv crates/dash-router-net crates/dash-router
+sed -i 's/^name = "dash-router-net"$/name = "dash-router"/' crates/dash-router/Cargo.toml
 grep -n '^name' crates/dash-router/Cargo.toml
 ```
 
@@ -67,13 +67,13 @@ The model crate's name contains the old name as a prefix, so use a negative-look
 
 ```bash
 cd /home/michael/work/dash-router
-files=$(grep -rl 'dash-router\|dash_router' --include='*.rs' --include='*.toml' --include='*.md' crates docs README.md 2>/dev/null)
+files=$(grep -rl 'dash-router-net\|dash_router_net' --include='*.rs' --include='*.toml' --include='*.md' crates docs README.md 2>/dev/null)
 for f in $files; do
-  sed -i -e 's/dash-router-net-model/dash-router-net-model/g' -e 's/dash_router_net_model/dash_router_net_model/g' \
-         -e 's/dash-router/dash-router/g' -e 's/dash_router/dash_router/g' \
-         -e 's/dash-router-net-model/dash-router-net-model/g' -e 's/dash_router_net_model/dash_router_net_model/g' "$f"
+  sed -i -e 's/dash-router-net-model/DRNM_SENTINEL/g' -e 's/dash_router_net_model/DRNMU_SENTINEL/g' \
+         -e 's/dash-router-net/dash-router/g' -e 's/dash_router_net/dash_router/g' \
+         -e 's/DRNM_SENTINEL/dash-router-net-model/g' -e 's/DRNMU_SENTINEL/dash_router_net_model/g' "$f"
 done
-grep -rn 'dash-router\b\|dash_router\b' --include='*.rs' --include='*.toml' --include='*.md' crates docs | grep -v 'net-model\|net_model'
+grep -rn 'dash-router-net\b\|dash_router_net\b' --include='*.rs' --include='*.toml' --include='*.md' crates docs | grep -v 'net-model\|net_model'
 ```
 
 Expected: the final grep prints nothing.
