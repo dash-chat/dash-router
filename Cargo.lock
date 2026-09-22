@@ -228,6 +228,7 @@ dependencies = [
  "anyhow",
  "dash-router-core",
  "dash-router-policy",
+ "polestar",
  "postcard",
  "proptest",
  "rand",
