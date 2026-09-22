@@ -35,13 +35,16 @@
 //! sketched in the brief); the real names are [`p2panda_core::SigningKey`]
 //! and [`p2panda_core::VerifyingKey`], used directly rather than wrapped.
 
+use std::collections::BTreeSet;
+
 use anyhow::{Context, Result};
 use dash_router_core::WIRE_VERSION;
 use futures_util::StreamExt;
 use p2panda_core::{Hash, SigningKey, Topic, VerifyingKey};
-use p2panda_net::gossip::{GossipHandle, GossipSubscription};
+use p2panda_net::gossip::{GossipEvent, GossipHandle, GossipSubscription};
 use p2panda_net::iroh_mdns::MdnsDiscoveryMode;
 use p2panda_net::{AddressBook, Discovery, Endpoint, Gossip, MdnsDiscovery};
+use tokio::sync::{broadcast, watch};
 
 use crate::transport::{Incoming, Transport};
 
@@ -65,6 +68,11 @@ fn topic() -> Topic {
 pub struct PandaTransport {
     handle: GossipHandle,
     subscription: GossipSubscription,
+    /// The node's current direct gossip neighbours on our topic, folded
+    /// from p2panda's membership events by a small tracker task. This is
+    /// the set a `broadcast` actually hands bytes to; everyone else hears
+    /// them only via further gossip hops.
+    neighbours: watch::Receiver<BTreeSet<VerifyingKey>>,
     // Kept alive for as long as the transport lives: dropping any of these
     // tears down the corresponding actor (address book, endpoint, mDNS,
     // discovery, gossip).
@@ -113,6 +121,15 @@ pub async fn spawn_panda(private_key: SigningKey) -> Result<(PandaTransport, Ver
         .await
         .context("spawning gossip")?;
 
+    // Subscribe to membership events *before* joining the topic: p2panda
+    // only delivers events emitted after the subscription exists, and the
+    // `Joined` event fires during `stream()`.
+    let events = gossip
+        .events()
+        .await
+        .context("subscribing to gossip events")?;
+    let neighbours = track_neighbours(topic(), events);
+
     let handle = gossip
         .stream(topic())
         .await
@@ -123,6 +140,7 @@ pub async fn spawn_panda(private_key: SigningKey) -> Result<(PandaTransport, Ver
         PandaTransport {
             handle,
             subscription,
+            neighbours,
             _address_book: address_book,
             _endpoint: endpoint,
             _mdns: mdns,
@@ -131,6 +149,55 @@ pub async fn spawn_panda(private_key: SigningKey) -> Result<(PandaTransport, Ver
         },
         public_key,
     ))
+}
+
+impl PandaTransport {
+    /// Watch this node's direct gossip neighbours on the wire topic. The
+    /// receiver outlives the transport (it just stops changing once the
+    /// gossip actor is gone), so an embedder can hand the transport to
+    /// [`crate::spawn`] and keep observing the overlay from outside.
+    pub fn neighbours(&self) -> watch::Receiver<BTreeSet<VerifyingKey>> {
+        self.neighbours.clone()
+    }
+}
+
+/// Fold p2panda's membership events for `topic` into a watch channel.
+/// Ends when the events channel closes (all `Gossip` handles dropped).
+fn track_neighbours(
+    topic: Topic,
+    mut events: broadcast::Receiver<GossipEvent>,
+) -> watch::Receiver<BTreeSet<VerifyingKey>> {
+    let (tx, rx) = watch::channel(BTreeSet::new());
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(GossipEvent::Joined { topic: t, nodes }) if t == topic => {
+                    tx.send_modify(|set| set.extend(nodes));
+                }
+                Ok(GossipEvent::NeighbourUp { topic: t, node }) if t == topic => {
+                    tx.send_modify(|set| {
+                        set.insert(node);
+                    });
+                }
+                Ok(GossipEvent::NeighbourDown { topic: t, node }) if t == topic => {
+                    tx.send_modify(|set| {
+                        set.remove(&node);
+                    });
+                }
+                Ok(GossipEvent::Left { topic: t }) if t == topic => {
+                    tx.send_modify(|set| set.clear());
+                }
+                Ok(_) => {}
+                // Lagged: we lost some events. The set may now be stale
+                // until the next Up/Down for the affected node; membership
+                // events are rare enough that this is acceptable for a
+                // diagnostic view.
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    rx
 }
 
 impl Transport for PandaTransport {
