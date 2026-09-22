@@ -10,11 +10,37 @@ use std::sync::{
 use anyhow::Result;
 use tokio::sync::broadcast;
 
+/// A transport-level node identity: 32 key bytes, p2panda-free. The
+/// p2panda transport fills it from the verified gossip envelope (spec
+/// 2026-09-22 §3.2); loopback leaves it `None`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PeerKey(pub [u8; 32]);
+
+impl From<[u8; 32]> for PeerKey {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+/// How a wire identity `N` maps to a transport identity, if it has one.
+/// The shell drops a message whose `sender.peer_key()` disagrees with the
+/// transport's verified `Incoming::author`.
+pub trait PeerIdentity {
+    fn peer_key(&self) -> Option<PeerKey>;
+}
+
+macro_rules! no_peer_key {
+    ($($t:ty),* $(,)?) => { $(impl PeerIdentity for $t { fn peer_key(&self) -> Option<PeerKey> { None } })* };
+}
+no_peer_key!(u8, u16, u32, u64, usize);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Incoming {
     /// The remote's address for the LAN check; `None` means the transport
     /// itself scopes membership (e.g. an mDNS-discovered overlay).
     pub remote: Option<IpAddr>,
+    /// The transport-verified author, when the transport verifies one.
+    pub author: Option<PeerKey>,
     pub bytes: Vec<u8>,
 }
 
@@ -77,6 +103,7 @@ impl Transport for LoopbackTransport {
                 Ok((_, addr, bytes)) => {
                     return Some(Incoming {
                         remote: Some(addr),
+                        author: None,
                         bytes,
                     });
                 }

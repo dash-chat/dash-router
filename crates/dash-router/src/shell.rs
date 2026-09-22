@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 use crate::handle::{Command, RouterEvent, RouterHandle, StatsSnapshot, StorageErrorReport};
 use crate::lan::is_lan;
 use crate::storage::{AsyncEvictableStorage, AsyncStorage, WatchableStorage};
-use crate::transport::{Incoming, Transport};
+use crate::transport::{Incoming, PeerIdentity, Transport};
 
 /// Where a `NodeCore` gets its randomized Want/Have re-arm intervals from.
 /// Production uses [`PolicyIntervals`]; tests use a scripted sequence so the
@@ -105,7 +105,7 @@ pub struct NodeCore<N: Id, L: Log, E, R, I> {
 
 impl<N, L, E, R, I> NodeCore<N, L, E, R, I>
 where
-    N: Id + serde::Serialize + serde::de::DeserializeOwned,
+    N: Id + serde::Serialize + serde::de::DeserializeOwned + PeerIdentity,
     L: WireLog,
     E: AsyncStorage<L>,
     R: AsyncEvictableStorage<L>,
@@ -261,6 +261,12 @@ where
             }
         };
         if msg.sender == self.router.id {
+            self.dropped_msgs += 1;
+            return Ok(out);
+        }
+        if let Some(author) = inc.author
+            && msg.sender.peer_key() != Some(author)
+        {
             self.dropped_msgs += 1;
             return Ok(out);
         }
@@ -742,7 +748,7 @@ pub fn spawn<N, L, E, R, T, I>(
     JoinHandle<Result<()>>,
 )
 where
-    N: Id + serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    N: Id + serde::Serialize + serde::de::DeserializeOwned + PeerIdentity + Send + 'static,
     L: WireLog + Send + 'static,
     E: AsyncStorage<L> + WatchableStorage<L> + Send + 'static,
     R: AsyncEvictableStorage<L> + Send + 'static,
@@ -988,6 +994,7 @@ mod tests {
     fn wire(msg: WireMessage<u32, u8>) -> Incoming {
         Incoming {
             remote: Some("192.168.0.9".parse().unwrap()),
+            author: None,
             bytes: msg.encode(),
         }
     }
@@ -1064,6 +1071,7 @@ mod tests {
         // logs are `Pair`, so encode the same LAN-sourced `Incoming` here.
         let wire = |msg: WireMessage<u32, Pair>| Incoming {
             remote: Some("192.168.0.9".parse().unwrap()),
+            author: None,
             bytes: msg.encode(),
         };
         let mut c: NodeCore<u32, Pair, OpsMap<Pair>, OpsMap<Pair>, Scripted> = NodeCore::new(
@@ -1290,10 +1298,12 @@ mod tests {
         let held = c.router.held.clone();
         let foreign = Incoming {
             remote: Some("8.8.8.8".parse().unwrap()),
+            author: None,
             bytes: WireMessage::have(7, vec![(0u8, vec![(0, op(1, true))])]).encode(),
         };
         let garbage = Incoming {
             remote: Some("192.168.0.9".parse().unwrap()),
+            author: None,
             bytes: vec![0xff, 0x00],
         };
         let echo = wire(WireMessage::want(
@@ -1306,6 +1316,81 @@ mod tests {
         }
         assert_eq!(c.dropped_msgs, 3);
         assert_eq!(c.router.held, held, "no state change from dropped input");
+    }
+
+    /// A wire identity with a transport key, for the sender check.
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        PartialEq,
+        Eq,
+        PartialOrd,
+        Ord,
+        Hash,
+        serde::Serialize,
+        serde::Deserialize,
+    )]
+    struct Keyed(u8);
+    impl std::fmt::Display for Keyed {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "k{}", self.0)
+        }
+    }
+    impl crate::transport::PeerIdentity for Keyed {
+        fn peer_key(&self) -> Option<crate::transport::PeerKey> {
+            Some(crate::transport::PeerKey([self.0; 32]))
+        }
+    }
+
+    /// Review focus 5 (spec §3.2).
+    #[tokio::test]
+    async fn sender_must_match_envelope_author() {
+        use crate::transport::PeerKey;
+        let mut c: NodeCore<Keyed, u8, OpsMap<u8>, OpsMap<u8>, Scripted> = NodeCore::new(
+            Keyed(0),
+            config(1 << 20),
+            BTreeSet::from([0u8]),
+            OpsMap::default(),
+            OpsMap::default(),
+            Scripted::ms(&[1000]),
+        );
+        c.init().await.unwrap();
+        let msg = WireMessage::want(
+            Keyed(2),
+            LogRanges::from_pairs([(0u8, Ranges::full())]),
+            BTreeSet::new(),
+        );
+        let forged = Incoming {
+            remote: None,
+            author: Some(PeerKey([3; 32])),
+            bytes: msg.encode(),
+        };
+        c.on_wire(Duration::from_millis(1), forged).await.unwrap();
+        assert_eq!(c.dropped_msgs, 1, "claimed k2, envelope says k3: dropped");
+        assert!(c.router.wants.is_empty());
+
+        let genuine = Incoming {
+            remote: None,
+            author: Some(PeerKey([2; 32])),
+            bytes: msg.encode(),
+        };
+        c.on_wire(Duration::from_millis(2), genuine).await.unwrap();
+        assert_eq!(c.dropped_msgs, 1);
+        assert!(c.router.wants.contains_key(&Keyed(2)));
+
+        let unverified = Incoming {
+            remote: None,
+            author: None,
+            bytes: msg.encode(),
+        };
+        c.on_wire(Duration::from_millis(3), unverified)
+            .await
+            .unwrap();
+        assert_eq!(
+            c.dropped_msgs, 1,
+            "no envelope: no check (loopback / plain gossip)"
+        );
     }
 
     /// A test-local `ext` store that fails `ingest` for chosen `(log, seq)`
@@ -1400,6 +1485,7 @@ mod tests {
     fn pair_wire(msg: WireMessage<u32, dash_router_core::Pair>) -> Incoming {
         Incoming {
             remote: Some("192.168.0.9".parse().unwrap()),
+            author: None,
             bytes: msg.encode(),
         }
     }
