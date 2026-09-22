@@ -23,8 +23,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use dash_router_core::{
-    LogRanges, NodeAction, NodeEffect, NodeMachine, NodeState, Op, OpsMap, Ranges, RouterAction,
-    RouterConfig, RouterState, Seq, Storage, Units, WireMessage,
+    EvictableStorage, LogRanges, NodeAction, NodeEffect, NodeMachine, NodeState, Op, OpsMap,
+    Ranges, RouterAction, RouterConfig, RouterState, Seq, Storage, Units, WireMessage,
+    eviction_candidates,
 };
 use dash_router_net::{CoreConfig, IntervalSource, NodeCore, Out, RouterEvent};
 use dash_router_policy::PushDebouncePolicy;
@@ -85,6 +86,12 @@ enum Step {
     Subscribe(u8),
     Unsubscribe(u8),
     Advance(u64),
+    /// Finding 4(b): a relay-maintenance tick. The SUT calls
+    /// `NodeCore::on_maintain`; the reference mirrors that same policy by
+    /// hand (see `Driver::ref_maintain`) since the pure `NodeMachine` takes
+    /// `RelayEvict(Payloads)` as an action rather than deciding when to
+    /// fire one — the shell/sim layer owns that policy in both worlds.
+    Maintain,
 }
 
 fn step_strategy() -> impl Strategy<Value = Step> {
@@ -97,6 +104,7 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         1 => (0u8..3).prop_map(Step::Subscribe),
         1 => (0u8..3).prop_map(Step::Unsubscribe),
         2 => (10u64..600).prop_map(Step::Advance),
+        1 => Just(Step::Maintain),
     ]
 }
 
@@ -177,6 +185,11 @@ struct Driver {
     ref_script: Scripted,
     now: Duration,
     next_seq: BTreeMap<u8, Seq>,
+    /// Finding 4(b): `NodeCore::on_maintain`'s policy constants, mirrored by
+    /// `ref_maintain` since the pure `NodeMachine` has no maintenance
+    /// action of its own to fire — only the resulting `RelayEvict(Payloads)`.
+    relay_cap: Units,
+    evict_at: f64,
 }
 
 impl Driver {
@@ -219,6 +232,8 @@ impl Driver {
             ref_script: Scripted::ms(intervals),
             now: Duration::ZERO,
             next_seq: BTreeMap::new(),
+            relay_cap,
+            evict_at: 0.75, // must match core_config.evict_at above
         };
         // init() arms the SUT's first Want timer with the script's first
         // interval; mirror it on the reference with the SAME script, so both
@@ -318,6 +333,34 @@ impl Driver {
         Ok(out)
     }
 
+    /// Mirrors `NodeCore::on_maintain`'s policy exactly (see that fn):
+    /// once relay usage crosses `evict_at * relay_cap`, prefer evicting
+    /// payloads nobody wants (`eviction_candidates`); if nothing qualifies,
+    /// shed whole unwanted ranges instead. Applied only when the resulting
+    /// proposal is non-empty — both `RelayEvictPayloads`/`RelayEvict` are
+    /// disabled-on-empty actions in `NodeMachine` (see `node.rs`), matching
+    /// the "enabled actions only" rule the rest of this driver already
+    /// follows for `ArmHaveTimer` etc.
+    fn ref_maintain(&mut self, idx: usize) -> Result<Vec<NodeEffect<u32, u8>>, TestCaseError> {
+        let usage = EvictableStorage::usage(&self.ref_state.relay.0);
+        let threshold = ((self.evict_at * self.relay_cap as f64) as Units).max(1);
+        if usage < threshold {
+            return Ok(Vec::new());
+        }
+        let held_payloads = EvictableStorage::held_payloads(&self.ref_state.relay.0);
+        let others_wants = self.ref_state.router.others_wants();
+        let candidates = eviction_candidates(&held_payloads, &others_wants);
+        if !candidates.is_empty() {
+            return self.ref_step(idx, NodeAction::RelayEvictPayloads(candidates));
+        }
+        let held_all = Storage::held_all(&self.ref_state.relay.0);
+        let full = held_all.difference(&others_wants);
+        if !full.is_empty() {
+            return self.ref_step(idx, NodeAction::RelayEvict(full));
+        }
+        Ok(Vec::new())
+    }
+
     async fn apply(&mut self, idx: usize, step: &Step) -> Result<(), TestCaseError> {
         let sut_out: Vec<Out<u32, u8>>;
         let ref_fx: Vec<NodeEffect<u32, u8>>;
@@ -359,10 +402,16 @@ impl Driver {
                 start,
                 end,
             } => {
-                let msg: WireMessage<u32, u8> = WireMessage::want(
-                    from,
-                    LogRanges::from_pairs([(log, Ranges::range(start, end))]),
-                );
+                let ranges = LogRanges::from_pairs([(log, Ranges::range(start, end))]);
+                // Finding 8(a): the SUT only arms the have timer when the
+                // RECEIVED ranges are non-empty (an empty Want must not arm
+                // a forever no-op fire/re-arm loop) — mirror that exact
+                // gate here, not `wants.is_empty()` (which is always false
+                // after this Recv, since `RouterAction::RecvWant` records
+                // the witnessing peer's entry in `wants` regardless of
+                // whether its ranges were empty).
+                let ranges_nonempty = !ranges.is_empty();
+                let msg: WireMessage<u32, u8> = WireMessage::want(from, ranges);
                 sut_out = self
                     .core
                     .on_wire(self.now, incoming(&msg))
@@ -371,12 +420,10 @@ impl Driver {
                         TestCaseError::fail(format!("step {idx}: SUT on_wire(Want): {e}"))
                     })?;
                 let mut fx = self.ref_step(idx, NodeAction::Recv(msg))?;
-                // Binding semantics #1: a witnessed Want arms the Have timer
-                // when none is armed. Mirror the SUT's arm-on-recv, in the
-                // same call.
-                if self.ref_state.router.have_timer.is_none()
-                    && !self.ref_state.router.wants.is_empty()
-                {
+                // Binding semantics #1: a witnessed non-empty Want arms the
+                // Have timer when none is armed. Mirror the SUT's
+                // arm-on-recv, in the same call.
+                if ranges_nonempty && self.ref_state.router.have_timer.is_none() {
                     let next = self.ref_script.next_have();
                     let more = self.ref_step(
                         idx,
@@ -409,6 +456,12 @@ impl Driver {
                     })?;
                 ref_fx = self.ref_advance_to(idx, target)?;
             }
+            Step::Maintain => {
+                sut_out = self.core.on_maintain(self.now).await.map_err(|e| {
+                    TestCaseError::fail(format!("step {idx}: SUT on_maintain: {e}"))
+                })?;
+                ref_fx = self.ref_maintain(idx)?;
+            }
         }
         self.compare(idx, &sut_out, &ref_fx)?;
         Ok(())
@@ -429,6 +482,23 @@ impl Driver {
         let sut_relay = Storage::held_all(&self.core.relay);
         let ref_relay = self.ref_state.relay.0.held_all();
         check!(idx, "relay.held_all", sut_relay, ref_relay);
+
+        // Finding 4(c): the relay's eviction-relevant summaries, not just
+        // its held ranges — these are exactly what `ref_maintain`/
+        // `NodeCore::on_maintain` decide eviction on, so a drift here would
+        // otherwise go unnoticed by `held_all` alone.
+        check!(
+            idx,
+            "relay.usage",
+            EvictableStorage::usage(&self.core.relay),
+            EvictableStorage::usage(&self.ref_state.relay.0)
+        );
+        check!(
+            idx,
+            "relay.held_payloads",
+            EvictableStorage::held_payloads(&self.core.relay),
+            EvictableStorage::held_payloads(&self.ref_state.relay.0)
+        );
 
         check!(
             idx,
@@ -485,7 +555,12 @@ fn run_lockstep(
         .build()
         .unwrap()
         .block_on(async move {
-            let mut driver = Driver::new(subs, &intervals, 64).await?;
+            // Finding 4(a): 10, not 64 — the generated universe tops out at
+            // 48 units (3 logs × 8 seqs × up to 2 units each), so a cap of
+            // 64 could never be reached and the shed-at-cap branch in
+            // `ingest_parked` was dead in this suite. 10 makes both the
+            // shed branch and `on_maintain`'s eviction genuinely reachable.
+            let mut driver = Driver::new(subs, &intervals, 10).await?;
             for (idx, step) in steps.iter().enumerate() {
                 driver.apply(idx, step).await?;
             }
@@ -519,6 +594,22 @@ fn fixed_regression_sequence() {
             log: 0,
             seqs: vec![(5, true)],
         }, // log 0: subscribed, delivers
+        // Finding 4(d): fill unsubscribed log 2 with payload-bearing ops
+        // past the (relay_cap=10) cap, forcing at least one shed in
+        // `ingest_parked` (usage sits at 3 units from log 1 above; seqs 0-2
+        // fit — usage climbs to 9 — but seqs 3-4 each push usage+2 past 10
+        // and are shed). This makes the shed-at-cap branch provably execute
+        // every run, not just when the proptest strategy happens to hit it.
+        Step::RecvHave {
+            from: 4,
+            log: 2,
+            seqs: vec![(0, true), (1, true), (2, true), (3, true), (4, true)],
+        },
+        // Usage (9) now sits above the evict_at*relay_cap threshold (7), so
+        // this Maintain genuinely evicts: log 2's payloads aren't wanted by
+        // anyone (only log 1 is, via peer 1's still-live Want above), so
+        // `eviction_candidates` picks them for payload-first GC.
+        Step::Maintain,
         Step::Unsubscribe(0),
         Step::Advance(700), // past want_ttl/have_ttl (500ms) expiry
     ];
