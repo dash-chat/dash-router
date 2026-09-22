@@ -112,13 +112,9 @@ fn log_bounds<L: LogKey>(log: &L) -> (Vec<u8>, Vec<u8>) {
 /// when `ranges` is empty (mirroring `OpsMap::held_all`/`held_payloads`,
 /// which omit logs with nothing held rather than keep an empty marker).
 fn set_log_entry<L: LogKey>(map: &mut LogRanges<L>, log: &L, ranges: Ranges) {
-    let kept: Vec<(L, Ranges)> = map
-        .iter()
-        .filter(|(l, _)| *l != log)
-        .map(|(l, r)| (l.clone(), r.clone()))
-        .collect();
-    *map = LogRanges::from_pairs(kept);
-    if !ranges.is_empty() {
+    if ranges.is_empty() {
+        map.remove(log);
+    } else {
         map.insert(log.clone(), ranges);
     }
 }
@@ -176,6 +172,7 @@ impl<L: LogKey> DiskRelayStore<L> {
         {
             let read_txn = db.begin_read()?;
             let table = read_txn.open_table(TABLE)?;
+
             // Row-level problems (a malformed key, an undecodable value) are
             // skipped-and-counted rather than failing the whole open: a row
             // we can't parse is a row we don't hold, not a reason to refuse

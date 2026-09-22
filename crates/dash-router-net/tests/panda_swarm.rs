@@ -94,12 +94,10 @@ async fn spawn_node(i: usize) -> Node {
         .unwrap_or_else(|e| panic!("spawn p2panda node {i}: {e:#}"));
     let neighbours = transport.neighbours();
     let ext = MemStore::<Log>::new();
-    // The wire identity is the node's index, not its p2panda key: the
-    // shell's `N: polestar::Id` bound (`TryFrom<usize>` etc.) isn't met by
-    // `VerifyingKey`, so spec §6's "sender is the public key" is not yet
-    // expressible here. The key still identifies the node in the overlay.
+    // The wire identity `N` is the node's p2panda public key (spec §6),
+    // exactly as a real node would run.
     let (handle, events, _task) = spawn(
-        i as u32,
+        key,
         config(),
         Duration::from_secs(5),
         (0..N as Log).collect(),

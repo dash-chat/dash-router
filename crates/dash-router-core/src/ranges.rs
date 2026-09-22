@@ -181,7 +181,11 @@ impl Ranges {
             while other.0.get(j) == Some(&p) {
                 j += 1;
             }
-            let now = f(self.contains(p), other.contains(p));
+            // `i` is now exactly the number of `self` boundaries <= p
+            // (boundaries are strictly increasing and swept in order), which
+            // is what `contains` binary-searches for: odd means p is inside.
+            // Same for `j`. No need to search for what the sweep already knows.
+            let now = f(i % 2 == 1, j % 2 == 1);
             if now != inside {
                 out.push(p);
                 inside = now;

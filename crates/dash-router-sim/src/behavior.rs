@@ -616,8 +616,11 @@ impl Behavior for SimBehavior {
                 for n in state.nodes.keys().copied().collect::<Vec<_>>() {
                     let node = state.node(&n);
                     let mut gc = LogRanges::empty();
+                    // Hoisted: `held_all` rebuilds the whole store summary,
+                    // and nothing in the loop mutates the node.
+                    let ext_held = node.ext.0.held_all();
                     for log in &node.subscriptions {
-                        if let Some(r) = node.ext.0.held_all().get(log)
+                        if let Some(r) = ext_held.get(log)
                             && let Some(last) = r.last()
                             && last + 1 > gc_spec.keep_last
                         {
