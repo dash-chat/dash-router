@@ -1,6 +1,6 @@
 # Dash Chat LAN router integration — design
 
-Hook a `dash-router-net` shell into a Dash Chat node so ops in the node's
+Hook a `dash-router` shell into a Dash Chat node so ops in the node's
 p2panda store replicate to nearby devices over LAN gossip, without touching
 the existing mailbox and log-sync paths. Work spans two repos: small
 additions to `dash-router` (this repo) and one contained module in
@@ -35,6 +35,19 @@ the brainstorm on 2026-09-22.
   [approved]**, and the whole module sits behind a `lan-router` cargo
   feature on `dashchat-node`. The config field exists regardless of the
   feature; with the feature off it is ignored.
+- **The shell crate is renamed `dash-router-net` → `dash-router`
+  [approved].** It is the crate embedders use; core, policy and the models
+  are its internals. It re-exports `dash_router_core` and
+  `dash_router_policy` so an embedder depends on one crate.
+  `dash-router-net-model` keeps its name: it models the *network*
+  (broadcast, loss, reordering), not the net crate.
+- **Every topic is routed, inbox topics included [approved].** Contact
+  requests are made in person, which is exactly when two devices share a
+  LAN. Since the router cannot subscribe to a log whose author it does not
+  know yet, the shell gains an interest predicate: a witnessed Have for a
+  log matching the predicate auto-subscribes it (§3.5). Catch-up for an
+  inbox log the node never witnessed live needs a wildcard Want in the core
+  protocol; that is a follow-up (§5).
 
 ## 2. Dependency wiring (dash-chat)
 
@@ -42,19 +55,18 @@ the brainstorm on 2026-09-22.
 
 ```toml
 [features]
-lan-router = ["dep:dash-router-net", "dep:dash-router-core", "dep:dash-router-policy"]
+lan-router = ["dep:dash-router"]
 
 [dependencies]
-dash-router-net    = { git = "https://github.com/maackle/dash-router", optional = true, features = ["p2panda"] }
-dash-router-core   = { git = "...", optional = true }
-dash-router-policy = { git = "...", optional = true }
+dash-router = { git = "https://github.com/maackle/dash-router", optional = true, features = ["p2panda"] }
 ```
 
-(A `path` dep during development; switch to `git` before merge.)
+(A `path` dep during development; switch to `git` before merge.) Core and
+policy types come through `dash_router::core` and `dash_router::policy`.
 
 Workspace `Cargo.toml` gains `[patch.crates-io]` entries for `p2panda-core`
 and `p2panda-net` pointing at the `dash-chat/p2panda` fork branch already
-used everywhere else, so `dash-router-net`'s registry deps resolve to the
+used everywhere else, so `dash-router`'s registry deps resolve to the
 same crates and `SigningKey`/`VerifyingKey`/`Topic` are one type. Both
 sides are 0.7.1, so the patch is version-compatible. `dash-router`'s own
 `[patch]` for a local polestar checkout does not propagate; the git
@@ -62,10 +74,23 @@ polestar is used.
 
 ## 3. dash-router changes
 
+### 3.0 Rename
+
+`crates/dash-router-net` → `crates/dash-router`, package name
+`dash-router`, `lib.rs` adds `pub use dash_router_core as core;` and
+`pub use dash_router_policy as policy;`. Every reference in the sim, core
+doc comments, the model crate's dev-deps, tests and the two earlier specs
+is updated. One mechanical commit before any functional change.
+
 ### 3.1 `GossipTransport` over embedder-supplied gossip (`panda.rs`)
 
-`dash-router-net` must not depend on the `p2panda` umbrella crate, so the
-ephemeral stream types never appear here. Instead `panda.rs` gains a
+The ephemeral stream types live in the `p2panda` umbrella crate, not in
+`p2panda-net`. In Dash Chat that crate is a fork, so a `dash-router` that
+named those types would have to either pin itself to Dash Chat's fork or
+trust the fork to stay API-compatible with the registry version of a much
+larger crate (sqlite store, spaces, encryption, blobs, stream processing).
+Two five-line traits avoid that coupling, keep `dash-router` depending on
+`p2panda-net` only, and keep its test builds light. So `panda.rs` gains a
 transport over two small traits the embedder implements:
 
 ```rust
@@ -73,8 +98,8 @@ transport over two small traits the embedder implements:
 pub trait GossipPublisher { async fn publish(&mut self, bytes: Vec<u8>) -> Result<()>; }
 #[trait_variant::make(Send)]
 pub trait GossipSubscription {
-    /// `(verified author's encoded key, bytes)`; `None` = closed.
-    async fn next(&mut self) -> Option<(Vec<u8>, Vec<u8>)>;
+    /// `(verified author, bytes)`; `None` = closed.
+    async fn next(&mut self) -> Option<(PeerKey, Vec<u8>)>;
 }
 
 pub struct GossipTransport<P, S> { publisher: P, subscription: S }
@@ -85,14 +110,34 @@ Dash Chat implements the two traits over its ephemeral publisher and
 subscription pair. `Transport` semantics are unchanged; the existing
 `PandaTransport` and `spawn_panda` stay for standalone use and tests.
 
-### 3.2 `Incoming.author: Option<Vec<u8>>` (`transport.rs`)
+### 3.2 `PeerKey` and `Incoming.author` (`transport.rs`)
 
-`Incoming` gains `author: Option<Vec<u8>>` (encoded key bytes, so the
-trait stays p2panda-free). The shell's `on_wire`, after decoding, drops
-the message and bumps `dropped_msgs` when `author` is `Some` and does not
-equal the encoded `msg.sender`. Loopback and the existing `PandaTransport`
-set `None` (unchanged behaviour). This closes the "claim any sender"
-hole for free on the ephemeral path.
+```rust
+/// A transport-level node identity: 32 key bytes, p2panda-free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PeerKey(pub [u8; 32]);
+
+impl From<[u8; 32]> for PeerKey { .. }
+#[cfg(feature = "p2panda")]
+impl From<VerifyingKey> for PeerKey { .. }
+#[cfg(feature = "p2panda")]
+impl TryFrom<PeerKey> for VerifyingKey { .. }
+
+/// How a wire identity `N` maps to a transport identity, if it has one.
+pub trait PeerIdentity {
+    fn peer_key(&self) -> Option<PeerKey>;
+}
+```
+
+`PeerIdentity` is implemented for `VerifyingKey` (feature-gated, `Some`)
+and for the integer id types the tests and sim use (`None`). `NodeCore`'s
+`N` bound gains `PeerIdentity`.
+
+`Incoming` gains `author: Option<PeerKey>`. The shell's `on_wire`, after
+decoding, drops the message and bumps `dropped_msgs` when `author` is
+`Some(a)` and `msg.sender.peer_key() != Some(a)`. Loopback and the existing
+`PandaTransport` set `None` (unchanged behaviour). This closes the "claim
+any sender" hole for free on the ephemeral path.
 
 ### 3.3 Size-aware Have batching (`shell.rs`)
 
@@ -115,6 +160,17 @@ comment's "byte-for-byte one Have" claim is updated.
 
 The relay store's key must hold author (32) + LogId (32). Add the impl next
 to the existing `[u8; 32]`.
+
+### 3.5 Interest predicate: auto-subscribe on witnessed Have (`shell.rs`)
+
+`spawn` takes an additional `interested: Box<dyn Fn(&L) -> bool + Send>`.
+When a Have arrives naming a log that is not subscribed but for which
+`interested` returns true, the shell runs the same glue as
+`Command::Subscribe` for that log before processing the Have, so the ops
+land in ext and later Wants pull the rest. The default (`|_| false`)
+reproduces today's behaviour exactly, which is what the conformance and
+loop tests pass. Every subscription taken this way is reported as a new
+`RouterEvent::Subscribed(L)` so the embedder can persist it.
 
 ## 4. Dash Chat: the `lan_router` module
 
@@ -166,12 +222,18 @@ Implements `AsyncStorage<RouterLog>` and `WatchableStorage<RouterLog>` over
 ### 4.3 Subscriptions
 
 `LanRouter::spawn` seeds subscriptions from the same enumeration
-`initialize_stored_topics` uses, minus inbox topics, and for each topic
+`initialize_stored_topics` uses, every topic included, and for each topic
 subscribes `(author, LogId::from_topic(topic))` for:
 
 - every author with a height in `get_log_heights(log_id)`,
 - direct chats: both parties,
 - groups: `group_store.members(chat_id)`.
+
+The interest predicate (§3.5) is "the LogId half of `L` is in the topic
+map", so any author's log on any topic this node follows, inbox topics
+included, is picked up the moment a Have for it is witnessed. Authors
+learned this way need no persistence: the op store's log heights re-derive
+them on the next start.
 
 Runtime additions: `initialize_topic` calls `subscribe_topic`; the
 group-member paths in `app_processing.rs` that add a member call
@@ -204,7 +266,11 @@ networks never share an overlay.
 
 ## 5. Known gaps (v1, documented not fixed)
 
-- Inbox topics are not routed.
+- A log on a followed topic whose Have this node never witnessed live (for
+  example a contact request sent while the recipient was off the LAN) is
+  not pulled, because the router cannot Want a log by topic alone. Fix is
+  a wildcard Want (topic prefix) in the core protocol and its models; own
+  spec.
 - `app_processing.rs` registers the author of every `ExternalStream` op as
   a bootstrap node (assumes mailbox origin). Router-imported ops trigger the
   same. Harmless on a LAN; noted for cleanup.
@@ -215,7 +281,9 @@ networks never share an overlay.
 dash-router:
 - Unit: `[u8; 64]` LogKey round-trip; Have/Want splitting stays under the
   budget on a large fixture and preserves `(log, seq)` order; oversize op
-  goes header-only; envelope/sender mismatch is dropped and counted.
+  goes header-only; envelope/sender mismatch is dropped and counted;
+  interest predicate auto-subscribes on a witnessed Have and emits
+  `Subscribed`, and the default predicate changes nothing.
 - Existing conformance and loop tests stay green.
 
 dash-chat (`--features lan-router`):
@@ -225,7 +293,9 @@ dash-chat (`--features lan-router`):
 - Integration (`tests/lan_router.rs`, multi-thread, `#[ignore]` like the
   swarm test since it needs real mDNS): two `TestNode`s with mDNS active,
   relay off, no mailbox, `enable_lan_router: true`, contact established
-  out-of-band; a message sent on A appears in B's projection. A control run
+  out-of-band; a message sent on A appears in B's projection. A second
+  case: no prior contact, A sends a contact request to B's inbox topic and
+  it arrives via the router alone. A control run
   with the flag false must *not* converge, proving the router did the work.
 - `cargo check` on `dashchat-node` with default features must not pull any
   dash-router crate (verified via `cargo tree`).
