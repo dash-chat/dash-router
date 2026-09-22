@@ -453,3 +453,103 @@ fn eviction_candidates_cover_everything_when_nothing_is_wanted() {
     let (s, _) = m.transition(s, NodeAction::Recv(have)).unwrap();
     assert_eq!(s.eviction_candidates(), s.relay.0.held_payloads());
 }
+
+mod prefix {
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    use dash_router_core::{RouterAction, Storage};
+    use dash_router_core::{
+        LogRanges, NodeAction, NodeEffect, NodeMachine, NodeState, Op, Pair, Ranges, RouterConfig,
+        WireBody, WireMessage,
+    };
+    use polestar::prelude::*;
+    use polestar::time::RealTime;
+
+    type M = NodeMachine<u32, Pair, RealTime>;
+
+    fn machine() -> M {
+        NodeMachine::new(
+            RouterConfig {
+                want_ttl: Duration::from_millis(500).into(),
+                have_ttl: Duration::from_millis(500).into(),
+            },
+            1 << 20,
+        )
+    }
+
+    fn op(b: u8) -> Op {
+        Op { header: vec![b], payload: Some(vec![b; 4]) }
+    }
+
+    fn have(from: u32, log: Pair, seqs: &[u32]) -> WireMessage<u32, Pair> {
+        WireMessage::have(from, vec![(log, seqs.iter().map(|&q| (q, op(q as u8))).collect())])
+    }
+
+    /// Review focus 1: a never-seen author under a subscribed prefix is ext data.
+    #[test]
+    fn have_for_new_author_under_subscribed_prefix_is_delivered() {
+        let m = machine();
+        let s = NodeState::new(0u32, m.clone(), [1u8]);
+        let new_author = Pair::new(1, 42);
+        let (s, fx) = m.transition(s, NodeAction::Recv(have(7, new_author, &[0, 1]))).unwrap();
+        assert!(fx.contains(&NodeEffect::Deliver(new_author, 0)));
+        assert!(fx.contains(&NodeEffect::Deliver(new_author, 1)));
+        assert_eq!(s.ext.0.held_all().get(&new_author), Some(&Ranges::range(0, 2)));
+        assert!(s.relay.0.held_all().get(&new_author).is_none());
+    }
+
+    /// Subscribe(prefix) migrates every author's relay log under it to ext.
+    #[test]
+    fn subscribe_prefix_migrates_all_relay_logs_under_it() {
+        let m = machine();
+        let s = NodeState::new(0u32, m.clone(), []); // pure relay
+        let a1 = Pair::new(1, 1);
+        let a2 = Pair::new(1, 2);
+        let other = Pair::new(2, 1);
+        let (s, _) = m.transition(s, NodeAction::Recv(have(7, a1, &[0]))).unwrap();
+        let (s, _) = m.transition(s, NodeAction::Recv(have(7, a2, &[0, 1]))).unwrap();
+        let (s, _) = m.transition(s, NodeAction::Recv(have(7, other, &[0]))).unwrap();
+        let (s, _) = m.transition(s, NodeAction::Subscribe(1u8)).unwrap();
+        assert!(s.is_subscribed(&a1) && s.is_subscribed(&a2) && !s.is_subscribed(&other));
+        assert_eq!(s.ext.0.held_all().get(&a1), Some(&Ranges::range(0, 1)));
+        assert_eq!(s.ext.0.held_all().get(&a2), Some(&Ranges::range(0, 2)));
+        assert!(s.relay.0.held_all().get(&a1).is_none());
+        assert!(s.relay.0.held_all().get(&a2).is_none());
+        assert_eq!(s.relay.0.held_all().get(&other), Some(&Ranges::range(0, 1)));
+        assert_eq!(s.router.open, BTreeSet::from([1u8]));
+    }
+
+    /// Review focus 3.
+    #[test]
+    fn unsubscribe_prefix_parks_later_haves_in_relay() {
+        let m = machine();
+        let s = NodeState::new(0u32, m.clone(), [1u8]);
+        let (s, _) = m.transition(s, NodeAction::Unsubscribe(1u8)).unwrap();
+        assert!(s.router.open.is_empty());
+        let a1 = Pair::new(1, 1);
+        let (s, fx) = m.transition(s, NodeAction::Recv(have(7, a1, &[0]))).unwrap();
+        assert!(!fx.iter().any(|e| matches!(e, NodeEffect::Deliver(..))));
+        assert_eq!(s.relay.0.held_all().get(&a1), Some(&Ranges::range(0, 1)));
+    }
+
+    /// The prefix Want replaces the known-but-empty marker: a subscription
+    /// with nothing stored sends `prefixes`, not a full range for a log.
+    #[test]
+    fn empty_subscription_wants_by_prefix_not_marker() {
+        let m = machine();
+        let s = NodeState::new(0u32, m.clone(), [1u8]);
+        assert!(s.held_union().is_empty(), "no marker");
+        let (s, _) = m
+            .transition(s, NodeAction::Router(RouterAction::ArmWantTimer(Duration::ZERO.into())))
+            .unwrap();
+        let (_, fx) = m.transition(s, NodeAction::Router(RouterAction::FireWant)).unwrap();
+        let want = fx.iter().find_map(|e| match e {
+            NodeEffect::Broadcast(WireMessage { body: WireBody::Want { ranges, prefixes }, .. }) => {
+                Some((ranges.clone(), prefixes.clone()))
+            }
+            _ => None,
+        });
+        assert_eq!(want, Some((LogRanges::empty(), BTreeSet::from([1u8]))));
+    }
+}

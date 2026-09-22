@@ -59,29 +59,39 @@ pub struct NodeState<N: Id, L: Log, T: TimeInterval> {
     pub router: SM<RouterMachine<N, L, T>>,
     pub relay: SM<RelayStoreMachine<L>>,
     pub ext: SM<ExtStoreMachine<L>>,
-    pub subscriptions: BTreeSet<L>,
+    /// Subscriptions by prefix (spec 2026-09-22 §3.5): a log is subscribed
+    /// iff its prefix is.
+    pub subscriptions: BTreeSet<L::Prefix>,
 }
 
-fn held_union<L: Id>(
-    relay: &RelayStoreState<L>,
-    ext: &ExtStoreState<L>,
-    subscriptions: &BTreeSet<L>,
-) -> LogRanges<L> {
-    let mut out = relay.0.held_all().union(&ext.0.held_all());
-    for log in subscriptions {
-        if out.get(log).is_none() {
-            out.insert(*log, Ranges::empty());
-        }
-    }
-    out
+/// held snapshot = relay ∪ ext. No empty markers: a subscribed prefix
+/// with nothing stored is advertised by the Want's `prefixes`, not by a
+/// per-log marker (there is no log to name before its author is known).
+fn held_union<L: Log>(relay: &RelayStoreState<L>, ext: &ExtStoreState<L>) -> LogRanges<L> {
+    relay.0.held_all().union(&ext.0.held_all())
 }
 
 impl<N: Id, L: Log, T: polestar::time::TimeInterval> NodeState<N, L, T> {
-    /// held snapshot = relay ∪ ext ∪ empty keys for subscriptions (§5: a
-    /// subscription with nothing stored yet is still "known" and wants
-    /// everything).
+    /// See [`held_union`].
     pub fn held_union(&self) -> LogRanges<L> {
-        held_union(&self.relay, &self.ext, &self.subscriptions)
+        held_union(&self.relay, &self.ext)
+    }
+
+    /// A log is subscribed iff its prefix is.
+    pub fn is_subscribed(&self, log: &L) -> bool {
+        self.subscriptions.contains(&log.prefix())
+    }
+
+    /// Every relay-held log under `prefix`, as full ranges: what Subscribe migrates.
+    fn relay_logs_under(&self, prefix: &L::Prefix) -> LogRanges<L> {
+        LogRanges::from_pairs(
+            self.relay
+                .0
+                .held_all()
+                .iter()
+                .filter(|(log, _)| log.prefix() == *prefix)
+                .map(|(log, _)| (*log, Ranges::full())),
+        )
     }
 
     /// Whether either storage side currently holds this exact `(log, seq)`.
@@ -96,18 +106,20 @@ impl<N: Id, L: Log, T: polestar::time::TimeInterval> NodeState<N, L, T> {
 }
 
 impl<N: Id, L: Log + Default, T: polestar::time::TimeInterval> NodeState<N, L, T> {
-    /// A fresh node with empty stores, subscribed to `subscriptions`; the
-    /// router starts with the resulting held snapshot.
+    /// A fresh node with empty stores, subscribed to the prefixes in
+    /// `subscriptions`; the router starts with the (empty) held snapshot
+    /// and those prefixes open.
     pub fn new(
         id: N,
         machine: NodeMachine<N, L, T>,
-        subscriptions: impl IntoIterator<Item = L>,
+        subscriptions: impl IntoIterator<Item = L::Prefix>,
     ) -> Self {
         let relay = RelayStoreState::default();
         let ext = ExtStoreState::default();
-        let subscriptions = subscriptions.into_iter().collect();
-        let held = held_union(&relay, &ext, &subscriptions);
-        let router = RouterState::new(id, held);
+        let subscriptions: BTreeSet<L::Prefix> = subscriptions.into_iter().collect();
+        let held = held_union(&relay, &ext);
+        let mut router = RouterState::new(id, held);
+        router.open = subscriptions.clone();
         Self {
             router: SM::new(machine.router, router),
             relay: SM::new(machine.relay, relay),
@@ -127,10 +139,12 @@ pub enum NodeAction<N, L: Log, T> {
     Recv(WireMessage<N, L>),
     /// Locally authored data: ingest to `ext`, then `Push` to the router.
     Authored(L, Seq, Op),
-    /// Start caring about a log: migrate any relay-side bytes for it to
-    /// `ext`.
-    Subscribe(L),
-    Unsubscribe(L),
+    /// Start caring about every log under a prefix: migrate relay-side
+    /// bytes for them to ext and open the prefix on the router.
+    Subscribe(L::Prefix),
+    /// Stop caring about a prefix: close it on the router. Nothing is
+    /// migrated or forgotten; later Haves under it park in the relay.
+    Unsubscribe(L::Prefix),
     /// The application synced natively (out of band) into `ext`.
     NativeSync(L, Seq, Op),
     /// The application GC'd its own store.
@@ -260,17 +274,21 @@ where
                 let fx = s.router.step(RouterAction::Push(ranges))?;
                 self.route_router_fx(&mut s, fx, &BTreeMap::new(), &mut out)?;
             }
-            NodeAction::Subscribe(log) => {
-                s.subscriptions.insert(log);
-                let all = LogRanges::from_pairs([(log, Ranges::full())]);
-                for (log, seq, op) in s.relay.0.fetch(&all) {
-                    s.ext.step(ExtStoreAction::Ingest(log, seq, op))?;
+            NodeAction::Subscribe(prefix) => {
+                s.subscriptions.insert(prefix);
+                let under = s.relay_logs_under(&prefix);
+                if !under.is_empty() {
+                    for (log, seq, op) in s.relay.0.fetch(&under) {
+                        s.ext.step(ExtStoreAction::Ingest(log, seq, op))?;
+                    }
+                    s.relay.step(RelayStoreAction::Evict(under))?;
                 }
-                s.relay.step(RelayStoreAction::Evict(all))?;
+                s.router.step(RouterAction::Open(s.subscriptions.clone()))?;
                 self.reconcile_held(&mut s)?;
             }
-            NodeAction::Unsubscribe(log) => {
-                s.subscriptions.remove(&log);
+            NodeAction::Unsubscribe(prefix) => {
+                s.subscriptions.remove(&prefix);
+                s.router.step(RouterAction::Open(s.subscriptions.clone()))?;
                 self.reconcile_held(&mut s)?;
             }
             NodeAction::NativeSync(log, seq, op) => {
@@ -326,7 +344,7 @@ where
         // into a silent shed.
         let mut usage: Units = s.relay.0.usage();
         for ((log, seq), op) in parked {
-            if s.subscriptions.contains(log) {
+            if s.is_subscribed(log) {
                 s.ext.step(ExtStoreAction::Ingest(*log, *seq, op.clone()))?;
             } else {
                 let units: Units = s.relay.0.ingest_delta(log, *seq, op);
@@ -353,7 +371,7 @@ where
             match e {
                 Effect::Accept(novel) => {
                     for (log, r) in novel.iter() {
-                        if !s.subscriptions.contains(log) {
+                        if !s.is_subscribed(log) {
                             continue;
                         }
                         // Never iterate `Ranges` directly — it may be open;

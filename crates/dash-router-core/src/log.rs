@@ -49,7 +49,9 @@ impl<T> WireLog for T where
 /// A two-level log id for tests and examples: `(prefix, author)`, the
 /// shape Dash Chat's `(LogId, author)` has. Orders prefix-first so a
 /// prefix's logs are contiguous, exactly as the relay store keys them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct Pair {
     pub prefix: u8,
     pub author: u8,
@@ -86,15 +88,24 @@ mod tests {
 
     #[test]
     fn pair_prefix_is_the_first_half() {
-        let l = Pair { prefix: 3, author: 9 };
+        let l = Pair {
+            prefix: 3,
+            author: 9,
+        };
         assert_eq!(l.prefix(), 3);
         assert_eq!(l.to_string(), "3/9");
     }
 
     #[test]
     fn pair_orders_by_prefix_then_author() {
-        let a = Pair { prefix: 1, author: 9 };
-        let b = Pair { prefix: 2, author: 0 };
+        let a = Pair {
+            prefix: 1,
+            author: 9,
+        };
+        let b = Pair {
+            prefix: 2,
+            author: 0,
+        };
         assert!(a < b);
     }
 
