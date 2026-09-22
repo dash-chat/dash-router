@@ -23,9 +23,9 @@ the brainstorm on 2026-09-22.
   it against the envelope author and drops mismatches (§4). Removing the
   field is a later, wire-breaking change.
 - **Log identity is `(author, LogId)` [approved].** Dash Chat's LogId is
-  `blake3(topic)`, one log per author per topic. The adapter subscribes to
-  that pair for every author it knows on a subscribed topic. Inbox topics
-  (unknown authors write) stay outside the router in v1.
+  `blake3(topic)`, one log per author per topic. Topics stay out of the
+  router; the adapter subscribes to that pair for every author it knows on
+  a subscribed topic.
 - **Serve only acked ops [approved].** The ext adapter mirrors
   `MailboxStore::get_log`: a log's held range stops at the acked height, so
   a body about to be tombstoned never leaves the device.
@@ -41,13 +41,15 @@ the brainstorm on 2026-09-22.
   `dash_router_policy` so an embedder depends on one crate.
   `dash-router-net-model` keeps its name: it models the *network*
   (broadcast, loss, reordering), not the net crate.
-- **Every topic is routed, inbox topics included [approved].** Contact
-  requests are made in person, which is exactly when two devices share a
-  LAN. Since the router cannot subscribe to a log whose author it does not
-  know yet, the shell gains an interest predicate: a witnessed Have for a
-  log matching the predicate auto-subscribes it (§3.5). Catch-up for an
-  inbox log the node never witnessed live needs a wildcard Want in the core
-  protocol; that is a follow-up (§5).
+- **Every topic is routed, inbox topics included; a topic subscription is
+  a stream of log subscriptions [approved].** Contact requests are made in
+  person, which is exactly when two devices share a LAN. Dash Chat, the
+  only party that knows topics, drives the stream: it calls `subscribe` on
+  the router each time it learns of a log on a followed topic. For logs no
+  other channel will ever show it (a stranger's contact request on the
+  LAN), the router reports the Haves it witnesses for unsubscribed logs
+  (§3.5). Catch-up for a log the node never witnessed live needs a
+  wildcard Want in the core protocol; that is a follow-up (§5).
 
 ## 2. Dependency wiring (dash-chat)
 
@@ -161,16 +163,16 @@ comment's "byte-for-byte one Have" claim is updated.
 The relay store's key must hold author (32) + LogId (32). Add the impl next
 to the existing `[u8; 32]`.
 
-### 3.5 Interest predicate: auto-subscribe on witnessed Have (`shell.rs`)
+### 3.5 `RouterEvent::Witnessed(L)` (`shell.rs`, `handle.rs`)
 
-`spawn` takes an additional `interested: Box<dyn Fn(&L) -> bool + Send>`.
-When a Have arrives naming a log that is not subscribed but for which
-`interested` returns true, the shell runs the same glue as
-`Command::Subscribe` for that log before processing the Have, so the ops
-land in ext and later Wants pull the rest. The default (`|_| false`)
-reproduces today's behaviour exactly, which is what the conformance and
-loop tests pass. Every subscription taken this way is reported as a new
-`RouterEvent::Subscribed(L)` so the embedder can persist it.
+When a decoded Have names a log the shell holds no subscription for, it
+emits `RouterEvent::Witnessed(log)` once per log (a `BTreeSet<L>` of
+already-reported logs, cleared for a log on `Subscribe`, so a later
+unsubscribe-then-witness reports again). No state change: the Have is
+processed exactly as today, so the ops still land in the relay store and
+migrate to ext if the embedder answers with `subscribe`. The set is
+bounded by the number of distinct logs seen on the LAN. Conformance
+projection excludes it.
 
 ## 4. Dash Chat: the `lan_router` module
 
@@ -219,25 +221,26 @@ Implements `AsyncStorage<RouterLog>` and `WatchableStorage<RouterLog>` over
   `hint_changed`, which `ack_operation` in `app_processing.rs` calls after
   a successful ack (one line, guarded by `if let Some(r) = &self.lan_router`).
 
-### 4.3 Subscriptions
+### 4.3 Subscriptions: the stream
 
-`LanRouter::spawn` seeds subscriptions from the same enumeration
-`initialize_stored_topics` uses, every topic included, and for each topic
-subscribes `(author, LogId::from_topic(topic))` for:
+A Dash Chat topic subscription is a stream of router log subscriptions
+`(author, LogId::from_topic(topic))` over time. `lan_router.rs` owns the
+stream and keeps the `LogId → TopicId` map (§4.2). Its sources:
 
-- every author with a height in `get_log_heights(log_id)`,
-- direct chats: both parties,
-- groups: `group_store.members(chat_id)`.
+- **Startup:** for every topic `initialize_stored_topics` enumerates
+  (all of them, inbox topics included), every author with a height in
+  `get_log_heights(log_id)`, plus both parties of a direct chat and
+  `group_store.members(chat_id)` for a group.
+- **Runtime, Dash Chat side:** `initialize_topic` calls `subscribe_topic`;
+  `establish_contact` and the group-member paths in `app_processing.rs`
+  call `note_author(topic, author)`. One-line hooks behind the `Option`.
+- **Runtime, router side:** the event loop in `lan_router.rs` handles
+  `RouterEvent::Witnessed(log)`: if the LogId half is in the topic map,
+  it calls `subscribe`; otherwise it ignores the event. This is how a
+  stranger's contact request on the LAN reaches the inbox.
 
-The interest predicate (§3.5) is "the LogId half of `L` is in the topic
-map", so any author's log on any topic this node follows, inbox topics
-included, is picked up the moment a Have for it is witnessed. Authors
-learned this way need no persistence: the op store's log heights re-derive
-them on the next start.
-
-Runtime additions: `initialize_topic` calls `subscribe_topic`; the
-group-member paths in `app_processing.rs` that add a member call
-`note_author`. Both are one-line hooks behind the `Option`.
+Authors learned through the router need no persistence: the op store's log
+heights re-derive them on the next start.
 
 ### 4.4 Transport
 
@@ -282,8 +285,8 @@ dash-router:
 - Unit: `[u8; 64]` LogKey round-trip; Have/Want splitting stays under the
   budget on a large fixture and preserves `(log, seq)` order; oversize op
   goes header-only; envelope/sender mismatch is dropped and counted;
-  interest predicate auto-subscribes on a witnessed Have and emits
-  `Subscribed`, and the default predicate changes nothing.
+  `Witnessed` fires once per unsubscribed log named in a Have and not for
+  subscribed ones.
 - Existing conformance and loop tests stay green.
 
 dash-chat (`--features lan-router`):
