@@ -22,10 +22,11 @@ the brainstorm on 2026-09-22.
   verified author. `WireMessage.sender` stays in v1; the shell now *checks*
   it against the envelope author and drops mismatches (§4). Removing the
   field is a later, wire-breaking change.
-- **Log identity is `(author, LogId)` [approved].** Dash Chat's LogId is
-  `blake3(topic)`, one log per author per topic. Topics stay out of the
-  router; the adapter subscribes to that pair for every author it knows on
-  a subscribed topic.
+- **Log identity is `(LogId, author)` and subscriptions name the LogId
+  prefix [approved].** Dash Chat's LogId is `blake3(topic)`, one log per
+  author per topic. Topics stay out of the router. A router subscription
+  names a prefix (the LogId) and means every author's log under it, now
+  and in the future (§3.5).
 - **Serve only acked ops [approved].** The ext adapter mirrors
   `MailboxStore::get_log`: a log's held range stops at the acked height, so
   a body about to be tombstoned never leaves the device.
@@ -41,15 +42,13 @@ the brainstorm on 2026-09-22.
   `dash_router_policy` so an embedder depends on one crate.
   `dash-router-net-model` keeps its name: it models the *network*
   (broadcast, loss, reordering), not the net crate.
-- **Every topic is routed, inbox topics included; a topic subscription is
-  a stream of log subscriptions [approved].** Contact requests are made in
-  person, which is exactly when two devices share a LAN. Dash Chat, the
-  only party that knows topics, drives the stream: it calls `subscribe` on
-  the router each time it learns of a log on a followed topic. For logs no
-  other channel will ever show it (a stranger's contact request on the
-  LAN), the router reports the Haves it witnesses for unsubscribed logs
-  (§3.5). Catch-up for a log the node never witnessed live needs a
-  wildcard Want in the core protocol; that is a follow-up (§5).
+- **Every topic is routed, inbox topics included [approved].** With
+  prefix subscriptions this needs nothing special: Dash Chat subscribes to
+  `LogId::from_topic(topic)` once per topic. A contact request from an
+  author the owner has not met yet (the advertised inbox; the QR exchange
+  is one-way) is simply another log under a subscribed prefix, and a relay
+  that holds it can serve it even if the owner was off the LAN when it was
+  sent.
 
 ## 2. Dependency wiring (dash-chat)
 
@@ -163,16 +162,68 @@ comment's "byte-for-byte one Have" claim is updated.
 The relay store's key must hold author (32) + LogId (32). Add the impl next
 to the existing `[u8; 32]`.
 
-### 3.5 `RouterEvent::Witnessed(L)` (`shell.rs`, `handle.rs`)
+### 3.5 Prefix subscriptions (`dash-router-core`, models, shell)
 
-When a decoded Have names a log the shell holds no subscription for, it
-emits `RouterEvent::Witnessed(log)` once per log (a `BTreeSet<L>` of
-already-reported logs, cleared for a log on `Subscribe`, so a later
-unsubscribe-then-witness reports again). No state change: the Have is
-processed exactly as today, so the ops still land in the relay store and
-migrate to ext if the embedder answers with `subscribe`. The set is
-bounded by the number of distinct logs seen on the LAN. Conformance
-projection excludes it.
+The protocol change that makes "subscribe to a topic" expressible without
+the router knowing topics. Wire version bumps to 1 (topic
+`dash-router/v1`).
+
+**Log type.** Core gains
+
+```rust
+pub trait Log: Id {
+    type Prefix: Id;
+    fn prefix(&self) -> Self::Prefix;
+}
+```
+
+with `Prefix = Self` and `prefix = identity` for the integer ids the tests,
+models and sim use, so every existing scenario keeps its meaning (a prefix
+subscription to `7` is a subscription to log `7`). Dash Chat's
+`RouterLog(LogId, author)` has `Prefix = LogId`.
+
+**Wire.** `WireBody::Want` becomes
+
+```rust
+Want { ranges: LogRanges<L>, prefixes: BTreeSet<L::Prefix> }
+```
+
+`ranges` is what it is today: gaps and open tails for logs the wanter
+already knows. `prefixes` says "and every log under these that I have not
+named in `ranges`". Have is unchanged.
+
+**Router state and actions.** `RouterState` gains `open:
+BTreeSet<L::Prefix>` (this node's wholesale interests), set by a new
+`RouterAction::Open(BTreeSet<L::Prefix>)` from the node glue on
+subscribe/unsubscribe. `Record` (recent wants) carries the wanter's
+prefixes too, and so does `relayed_wants`. `FireWant` sends
+`Want { ranges: wanted(), prefixes: open }`. `next_have` becomes the union
+over each recent Want record of: `held ∩ record.ranges` plus, for every
+held log whose prefix is in `record.prefixes` and which `record.ranges`
+does not name, that log's full held range; then minus `recent_haves` as
+today. A wanter that already knows a log names it explicitly and so never
+gets it wholesale again. Want relaying and suppression treat prefixes as
+one more set to union and diff.
+
+**Node glue (`NodeMachine` and `NodeCore`).** `subscriptions` becomes
+`BTreeSet<L::Prefix>`; a log is subscribed iff its prefix is.
+`Subscribe(prefix)` migrates every relay log under that prefix into ext
+and issues `Open`; `Unsubscribe` the reverse. `reconcile_held` drops the
+"known-but-empty marker" for subscribed logs with no data: the prefix
+entry in Want now carries that intent, and the marker returns naturally
+once a first op for the log lands. The embedder API is
+`RouterHandle::subscribe(prefix)` / `unsubscribe(prefix)`; `Delivered`
+still reports the full `L`.
+
+**Models and tests.** `dash-router-net-model`, the sim behaviours and the
+conformance driver take `Log` in place of `Id` on `L` and pass prefixes
+through; with `Prefix = Self` their existing assertions hold unchanged. New
+core tests: a prefix Want is answered with every held log under the
+prefix except those named explicitly; a Subscribe migrates all relay logs
+under the prefix; a Want relayed onward keeps its prefixes.
+
+This work is sequenced first in the implementation plan, as its own phase
+with the models green before any shell or Dash Chat wiring.
 
 ## 4. Dash Chat: the `lan_router` module
 
@@ -187,7 +238,7 @@ impl LanRouter {
     /// `None` when disabled by config or feature.
     pub async fn spawn(node: &Node) -> Result<Option<Self>>;
     pub async fn subscribe_topic(&self, topic: TopicId) -> Result<()>;
-    pub async fn note_author(&self, topic: TopicId, author: DeviceId) -> Result<()>;
+    pub async fn unsubscribe_topic(&self, topic: TopicId) -> Result<()>;
     pub fn hint_changed(&self, author: DeviceId, log_id: LogId);
     pub async fn shutdown(self);
 }
@@ -196,9 +247,10 @@ impl LanRouter {
 ### 4.1 Identity and log type
 
 - `N = DeviceId` (the node's ed25519 key, already `VerifyingKey`).
-- `RouterLog([u8; 64])`: author key bytes then LogId bytes. Implements
-  `Serialize`, `Ord`, and `LogKey` conversion. Helpers `RouterLog::new(author,
-  log_id)` and `split()`.
+- `RouterLog([u8; 64])`: LogId bytes then author key bytes, prefix
+  first so the relay store's ordered scans group a topic's logs together.
+  Implements `Serialize`, `Ord`, `Log` (`Prefix = LogId`) and `LogKey`
+  conversion. Helpers `RouterLog::new(log_id, author)` and `split()`.
 
 ### 4.2 Ext store adapter: `OpStoreExt`
 
@@ -221,26 +273,22 @@ Implements `AsyncStorage<RouterLog>` and `WatchableStorage<RouterLog>` over
   `hint_changed`, which `ack_operation` in `app_processing.rs` calls after
   a successful ack (one line, guarded by `if let Some(r) = &self.lan_router`).
 
-### 4.3 Subscriptions: the stream
+### 4.3 Subscriptions
 
-A Dash Chat topic subscription is a stream of router log subscriptions
-`(author, LogId::from_topic(topic))` over time. `lan_router.rs` owns the
-stream and keeps the `LogId → TopicId` map (§4.2). Its sources:
+One router subscription per topic: `subscribe_topic(topic)` inserts
+`LogId::from_topic(topic) → topic` into the topic map (§4.2), opens the
+per-topic import channel, and calls `RouterHandle::subscribe(log_id)`.
+That covers every author's log on the topic, known or not yet known, and
+migrates anything the relay already holds under it.
 
-- **Startup:** for every topic `initialize_stored_topics` enumerates
-  (all of them, inbox topics included), every author with a height in
-  `get_log_heights(log_id)`, plus both parties of a direct chat and
-  `group_store.members(chat_id)` for a group.
-- **Runtime, Dash Chat side:** `initialize_topic` calls `subscribe_topic`;
-  `establish_contact` and the group-member paths in `app_processing.rs`
-  call `note_author(topic, author)`. One-line hooks behind the `Option`.
-- **Runtime, router side:** the event loop in `lan_router.rs` handles
-  `RouterEvent::Witnessed(log)`: if the LogId half is in the topic map,
-  it calls `subscribe`; otherwise it ignores the event. This is how a
-  stranger's contact request on the LAN reaches the inbox.
+- **Startup:** `LanRouter::spawn` calls `subscribe_topic` for every topic
+  `initialize_stored_topics` enumerates, inbox topics included.
+- **Runtime:** `initialize_topic` calls `subscribe_topic`; the paths that
+  drop a topic call `unsubscribe_topic`. One-line hooks behind the
+  `Option`.
 
-Authors learned through the router need no persistence: the op store's log
-heights re-derive them on the next start.
+No author enumeration, no membership hooks, no persistence beyond what
+Dash Chat already keeps for its own topics.
 
 ### 4.4 Transport
 
@@ -269,11 +317,12 @@ networks never share an overlay.
 
 ## 5. Known gaps (v1, documented not fixed)
 
-- A log on a followed topic whose Have this node never witnessed live (for
-  example a contact request sent while the recipient was off the LAN) is
-  not pulled, because the router cannot Want a log by topic alone. Fix is
-  a wildcard Want (topic prefix) in the core protocol and its models; own
-  spec.
+- **Future multi-log topics.** If Dash Chat later associates a topic
+  with logs whose LogId is not `blake3(topic)`, each such LogId is one
+  more prefix to subscribe to when the association is made. Prefix
+  subscription migrates whatever the relay already holds under it, so an
+  association made after the ops arrived loses nothing. No router change
+  needed.
 - `app_processing.rs` registers the author of every `ExternalStream` op as
   a bootstrap node (assumes mailbox origin). Router-imported ops trigger the
   same. Harmless on a LAN; noted for cleanup.
@@ -285,9 +334,9 @@ dash-router:
 - Unit: `[u8; 64]` LogKey round-trip; Have/Want splitting stays under the
   budget on a large fixture and preserves `(log, seq)` order; oversize op
   goes header-only; envelope/sender mismatch is dropped and counted;
-  `Witnessed` fires once per unsubscribed log named in a Have and not for
-  subscribed ones.
-- Existing conformance and loop tests stay green.
+  prefix-subscription tests as listed in §3.5.
+- Existing conformance, loop, model and sim tests stay green with
+  `Prefix = Self`.
 
 dash-chat (`--features lan-router`):
 - Unit: `OpStoreExt` held/fetch against a real `OpStore` with acked and
