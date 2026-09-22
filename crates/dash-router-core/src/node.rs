@@ -135,7 +135,11 @@ pub enum NodeEffect<N, L: Ord> {
 }
 
 /// Fold a sorted, deduplicated flat op list into the wire's grouped shape.
-fn group_ops<L: PartialEq>(ops: Vec<(L, Seq, Op)>) -> Vec<(L, Vec<(Seq, Op)>)> {
+///
+/// `pub` so the tokio shell's async routing table (`dash-router-net`) can
+/// reuse it byte-for-byte rather than re-implementing the grouping and
+/// risking drift between the model and the real shell.
+pub fn group_ops<L: PartialEq>(ops: Vec<(L, Seq, Op)>) -> Vec<(L, Vec<(Seq, Op)>)> {
     let mut out: Vec<(L, Vec<(Seq, Op)>)> = Vec::new();
     for (log, seq, op) in ops {
         match out.last_mut() {
@@ -147,7 +151,10 @@ fn group_ops<L: PartialEq>(ops: Vec<(L, Seq, Op)>) -> Vec<(L, Vec<(Seq, Op)>)> {
 }
 
 /// The per-log ranges spanned by a flat set of parked `(log, seq)` keys.
-fn ranges_of<L: Ord + Clone>(parked: &BTreeMap<(L, Seq), Op>) -> LogRanges<L> {
+///
+/// `pub` so the tokio shell can share this exact parking-to-ranges
+/// computation with the model (see [`group_ops`]).
+pub fn ranges_of<L: Ord + Clone>(parked: &BTreeMap<(L, Seq), Op>) -> LogRanges<L> {
     let mut by_log: BTreeMap<L, Vec<Seq>> = BTreeMap::new();
     for (log, seq) in parked.keys() {
         by_log.entry(log.clone()).or_default().push(*seq);

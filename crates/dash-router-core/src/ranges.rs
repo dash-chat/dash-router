@@ -249,6 +249,11 @@ impl<L: Ord + Clone> LogRanges<L> {
         self.0.insert(log, ranges);
     }
 
+    /// Forget a log entirely (its "known" marker included).
+    pub fn remove(&mut self, log: &L) -> Option<Ranges> {
+        self.0.remove(log)
+    }
+
     /// Keeps every key present in either operand, even where the merged
     /// value is empty, so a known-but-empty marker in either side survives
     /// (e.g. `held.union(&novel)` never loses a log's "known" status).
