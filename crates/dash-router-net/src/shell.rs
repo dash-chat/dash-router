@@ -630,6 +630,7 @@ where
 /// `hints = ext.changed()` is taken before `ext` moves into the `NodeCore`
 /// (the core's stored sender keeps the broadcast channel alive, so `hints`
 /// never sees `Closed` while the task runs).
+#[allow(clippy::too_many_arguments)] // spec §5's literal API; not a config struct by design
 pub fn spawn<N, L, E, R, T, I>(
     id: N,
     config: CoreConfig,
@@ -665,7 +666,9 @@ where
         maintain.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let init_out = core.init().await?;
-        route_outs(init_out, &mut transport, &event_tx).await?;
+        if !route_outs(init_out, &mut transport, &event_tx).await? {
+            return Ok(()); // transport already gone; clean stop, drain nothing
+        }
 
         loop {
             let deadline = core
