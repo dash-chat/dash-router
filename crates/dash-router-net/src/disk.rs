@@ -24,10 +24,16 @@ const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ops");
 /// A log id usable as a fixed-width, order-preserving byte key: encoding
 /// must be monotonic (big-endian for integers) so a byte-lexicographic scan
 /// of the table visits sequences in log, then seq, order.
+///
+/// `read_key` is fallible (`None` rather than panicking) because it decodes
+/// bytes redb hands back from disk: a key shorter than `WIDTH` is a
+/// malformed row (corruption, a foreign writer, a truncated file), not a
+/// programmer error, and trait methods here never panic on that — see
+/// [`row_seq`] and the fix-round-2 note on [`DiskRelayStore`].
 pub trait LogKey: Ord + Clone {
     const WIDTH: usize;
     fn write_key(&self, out: &mut Vec<u8>);
-    fn read_key(bytes: &[u8]) -> Self;
+    fn read_key(bytes: &[u8]) -> Option<Self>;
 }
 
 impl LogKey for [u8; 32] {
@@ -37,10 +43,8 @@ impl LogKey for [u8; 32] {
         out.extend_from_slice(self);
     }
 
-    fn read_key(bytes: &[u8]) -> Self {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes[..32]);
-        arr
+    fn read_key(bytes: &[u8]) -> Option<Self> {
+        bytes.get(..32)?.try_into().ok()
     }
 }
 
@@ -51,8 +55,8 @@ impl LogKey for u32 {
         out.extend_from_slice(&self.to_be_bytes());
     }
 
-    fn read_key(bytes: &[u8]) -> Self {
-        u32::from_be_bytes(bytes[..4].try_into().expect("4-byte key"))
+    fn read_key(bytes: &[u8]) -> Option<Self> {
+        Some(u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?))
     }
 }
 
@@ -63,8 +67,8 @@ impl LogKey for u8 {
         out.push(*self);
     }
 
-    fn read_key(bytes: &[u8]) -> Self {
-        bytes[0]
+    fn read_key(bytes: &[u8]) -> Option<Self> {
+        bytes.first().copied()
     }
 }
 
@@ -75,8 +79,16 @@ fn row_key<L: LogKey>(log: &L, seq: Seq) -> Vec<u8> {
     out
 }
 
-fn row_seq<L: LogKey>(key: &[u8]) -> Seq {
-    Seq::from_be_bytes(key[L::WIDTH..].try_into().expect("4-byte seq suffix"))
+/// The seq suffix of a row key, or `None` if `key` isn't exactly
+/// `L::WIDTH + 4` bytes — a malformed row, treated the same as a row we
+/// can't decode: skipped and counted, never panicked on (Ruling B: trait
+/// methods never panic; a row we can't parse is a row we don't hold).
+fn row_seq<L: LogKey>(key: &[u8]) -> Option<Seq> {
+    if key.len() != L::WIDTH + 4 {
+        return None;
+    }
+    let suffix: [u8; 4] = key[L::WIDTH..].try_into().ok()?;
+    Some(Seq::from_be_bytes(suffix))
 }
 
 /// Inclusive `[lo, hi]` byte bounds covering every seq for one log: since
@@ -118,6 +130,17 @@ fn set_log_entry<L: LogKey>(map: &mut LogRanges<L>, log: &L, ranges: Ranges) {
 /// serve the in-memory cache directly and never touch redb at all, so they
 /// cannot fail. Every swallowed error is counted in `io_errors` so this
 /// degradation isn't silent.
+///
+/// **Invariant (fix round 2):** after any degraded operation the cache may
+/// *under*-report — treat data as absent/evicted that redb still holds —
+/// but must never *over*-report — claim to hold data redb no longer
+/// reflects. Under-reporting is the safe direction: the protocol already
+/// treats un-advertised data as absent and repairs it through the normal
+/// want/have cycle or the next reopen's full scan; over-reporting would
+/// promise data a `fetch` can't actually produce. This is why a failed
+/// [`Self::rebuild_log`] after a *committed* evict drops that log from the
+/// cache entirely (see [`Self::drop_log_from_cache`]) rather than leaving
+/// the pre-eviction entries in place.
 pub struct DiskRelayStore<L: LogKey> {
     db: Database,
     /// Maintained incrementally (single writer: this store); rebuilt by a
@@ -147,15 +170,40 @@ impl<L: LogKey> DiskRelayStore<L> {
         let mut per_log: std::collections::BTreeMap<L, (Vec<Seq>, Vec<Seq>)> =
             std::collections::BTreeMap::new();
         let mut usage: Units = 0;
+        let mut io_errors: u64 = 0;
         {
             let read_txn = db.begin_read()?;
             let table = read_txn.open_table(TABLE)?;
+            // Row-level problems (a malformed key, an undecodable value) are
+            // skipped-and-counted rather than failing the whole open: a row
+            // we can't parse is a row we don't hold, not a reason to refuse
+            // to start. Only transaction/table-level failures (begin_read,
+            // open_table, range itself) still propagate via `?`, since
+            // there's no store to construct at all if those fail.
             for row in table.range::<&[u8]>(..)? {
-                let (k, v) = row?;
+                let (k, v) = match row {
+                    Ok(kv) => kv,
+                    Err(_) => {
+                        io_errors += 1;
+                        continue;
+                    }
+                };
                 let key = k.value();
-                let log = L::read_key(&key[..L::WIDTH]);
-                let seq = row_seq::<L>(key);
-                let op: Op = postcard::from_bytes(v.value())?;
+                let Some(log) = key.get(..L::WIDTH).and_then(L::read_key) else {
+                    io_errors += 1;
+                    continue;
+                };
+                let Some(seq) = row_seq::<L>(key) else {
+                    io_errors += 1;
+                    continue;
+                };
+                let op: Op = match postcard::from_bytes(v.value()) {
+                    Ok(op) => op,
+                    Err(_) => {
+                        io_errors += 1;
+                        continue;
+                    }
+                };
                 usage += if op.payload.is_some() { 2 } else { 1 };
                 let entry = per_log.entry(log).or_default();
                 entry.0.push(seq);
@@ -179,13 +227,14 @@ impl<L: LogKey> DiskRelayStore<L> {
             held,
             payloads,
             usage,
-            io_errors: AtomicU64::new(0),
+            io_errors: AtomicU64::new(io_errors),
         })
     }
 
     /// Count of redb operations that failed and were degraded (dropped
-    /// write / partial read) rather than panicking. See the struct's
-    /// doc comment: this is the diagnostic surface for that degradation.
+    /// write / partial read / skipped malformed row) rather than
+    /// panicking. See the struct's doc comment: this is the diagnostic
+    /// surface for that degradation.
     pub fn io_errors(&self) -> u64 {
         self.io_errors.load(Ordering::Relaxed)
     }
@@ -194,12 +243,29 @@ impl<L: LogKey> DiskRelayStore<L> {
         self.io_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Drop `log` from both `held` and `payloads` entirely. Used when a
+    /// redb error leaves us unable to trust what's still on disk for this
+    /// log (see the struct doc's under-report-not-over-report invariant):
+    /// under-reporting "we hold nothing for this log" is always safe,
+    /// since the protocol treats un-advertised data as absent and repairs
+    /// it later, while over-reporting could promise a `fetch` can't
+    /// deliver.
+    fn drop_log_from_cache(&mut self, log: &L) {
+        set_log_entry(&mut self.held, log, Ranges::empty());
+        set_log_entry(&mut self.payloads, log, Ranges::empty());
+    }
+
     /// Recompute `held`/`payloads` for exactly this log from a fresh
     /// prefix scan: eviction is rare, so recompute-per-touched-log keeps
     /// the incremental cache trivially correct rather than requiring a
-    /// delta-tracking eviction path. Returns `Err` on any redb failure
-    /// without touching `held`/`payloads` (they're only written after the
-    /// whole scan succeeds), so callers can leave the cache as-is on error.
+    /// delta-tracking eviction path.
+    ///
+    /// A malformed row's key (see [`row_seq`]) is skipped-and-counted, not
+    /// fatal to the rebuild. Only a transaction/table-level failure
+    /// (`begin_read`/`open_table`/`range`) or an undecodable value fails
+    /// the whole rebuild — `held`/`payloads` are only written after the
+    /// scan fully succeeds, so callers can tell "scan failed, cache
+    /// unchanged" (`Err`) apart from "scan succeeded" (`Ok`).
     fn rebuild_log(&mut self, log: &L) -> Result<()> {
         let (lo, hi) = log_bounds(log);
         let mut seqs = vec![];
@@ -209,7 +275,10 @@ impl<L: LogKey> DiskRelayStore<L> {
             let table = read_txn.open_table(TABLE)?;
             for row in table.range(lo.as_slice()..=hi.as_slice())? {
                 let (k, v) = row?;
-                let seq = row_seq::<L>(k.value());
+                let Some(seq) = row_seq::<L>(k.value()) else {
+                    self.note_io_error();
+                    continue;
+                };
                 let op: Op = postcard::from_bytes(v.value())?;
                 seqs.push(seq);
                 if op.payload.is_some() {
@@ -291,7 +360,10 @@ impl<L: LogKey> Storage<L> for DiskRelayStore<L> {
                         continue;
                     }
                 };
-                let seq = row_seq::<L>(k.value());
+                let Some(seq) = row_seq::<L>(k.value()) else {
+                    self.note_io_error();
+                    continue;
+                };
                 if !r.contains(seq) {
                     continue;
                 }
@@ -404,16 +476,24 @@ impl<L: LogKey> EvictableStorage<L> for DiskRelayStore<L> {
             let (lo, hi) = log_bounds(log);
             // As in `ingest`: every fallible call is inside this closure,
             // and `self.usage`/the cache are only touched on full success.
-            let outcome: anyhow::Result<Units> = (|| {
+            // A malformed key (see `row_seq`) is skipped-and-counted rather
+            // than failing the whole per-log write; returned alongside the
+            // units removed so the outer match can count it without a
+            // second borrow of `self` from inside the closure.
+            let outcome: anyhow::Result<(Units, u64)> = (|| {
                 let write_txn = self.db.begin_write()?;
                 let mut units_removed: Units = 0;
+                let mut malformed: u64 = 0;
                 {
                     let mut table = write_txn.open_table(TABLE)?;
                     let mut updates = vec![];
                     for row in table.range(lo.as_slice()..=hi.as_slice())? {
                         let (k, v) = row?;
                         let key = k.value().to_vec();
-                        let seq = row_seq::<L>(&key);
+                        let Some(seq) = row_seq::<L>(&key) else {
+                            malformed += 1;
+                            continue;
+                        };
                         if r.contains(seq) {
                             let op: Op = postcard::from_bytes(v.value())?;
                             if op.payload.is_some() {
@@ -434,18 +514,24 @@ impl<L: LogKey> EvictableStorage<L> for DiskRelayStore<L> {
                     }
                 }
                 write_txn.commit()?;
-                Ok(units_removed)
+                Ok((units_removed, malformed))
             })();
 
             match outcome {
-                Ok(units_removed) => {
+                Ok((units_removed, malformed)) => {
                     self.usage -= units_removed;
-                    // The write already committed; a failure rebuilding the
-                    // cache leaves it stale (still shows the pre-eviction
-                    // payload range) rather than guessed-at — repaired by
-                    // the next reopen's full scan.
+                    for _ in 0..malformed {
+                        self.note_io_error();
+                    }
+                    // The write already committed. On success, rebuild the
+                    // cache from a fresh scan; on failure, we can no longer
+                    // trust the pre-eviction entries for this log (they may
+                    // now over-report), so drop it from the cache entirely
+                    // instead — under-reporting is always the safe
+                    // direction (see the struct doc's invariant).
                     if self.rebuild_log(log).is_err() {
                         self.note_io_error();
+                        self.drop_log_from_cache(log);
                     }
                 }
                 Err(_) => self.note_io_error(),
@@ -459,16 +545,20 @@ impl<L: LogKey> EvictableStorage<L> for DiskRelayStore<L> {
                 continue;
             }
             let (lo, hi) = log_bounds(log);
-            let outcome: anyhow::Result<Units> = (|| {
+            let outcome: anyhow::Result<(Units, u64)> = (|| {
                 let write_txn = self.db.begin_write()?;
                 let mut units_removed: Units = 0;
+                let mut malformed: u64 = 0;
                 {
                     let mut table = write_txn.open_table(TABLE)?;
                     let mut removals = vec![];
                     for row in table.range(lo.as_slice()..=hi.as_slice())? {
                         let (k, v) = row?;
                         let key = k.value().to_vec();
-                        let seq = row_seq::<L>(&key);
+                        let Some(seq) = row_seq::<L>(&key) else {
+                            malformed += 1;
+                            continue;
+                        };
                         if r.contains(seq) {
                             let op: Op = postcard::from_bytes(v.value())?;
                             units_removed += if op.payload.is_some() { 2 } else { 1 };
@@ -480,14 +570,18 @@ impl<L: LogKey> EvictableStorage<L> for DiskRelayStore<L> {
                     }
                 }
                 write_txn.commit()?;
-                Ok(units_removed)
+                Ok((units_removed, malformed))
             })();
 
             match outcome {
-                Ok(units_removed) => {
+                Ok((units_removed, malformed)) => {
                     self.usage -= units_removed;
+                    for _ in 0..malformed {
+                        self.note_io_error();
+                    }
                     if self.rebuild_log(log).is_err() {
                         self.note_io_error();
+                        self.drop_log_from_cache(log);
                     }
                 }
                 Err(_) => self.note_io_error(),
@@ -638,6 +732,100 @@ mod tests {
         );
     }
 
+    /// Fix round 2, finding 1: a row whose key is shorter than
+    /// `L::WIDTH + 4` used to panic (`row_seq`'s `.expect(...)`, `u32`'s
+    /// `read_key`'s `.expect(...)`); it must instead be skipped and
+    /// counted. Faked cheaply by hand-inserting a too-short raw key
+    /// directly through redb. `fetch`'s per-log prefix scan never even
+    /// visits a key this malformed (it falls outside every `u32` log's
+    /// 8-byte bounds), so this specifically exercises `open`'s unscoped
+    /// full-table scan, which does visit it.
+    #[tokio::test]
+    async fn a_malformed_length_key_is_skipped_and_counted_not_panicked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.redb");
+        {
+            let mut store = DiskRelayStore::<u32>::open(&path).unwrap();
+            store.ingest(3, 0, op(1, true)).await.unwrap();
+
+            let write_txn = store.db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(super::TABLE).unwrap();
+                table
+                    .insert([1u8, 2, 3].as_slice(), b"irrelevant".as_slice())
+                    .unwrap();
+            }
+            write_txn.commit().unwrap();
+            assert_eq!(store.io_errors(), 0);
+        }
+
+        let store = DiskRelayStore::<u32>::open(&path).unwrap();
+        assert!(
+            store.io_errors() > 0,
+            "the malformed-length row was skipped and counted on reopen, not panicked on"
+        );
+        assert_eq!(
+            store.held_all().await.unwrap().get(&3u32),
+            Some(&Ranges::from_seqs([0])),
+            "the legitimate row still round-trips despite the malformed one"
+        );
+    }
+
+    /// Fix round 2, finding 2: a `rebuild_log` failure that happens *after*
+    /// an evict/evict_payloads write has already committed must not leave
+    /// the cache over-reporting (still advertising rows the write just
+    /// removed, or — as tested here — leaving payload/held ranges whose
+    /// accuracy `rebuild_log` couldn't actually reconfirm). Faked cheaply:
+    /// corrupt a value at a seq the eviction below doesn't target, so the
+    /// write itself succeeds, but `rebuild_log`'s full-log rescan (which,
+    /// unlike the write's own range-filtered scan, decodes every row in
+    /// the log unconditionally) trips over it and fails.
+    #[tokio::test]
+    async fn a_rebuild_failure_after_a_committed_evict_drops_the_log_rather_than_over_reporting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.redb");
+        let mut store = DiskRelayStore::<u32>::open(&path).unwrap();
+
+        store.ingest(2, 0, op(1, true)).await.unwrap();
+        store.ingest(2, 1, op(2, true)).await.unwrap();
+        assert_eq!(store.io_errors(), 0);
+
+        // Corrupt seq 1's value directly, bypassing the API: the cache
+        // still (correctly, for now) believes seq 1 is held with a
+        // payload. This row is outside the eviction range below, so the
+        // eviction's own write succeeds — only the post-write rescan
+        // visits it.
+        let key1 = super::row_key(&2u32, 1);
+        {
+            let write_txn = store.db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(super::TABLE).unwrap();
+                table
+                    .insert(key1.as_slice(), b"not valid postcard".as_slice())
+                    .unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        // Evict just seq 0's payload. The write succeeds; the subsequent
+        // `rebuild_log` rescans the whole log and fails on seq 1.
+        let ranges = LogRanges::from_pairs([(2u32, Ranges::range(0, 1))]);
+        store.evict_payloads(&ranges).await.unwrap();
+
+        // Under-report, not over-report: log 2 is dropped from both
+        // summaries entirely rather than left showing pre-eviction (now
+        // unverifiable) ranges.
+        assert!(
+            store.held_all().await.unwrap().get(&2u32).is_none(),
+            "a failed rebuild drops the log from held rather than over-reporting"
+        );
+        assert!(
+            store.held_payloads().await.unwrap().get(&2u32).is_none(),
+            "a failed rebuild drops the log from held_payloads rather than over-reporting"
+        );
+        assert!(store.io_errors() > 0, "the failed rebuild was counted");
+    }
+
     /// Task 10's node task `tokio::spawn`s a future holding an
     /// `AsyncEvictableStorage`; prove `DiskRelayStore`'s futures (picked up
     /// via the blanket bridge over the sync `Storage`/`EvictableStorage`
@@ -663,11 +851,16 @@ mod tests {
         300u32.write_key(&mut b);
         assert_eq!(a.len(), <u32 as LogKey>::WIDTH);
         assert!(a < b, "big-endian keeps numeric order");
-        assert_eq!(<u32 as LogKey>::read_key(&a), 3);
+        assert_eq!(<u32 as LogKey>::read_key(&a), Some(3));
         let arr = [9u8; 32];
         let mut k = Vec::new();
         arr.write_key(&mut k);
-        assert_eq!(<[u8; 32] as LogKey>::read_key(&k), arr);
+        assert_eq!(<[u8; 32] as LogKey>::read_key(&k), Some(arr));
+        // A malformed (too-short) key is `None`, not a panic — the fix
+        // round 2 requirement `LogKey::read_key` exists to satisfy.
+        assert_eq!(<u32 as LogKey>::read_key(&[1, 2]), None);
+        assert_eq!(<[u8; 32] as LogKey>::read_key(&[1, 2]), None);
+        assert_eq!(<u8 as LogKey>::read_key(&[]), None);
     }
 
     /// A tiny op-log for the proptest, run against both the disk store and
