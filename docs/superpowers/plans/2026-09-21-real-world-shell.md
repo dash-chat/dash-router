@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Turn the pure-world node into a running tokio LAN node: a shared policy crate, a reachable eviction subsystem with sim evidence, and the `dash-router-net` shell with a redb relay store, loopback + p2panda transports, and lockstep conformance against `NodeMachine`.
+**Goal:** Turn the pure-world node into a running tokio LAN node: a shared policy crate, a reachable eviction subsystem with sim evidence, and the `dash-router` shell with a redb relay store, loopback + p2panda transports, and lockstep conformance against `NodeMachine`.
 
 **Architecture:** One tokio task owns everything mutable (`NodeCore`), a thin imperative rind around the same pure `RouterMachine` transitions the model uses. Storage is behind async traits with a blanket sync→async bridge so the conformance test runs the real shell over the model's `OpsMap`. Tasks 1–5 are pure-world/sim work (the inherited eviction follow-ups); Tasks 6–12 build the shell. One plan, strictly ordered — later tasks consume interfaces earlier tasks produce.
 
@@ -14,7 +14,7 @@
 
 - `dash-router-core` stays pure: no RNG, no clock, no I/O, no tokio. Additions to it in this plan (Task 2, one trait method in Task 6) are pure functions/actions only.
 - `dash-router-policy` must not depend on tokio (spec §1). `rand` + `serde` only.
-- tokio appears only in `dash-router-net`. p2panda deps appear only in `dash-router-net` behind the **off-by-default** cargo feature `p2panda`, and only inside `transport.rs` (spec §6).
+- tokio appears only in `dash-router`. p2panda deps appear only in `dash-router` behind the **off-by-default** cargo feature `p2panda`, and only inside `transport.rs` (spec §6).
 - **No router protocol changes this round** (user ruling, 2026-09-21): the shed-at-cap churn loop and Unsubscribe keep-wanting behavior stay as-is, documented and deferred. Do not "fix" either in passing; `unsubscribe_keeps_advertising_and_keeps_wanting` in `crates/dash-router-core/tests/node.rs` must keep passing unchanged.
 - Storage errors degrade, never crash the node task (spec §3): relay-store errors are treated as sheds; ext-store errors surface as `RouterEvent::StorageError` while gossip continues.
 - Wire stays `WIRE_VERSION = 0`, unsigned, postcard; gossip topic string is `"dash-router/v0"` (spec §6.1).
@@ -950,15 +950,15 @@ git commit -m "feat(sim): push-vs-pull delivery latency metric; recapture baseli
 
 ---
 
-### Task 6: `dash-router-net` scaffold — async storage traits + `MemStore`
+### Task 6: `dash-router` scaffold — async storage traits + `MemStore`
 
 Create the shell crate with the async storage boundary and the in-memory selfish store (spec §3.5 via §6.2, §7). Includes one small pure addition to core: `ingest_delta` joins the `EvictableStorage` trait so the blanket bridge can carry it.
 
 **Files:**
-- Create: `crates/dash-router-net/Cargo.toml`
-- Create: `crates/dash-router-net/src/lib.rs`
-- Create: `crates/dash-router-net/src/storage.rs`
-- Create: `crates/dash-router-net/src/mem.rs`
+- Create: `crates/dash-router/Cargo.toml`
+- Create: `crates/dash-router/src/lib.rs`
+- Create: `crates/dash-router/src/storage.rs`
+- Create: `crates/dash-router/src/mem.rs`
 - Modify: `crates/dash-router-core/src/storage.rs` (trait method + OpsMap impl)
 
 **Interfaces:**
@@ -988,11 +988,11 @@ fn ingest_delta(&self, log: &L, seq: Seq, op: &Op) -> Units {
 
 - [ ] **Step 2: Create the crate**
 
-`crates/dash-router-net/Cargo.toml`:
+`crates/dash-router/Cargo.toml`:
 
 ```toml
 [package]
-name = "dash-router-net"
+name = "dash-router"
 description = "The tokio shell: a real Dash Router node over async storage and a LAN transport"
 version.workspace = true
 edition.workspace = true
@@ -1082,7 +1082,7 @@ async fn mem_store_is_shared_and_hints_after_ingest() {
 }
 ```
 
-- [ ] **Step 4: Run: `cargo test -p dash-router-net`** — expected: FAIL (nothing implemented).
+- [ ] **Step 4: Run: `cargo test -p dash-router`** — expected: FAIL (nothing implemented).
 
 - [ ] **Step 5: Implement `storage.rs`**
 
@@ -1255,8 +1255,8 @@ impl<L: Ord + Clone + Send + Sync> WatchableStorage<L> for MemStore<L> {
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/dash-router-net crates/dash-router-core Cargo.lock
-git commit -m "feat(net): dash-router-net crate with async storage boundary and MemStore"
+git add crates/dash-router crates/dash-router-core Cargo.lock
+git commit -m "feat(net): dash-router crate with async storage boundary and MemStore"
 ```
 
 ---
@@ -1266,15 +1266,15 @@ git commit -m "feat(net): dash-router-net crate with async storage boundary and 
 The relay's disk cache (spec §6.2, redb **[approved]**): one `ops` table keyed `(log bytes, seq BE)` so `held_all`/`fetch` are ordered prefix scans, with usage/held summaries scanned at startup and maintained incrementally (single writer: us).
 
 **Files:**
-- Create: `crates/dash-router-net/src/disk.rs`
-- Modify: `crates/dash-router-net/src/lib.rs` (`pub mod disk;` + re-export `DiskRelayStore`, `LogKey`)
-- Modify: `crates/dash-router-net/Cargo.toml` (add `redb`)
+- Create: `crates/dash-router/src/disk.rs`
+- Modify: `crates/dash-router/src/lib.rs` (`pub mod disk;` + re-export `DiskRelayStore`, `LogKey`)
+- Modify: `crates/dash-router/Cargo.toml` (add `redb`)
 
 **Interfaces:**
 - Consumes: `AsyncStorage`/`AsyncEvictableStorage` (Task 6).
 - Produces: `trait LogKey: Ord + Clone { const WIDTH: usize; fn write_key(&self, out: &mut Vec<u8>); fn read_key(bytes: &[u8]) -> Self; }` with impls for `[u8; 32]`, `u32`, `u8` (big-endian); `DiskRelayStore<L: LogKey>` with `pub fn open(path: &Path) -> Result<Self>` implementing both async storage traits. Task 10's spawn takes any `AsyncEvictableStorage`, so this store plugs in without further glue.
 
-**redb note for the implementer:** add the dependency with `cargo add redb --package dash-router-net` (latest stable) and consult that version's docs.rs for exact signatures — the shapes to use are `Database::create(path)`, `TableDefinition::<&[u8], &[u8]>::new("ops")`, `begin_write()/open_table()/insert()/remove()/commit()`, `begin_read()/open_table()/range::<&[u8]>(start..end)`. Keep this task's trait surface fixed regardless of redb's API details. redb calls run inline in the async fns **[decision]**: single writer, small values, a cache we may lose — `spawn_blocking` would buy little and cost `'static` copies; revisit under profiling.
+**redb note for the implementer:** add the dependency with `cargo add redb --package dash-router` (latest stable) and consult that version's docs.rs for exact signatures — the shapes to use are `Database::create(path)`, `TableDefinition::<&[u8], &[u8]>::new("ops")`, `begin_write()/open_table()/insert()/remove()/commit()`, `begin_read()/open_table()/range::<&[u8]>(start..end)`. Keep this task's trait surface fixed regardless of redb's API details. redb calls run inline in the async fns **[decision]**: single writer, small values, a cache we may lose — `spawn_blocking` would buy little and cost `'static` copies; revisit under profiling.
 
 - [ ] **Step 1: Write the failing tests** (`#[cfg(test)]` in `disk.rs`)
 
@@ -1349,7 +1349,7 @@ fn log_keys_are_fixed_width_and_order_preserving() {
 
 Also add a proptest mirroring the oracle test over arbitrary small op sequences (logs in `0..4u32`, seqs in `0..8`, random payload flags, interleaved `evict_payloads`/`evict` of random ranges), asserting `held_all`/`held_payloads`/`usage` equality after every step — this is the guard on the incremental cache.
 
-- [ ] **Step 2: Run: `cargo test -p dash-router-net disk`** — expected: FAIL.
+- [ ] **Step 2: Run: `cargo test -p dash-router disk`** — expected: FAIL.
 
 - [ ] **Step 3: Implement `disk.rs`**
 
@@ -1386,12 +1386,12 @@ pub struct DiskRelayStore<L: LogKey> {
 - `fetch`: per requested log, prefix scan and filter by `ranges.contains`.
 - `ingest_delta`: read the row, apply the `OpsMap::ingest_delta` match (2/1 new, 1 upgrade, 0 duplicate).
 
-- [ ] **Step 4: Run: `cargo test -p dash-router-net`** — expected: PASS (including proptest).
+- [ ] **Step 4: Run: `cargo test -p dash-router`** — expected: PASS (including proptest).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/dash-router-net Cargo.lock
+git add crates/dash-router Cargo.lock
 git commit -m "feat(net): redb-backed DiskRelayStore with scanned-then-incremental summaries"
 ```
 
@@ -1402,9 +1402,9 @@ git commit -m "feat(net): redb-backed DiskRelayStore with scanned-then-increment
 The pluggable transport boundary (spec §6.1, §7): a trait the p2panda adapter and the test loopback both implement, plus the pure LAN predicate.
 
 **Files:**
-- Create: `crates/dash-router-net/src/lan.rs`
-- Create: `crates/dash-router-net/src/transport.rs`
-- Modify: `crates/dash-router-net/src/lib.rs` (`pub mod lan; pub mod transport;` + re-exports `is_lan`, `Transport`, `Incoming`, `LoopbackHub`)
+- Create: `crates/dash-router/src/lan.rs`
+- Create: `crates/dash-router/src/transport.rs`
+- Modify: `crates/dash-router/src/lib.rs` (`pub mod lan; pub mod transport;` + re-exports `is_lan`, `Transport`, `Incoming`, `LoopbackHub`)
 
 **Interfaces:**
 - Consumes: nothing beyond tokio.
@@ -1449,7 +1449,7 @@ async fn loopback_broadcasts_to_everyone_but_the_sender() {
 }
 ```
 
-- [ ] **Step 2: Run: `cargo test -p dash-router-net lan loopback`** — expected: FAIL.
+- [ ] **Step 2: Run: `cargo test -p dash-router lan loopback`** — expected: FAIL.
 
 - [ ] **Step 3: Implement**
 
@@ -1567,12 +1567,12 @@ impl Transport for LoopbackTransport {
 
 Add `trait-variant = "0.1"` to `[dependencies]` if Task 6 has not already (see its Step 5 note).
 
-- [ ] **Step 4: Run: `cargo test -p dash-router-net`** — expected: PASS.
+- [ ] **Step 4: Run: `cargo test -p dash-router`** — expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/dash-router-net Cargo.lock
+git add crates/dash-router Cargo.lock
 git commit -m "feat(net): LAN predicate, Transport trait, in-process loopback hub"
 ```
 
@@ -1583,9 +1583,9 @@ git commit -m "feat(net): LAN predicate, Transport trait, in-process loopback hu
 The heart of the shell (spec §2–§4): a struct owning the pure `RouterState` plus both async stores, with one method per input source. Every method advances time first, runs pure transitions, and routes effects with `.await`s — the async re-implementation of `NodeMachine`'s glue (deliberate duplication; Task 11 checks they agree). The select loop (Task 10) stays thin.
 
 **Files:**
-- Create: `crates/dash-router-net/src/shell.rs` (NodeCore + `IntervalSource`)
-- Create: `crates/dash-router-net/src/handle.rs` (this task: `RouterEvent`, `StorageErrorReport`; Task 10 adds commands)
-- Modify: `crates/dash-router-net/src/lib.rs` (`pub mod handle; pub mod shell;` + re-exports)
+- Create: `crates/dash-router/src/shell.rs` (NodeCore + `IntervalSource`)
+- Create: `crates/dash-router/src/handle.rs` (this task: `RouterEvent`, `StorageErrorReport`; Task 10 adds commands)
+- Modify: `crates/dash-router/src/lib.rs` (`pub mod handle; pub mod shell;` + re-exports)
 - Modify: `crates/dash-router-core/src/node.rs` + `lib.rs` (make two helpers `pub`, add `LogRanges::remove`)
 
 **Interfaces:**
@@ -1848,7 +1848,7 @@ async fn on_wire_drops_foreign_garbage_and_echoes() {
 }
 ```
 
-- [ ] **Step 4: Run: `cargo test -p dash-router-net shell`** — expected: FAIL (nothing implemented).
+- [ ] **Step 4: Run: `cargo test -p dash-router shell`** — expected: FAIL (nothing implemented).
 
 - [ ] **Step 5: Implement `shell.rs`**
 
@@ -1959,12 +1959,12 @@ pub async fn advance_to(&mut self, now: Duration) -> anyhow::Result<Vec<Out<N, L
 
 `router_step` clones `self.router`, calls `self.machine.transition`, writes back, returns fx (same clone-based stepping as `NodeMachine`, same rationale). `flush_push` takes `pending_push`/clears `pending_since` and runs `RouterAction::Push` when non-empty. `route_fx`, `ingest_parked`, `hydrate`, `reconcile_held(touched: Option<&BTreeSet<L>>, out)` follow binding semantics #2–#4 above, transcribing `NodeMachine::route_router_fx`/`ingest_parked`/`held_union` with awaits — hydration uses the now-`pub` `group_ops`; Have parking uses the now-`pub` `ranges_of`. Reconcile's patch rule (semantics #7): per touched log, `merged = ext.held_of ∪ relay.held_of`; empty AND unsubscribed → `held_cache.remove(log)`; else `held_cache.insert(log, merged)`; full rebuild (`None`) is `held_all ∪ held_all` plus empty markers for subscriptions; both end with `RouterAction::Held(held_cache.clone())` — skipped (stale cache stands) when a read errored. `on_wire`/`on_append`/`on_subscribe`/`on_unsubscribe`/`on_hint`/`on_maintain` per binding semantics #2, #5, #6, #8 (subscribe migrates relay→ext then evicts the log from relay, as `NodeAction::Subscribe` does). Every `on_*` method starts with `advance_to(now)` and appends to its output.
 
-- [ ] **Step 6: Run: `cargo test -p dash-router-net`** — expected: PASS. Then `cargo test --workspace` — PASS.
+- [ ] **Step 6: Run: `cargo test -p dash-router`** — expected: PASS. Then `cargo test --workspace` — PASS.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/dash-router-net crates/dash-router-core
+git add crates/dash-router crates/dash-router-core
 git commit -m "feat(net): NodeCore, the async routing table with debounced push and maintenance"
 ```
 
@@ -1975,10 +1975,10 @@ git commit -m "feat(net): NodeCore, the async routing table with debounced push 
 The thin rind (spec §2's five sources, §5's API): one tokio task around `NodeCore`, a command handle, an event stream.
 
 **Files:**
-- Modify: `crates/dash-router-net/src/handle.rs` (Command, RouterHandle)
-- Modify: `crates/dash-router-net/src/shell.rs` (spawn + the loop)
-- Modify: `crates/dash-router-net/src/lib.rs` (re-export `spawn`, `RouterHandle`, `Command`)
-- Test: `crates/dash-router-net/tests/loop.rs`
+- Modify: `crates/dash-router/src/handle.rs` (Command, RouterHandle)
+- Modify: `crates/dash-router/src/shell.rs` (spawn + the loop)
+- Modify: `crates/dash-router/src/lib.rs` (re-export `spawn`, `RouterHandle`, `Command`)
+- Test: `crates/dash-router/tests/loop.rs`
 
 **Interfaces:**
 - Consumes: everything from Tasks 6–9.
@@ -2012,7 +2012,7 @@ pub fn spawn<N, L, E, R, T, I>(
 ) -> (RouterHandle<L>, mpsc::Receiver<RouterEvent<L>>, JoinHandle<anyhow::Result<()>>)
 ```
 
-- [ ] **Step 1: Write the failing e2e tests** (`crates/dash-router-net/tests/loop.rs`; both `#[tokio::test(start_paused = true)]` — virtual time auto-advances when the runtime is idle, so real seconds never pass)
+- [ ] **Step 1: Write the failing e2e tests** (`crates/dash-router/tests/loop.rs`; both `#[tokio::test(start_paused = true)]` — virtual time auto-advances when the runtime is idle, so real seconds never pass)
 
 ```rust
 //! Two real shells over the loopback transport: the whole §2 select loop,
@@ -2024,7 +2024,7 @@ use std::time::Duration;
 use dash_router_core::{Op, OpsMap, RouterConfig, Storage, Units};
 // The relay store is a plain OpsMap through the blanket sync bridge:
 // MemStore is the *watchable ext* store and implements no eviction.
-use dash_router_net::{
+use dash_router::{
     CoreConfig, LoopbackHub, MemStore, PolicyIntervals, RouterEvent, spawn,
 };
 use dash_router_policy::{IntervalPolicy, PushDebouncePolicy};
@@ -2117,7 +2117,7 @@ async fn late_joiner_repairs_via_want() {
 }
 ```
 
-- [ ] **Step 2: Run: `cargo test -p dash-router-net --test loop`** — expected: FAIL (`spawn` missing).
+- [ ] **Step 2: Run: `cargo test -p dash-router --test loop`** — expected: FAIL (`spawn` missing).
 
 - [ ] **Step 3: Implement `handle.rs` commands + `RouterHandle`** (oneshot round-trips; `shutdown` sends `Command::Shutdown` and treats a closed channel as already-down).
 
@@ -2134,12 +2134,12 @@ The loop (spec §2's five sources; each arm: compute `now = epoch.elapsed()`, ca
   5. `maintain.tick()` (a `tokio::time::interval` with `MissedTickBehavior::Delay`) → `on_maintain(now)`.
 - Routing outputs: `Out::Broadcast(msg)` → `transport.broadcast(msg.encode()).await` (a send error breaks the loop — the transport is gone); `Out::Event(e)` → `event_tx.send(e).await` ignoring a closed receiver (an embedder that dropped the stream still gets gossip).
 
-- [ ] **Step 5: Run: `cargo test -p dash-router-net`** — expected: PASS (unit + e2e). Then `cargo test --workspace`.
+- [ ] **Step 5: Run: `cargo test -p dash-router`** — expected: PASS (unit + e2e). Then `cargo test --workspace`.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/dash-router-net
+git add crates/dash-router
 git commit -m "feat(net): spawn select loop, RouterHandle, loopback end-to-end tests"
 ```
 
@@ -2154,7 +2154,7 @@ Where the deliberately duplicated routing table earns its keep (spec §8). Propt
 **Zero-debounce ruling (carried from the design):** conformance runs with `PushDebouncePolicy { window_ms: 0, max_latency_ms: 0 }`, so an `Append` step maps to the reference's atomic `NodeAction::Authored`. The debounce policy itself is pure-tested (Task 1) and e2e-tested (Task 10); lockstep checks routing equivalence, not batching.
 
 **Files:**
-- Test: `crates/dash-router-net/tests/conformance.rs`
+- Test: `crates/dash-router/tests/conformance.rs`
 
 **Interfaces:**
 - Consumes: `NodeCore` + `Scripted`-style intervals (Task 9), `NodeMachine`/`NodeState`/`NodeAction` (core), blanket sync bridge (Task 6).
@@ -2221,12 +2221,12 @@ proptest! {
 
 `step_strategy()`: `from: 1..4u32`, `log: 0..3u8`, seqs/starts `0..8u32`, `Advance(10..600ms)`, weighted roughly 3:3:2:1:1:2 across the six variants.
 
-- [ ] **Step 4: Run: `cargo test -p dash-router-net --test conformance`** — expected: PASS, ~64 cases.
+- [ ] **Step 4: Run: `cargo test -p dash-router --test conformance`** — expected: PASS, ~64 cases.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/dash-router-net
+git add crates/dash-router
 git commit -m "test(net): lockstep conformance of NodeCore against NodeMachine"
 ```
 
@@ -2237,9 +2237,9 @@ git commit -m "test(net): lockstep conformance of NodeCore against NodeMachine"
 The real transport behind the boundary (spec §6.1), compiled only under the `p2panda` feature so the default workspace stays light; then the docs closeout.
 
 **Files:**
-- Create: `crates/dash-router-net/src/panda.rs`
-- Modify: `crates/dash-router-net/Cargo.toml` (feature + optional deps)
-- Modify: `crates/dash-router-net/src/lib.rs` (`#[cfg(feature = "p2panda")] pub mod panda;`)
+- Create: `crates/dash-router/src/panda.rs`
+- Modify: `crates/dash-router/Cargo.toml` (feature + optional deps)
+- Modify: `crates/dash-router/src/lib.rs` (`#[cfg(feature = "p2panda")] pub mod panda;`)
 - Modify: `docs/superpowers/specs/2026-09-21-real-world-shell-design.md` (status + resolved decisions)
 
 **Interfaces:**
@@ -2267,14 +2267,14 @@ p2panda-core = { version = "0.7", optional = true }
 
 ```rust
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "binds real sockets and mDNS; run manually: cargo test -p dash-router-net --features p2panda -- --ignored"]
+#[ignore = "binds real sockets and mDNS; run manually: cargo test -p dash-router --features p2panda -- --ignored"]
 async fn two_panda_nodes_gossip_on_localhost() { /* two spawn_panda nodes,
     node A broadcasts a probe, node B receives it within a 30s timeout */ }
 ```
 
 - [ ] **Step 4: Build both ways**
 
-Run: `cargo build -p dash-router-net` and `cargo build -p dash-router-net --features p2panda` and `cargo clippy --workspace --all-targets` — all clean. Run the ignored smoke test once manually; if the environment blocks sockets/mDNS, note the failure mode in the commit message rather than faking it.
+Run: `cargo build -p dash-router` and `cargo build -p dash-router --features p2panda` and `cargo clippy --workspace --all-targets` — all clean. Run the ignored smoke test once manually; if the environment blocks sockets/mDNS, note the failure mode in the commit message rather than faking it.
 
 - [ ] **Step 5: Docs closeout**
 
@@ -2288,6 +2288,6 @@ Expected: all clean (run `cargo fmt --all` first if needed).
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/dash-router-net docs Cargo.lock
+git add crates/dash-router docs Cargo.lock
 git commit -m "feat(net): feature-gated p2panda transport; spec closeout"
 ```
