@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use anyhow::Result;
+use dash_router_core::router::RouterStateMachine;
 use dash_router_core::{
     Effect, LogRanges, Op, Ranges, RouterAction, RouterConfig, RouterMachine, RouterState, Seq,
     Units, WireBody, WireMessage, eviction_candidates, group_ops, ranges_of,
@@ -78,9 +79,8 @@ pub enum Out<N, L: Ord> {
 /// The shell's routing table: one owner of the pure [`RouterState`] plus
 /// both async stores. See the module doc for the deliberate-duplication
 /// rationale relative to `NodeMachine`.
-pub struct NodeCore<N: Ord, L: Ord, E, R, I> {
-    machine: RouterMachine<N, L, RealTime>,
-    pub router: RouterState<N, L, RealTime>,
+pub struct NodeCore<N: Id, L: Id, E, R, I> {
+    pub router: RouterStateMachine<N, L, RealTime>,
     pub ext: E,
     pub relay: R,
     pub subscriptions: BTreeSet<L>,
@@ -115,9 +115,11 @@ where
         relay: R,
         intervals: I,
     ) -> Self {
+        let state = RouterState::new(id, LogRanges::empty());
+        let machine = RouterMachine::new(config.router);
+        let router = RouterStateMachine::new(machine.into(), state);
         Self {
-            machine: RouterMachine::new(config.router),
-            router: RouterState::new(id, LogRanges::empty()),
+            router,
             ext,
             relay,
             subscriptions,
@@ -142,7 +144,7 @@ where
         let mut out = Vec::new();
         self.reconcile_held(None, &mut out).await?;
         let next = self.intervals.next_want();
-        self.router_step(RouterAction::ArmWantTimer(next.into()))?;
+        self.router.step(RouterAction::ArmWantTimer(next.into()))?;
         Ok(out)
     }
 
@@ -185,11 +187,11 @@ where
                 .as_ref()
                 .is_some_and(|t| t.remaining.is_zero())
             {
-                let fx = self.router_step(RouterAction::FireWant)?;
+                let fx = self.router.step(RouterAction::FireWant)?;
                 self.route_fx(fx, &BTreeMap::new(), &BTreeSet::new(), &mut out)
                     .await?;
                 let next = self.intervals.next_want();
-                self.router_step(RouterAction::ArmWantTimer(next.into()))?;
+                self.router.step(RouterAction::ArmWantTimer(next.into()))?;
                 continue;
             }
             if self
@@ -198,12 +200,12 @@ where
                 .as_ref()
                 .is_some_and(|t| t.remaining.is_zero())
             {
-                let fx = self.router_step(RouterAction::FireHave)?;
+                let fx = self.router.step(RouterAction::FireHave)?;
                 self.route_fx(fx, &BTreeMap::new(), &BTreeSet::new(), &mut out)
                     .await?;
                 if !self.router.wants.is_empty() {
                     let next = self.intervals.next_have();
-                    self.router_step(RouterAction::ArmHaveTimer(next.into()))?;
+                    self.router.step(RouterAction::ArmHaveTimer(next.into()))?;
                 }
                 continue;
             }
@@ -223,7 +225,7 @@ where
             if let Some(oldest) = self.pending_since {
                 step = step.min(self.debounce.deadline(oldest, self.latest_append) - self.now);
             }
-            self.router_step(RouterAction::Tick(step.into()))?;
+            self.router.step(RouterAction::Tick(step.into()))?;
             self.now += step;
         }
         Ok(out)
@@ -258,7 +260,7 @@ where
                 // received ranges being non-empty, mirrored exactly by the
                 // conformance driver (see tests/conformance.rs).
                 let ranges_nonempty = !ranges.is_empty();
-                let fx = self.router_step(RouterAction::RecvWant {
+                let fx = self.router.step(RouterAction::RecvWant {
                     from: msg.sender,
                     ranges,
                 })?;
@@ -269,7 +271,7 @@ where
                 // right after the Recv, in the same call.
                 if ranges_nonempty && self.router.have_timer.is_none() {
                     let next = self.intervals.next_have();
-                    self.router_step(RouterAction::ArmHaveTimer(next.into()))?;
+                    self.router.step(RouterAction::ArmHaveTimer(next.into()))?;
                 }
             }
             WireBody::Have(ops) => {
@@ -278,7 +280,7 @@ where
                     .flat_map(|(log, seqs)| seqs.into_iter().map(move |(q, o)| ((log, q), o)))
                     .collect();
                 let ranges = ranges_of(&parked);
-                let fx = self.router_step(RouterAction::RecvHave {
+                let fx = self.router.step(RouterAction::RecvHave {
                     from: msg.sender,
                     ranges,
                 })?;
@@ -424,16 +426,6 @@ where
         Ok(out)
     }
 
-    /// Clone-based stepping (same rationale as `NodeMachine`'s `*_step`
-    /// helpers): `RouterState` has no `Default`, so the sub-state is cloned
-    /// rather than taken.
-    fn router_step(&mut self, action: RouterAction<N, L, RealTime>) -> Result<Vec<Effect<L>>> {
-        let router = self.router.clone();
-        let (router, fx) = self.machine.transition(router, action)?;
-        self.router = router;
-        Ok(fx)
-    }
-
     /// Take the accumulated pending push and run it through the router, if
     /// non-empty.
     fn flush_push(&mut self) -> Result<Vec<Effect<L>>> {
@@ -442,7 +434,7 @@ where
         if ranges.is_empty() {
             Ok(Vec::new())
         } else {
-            self.router_step(RouterAction::Push(ranges))
+            self.router.step(RouterAction::Push(ranges))
         }
     }
 
@@ -593,7 +585,8 @@ where
                 self.held_cache = merged;
             }
         }
-        self.router_step(RouterAction::Held(self.held_cache.clone()))?;
+        self.router
+            .step(RouterAction::Held(self.held_cache.clone()))?;
         Ok(())
     }
 
