@@ -92,8 +92,16 @@ pub struct RouterState<N: Ord, L: Log, T> {
     /// above. An empty range for a log means the log is known but empty
     /// ("known-but-empty"): that log wants everything.
     pub held: LogRanges<L>,
-    /// Recent Wants from other nodes.
-    pub wants: BTreeMap<N, Record<L, T>>,
+    /// Recent Wants from other nodes: one record per received Want, each
+    /// with its own TTL (the `relayed_wants` mechanism, keyed by peer). A
+    /// Want may arrive split across several wire messages (the shell's
+    /// `pack_want`), and a peer's successive Wants overlap; each record
+    /// dies `want_ttl` after its own arrival, so pieces union and stale
+    /// ranges expire on their own schedule. Deliberately not one merged
+    /// record with a refreshed TTL: that would keep ranges the peer already
+    /// received alive past this node's `recent_haves` and re-send them every
+    /// cycle. A peer is present iff it has at least one live record.
+    pub wants: BTreeMap<N, Vec<Record<L, T>>>,
     /// Recent Haves from other nodes, plus this node's own last Have
     /// emission (keyed by its own id) for §3 suppression.
     pub haves: BTreeMap<N, Record<L, T>>,
@@ -153,18 +161,31 @@ impl<N: Id, L: Log, T: TimeInterval> RouterState<N, L, T> {
     }
 
     /// Union of recent Wants from other nodes, with each peer's prefix
-    /// interests expanded over what this node holds (spec §3.5).
+    /// interests expanded over what this node holds (spec §3.5). A peer's
+    /// live records are unioned *before* the prefix expansion, so a log the
+    /// peer named in one piece of a split Want is not sent wholesale because
+    /// of a prefix carried in another piece.
     pub fn others_wants(&self) -> LogRanges<L> {
-        self.wants.values().fold(LogRanges::empty(), |acc, r| {
-            acc.union(&r.ranges)
-                .union(&self.held_under(&r.prefixes, &r.ranges))
-        })
+        self.wants
+            .values()
+            .fold(LogRanges::empty(), |acc, records| {
+                let (named, prefixes) = records.iter().fold(
+                    (LogRanges::empty(), BTreeSet::new()),
+                    |(named, mut prefixes), r| {
+                        prefixes.extend(r.prefixes.iter().copied());
+                        (named.union(&r.ranges), prefixes)
+                    },
+                );
+                let wholesale = self.held_under(&prefixes, &named);
+                acc.union(&named).union(&wholesale)
+            })
     }
 
     /// Union of recent Want prefixes from other nodes.
     pub fn others_prefixes(&self) -> BTreeSet<L::Prefix> {
         self.wants
             .values()
+            .flatten()
             .flat_map(|r| r.prefixes.iter().copied())
             .collect()
     }
@@ -302,13 +323,11 @@ impl<N: Id, L: Log, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                     ensure!(dur <= timer.remaining, "tick would carry a timer past due");
                     timer.remaining = timer.remaining - dur;
                 }
-                for records in [&mut s.wants, &mut s.haves] {
-                    records.retain(|_, r| dur < r.ttl_left);
-                    for r in records.values_mut() {
-                        r.ttl_left = r.ttl_left - dur;
-                    }
+                s.haves.retain(|_, r| dur < r.ttl_left);
+                for r in s.haves.values_mut() {
+                    r.ttl_left = r.ttl_left - dur;
                 }
-                for records in [&mut s.relayed_haves, &mut s.relayed_wants] {
+                let decay = |records: &mut Vec<Record<L, T>>| {
                     records.retain_mut(|r| {
                         let alive = dur < r.ttl_left;
                         if alive {
@@ -316,6 +335,13 @@ impl<N: Id, L: Log, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                         }
                         alive
                     });
+                };
+                for records in s.wants.values_mut() {
+                    decay(records);
+                }
+                s.wants.retain(|_, records| !records.is_empty());
+                for records in [&mut s.relayed_haves, &mut s.relayed_wants] {
+                    decay(records);
                 }
             }
 
@@ -420,14 +446,12 @@ impl<N: Id, L: Log, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                         prefixes: relay_prefixes,
                     });
                 }
-                s.wants.insert(
-                    from,
-                    Record {
-                        ranges,
-                        prefixes,
-                        ttl_left: self.config.want_ttl,
-                    },
-                );
+                // Accumulate, never replace: see `RouterState::wants`.
+                s.wants.entry(from).or_default().push(Record {
+                    ranges,
+                    prefixes,
+                    ttl_left: self.config.want_ttl,
+                });
             }
 
             RouterAction::RecvHave { from, ranges } => {

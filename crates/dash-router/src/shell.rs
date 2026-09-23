@@ -1352,6 +1352,27 @@ mod tests {
         assert_eq!(c.oversize_drops, 0);
     }
 
+    /// Spec 2026-09-22 §3.3 end to end: a Want that `pack_want` splits into
+    /// several wire messages is recorded whole by the receiver — prefixes
+    /// (first piece) and every piece's ranges — not just the last piece.
+    #[tokio::test]
+    async fn split_want_is_fully_recorded_by_the_receiver() {
+        let ranges = LogRanges::from_pairs((0..200u8).map(|l| (l, Ranges::from(3))));
+        let prefixes: BTreeSet<u8> = (100..110).collect();
+        let (msgs, dropped) = crate::pack::pack_want(7u32, ranges.clone(), prefixes.clone(), 200);
+        assert_eq!(dropped, 0);
+        assert!(msgs.len() >= 3, "the Want must actually split");
+        let mut c = core(100, &[]).await;
+        for (i, msg) in msgs.into_iter().enumerate() {
+            let _ = c
+                .on_wire(Duration::from_millis(i as u64), wire(msg))
+                .await
+                .unwrap();
+        }
+        assert_eq!(c.router.others_wants(), ranges, "every piece's ranges");
+        assert_eq!(c.router.others_prefixes(), prefixes, "the prefix piece too");
+    }
+
     /// Maintenance evicts payloads nobody wants once usage crosses the line.
     #[tokio::test]
     async fn maintain_evicts_payloads_first() {
