@@ -9,6 +9,9 @@ world; the pure-world plan executes independently.
 
 ## Resolved
 
+Wire is now v1 with prefix Wants; see
+`docs/superpowers/specs/2026-09-22-dash-chat-lan-router-design.md`.
+
 All five §9 open questions were approved as drafted, user-approved
 2026-09-21:
 

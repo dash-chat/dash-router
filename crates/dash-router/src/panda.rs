@@ -1,6 +1,12 @@
 //! The real transport behind the boundary (spec §6.1): p2panda-net's gossip
 //! protocol scoped to the local-area network via active mDNS discovery.
 //!
+//! [`PandaTransport`] is the standalone transport (own p2panda stack,
+//! unsigned gossip, `author: None`). An embedder with its own p2panda node
+//! uses [`crate::transport::GossipTransport`] over its ephemeral stream
+//! instead, and the shell then checks `WireMessage::sender` against the
+//! envelope's verified author.
+//!
 //! ## Trust stance \[approved\]
 //!
 //! Wire messages carry no signatures in v1 (spec §9): the transport itself
