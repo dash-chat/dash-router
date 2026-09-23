@@ -220,6 +220,11 @@ impl Driver {
                 window_ms: 0,
                 max_latency_ms: 0,
             },
+            // Far above anything the generated steps produce (a few logs of
+            // few-byte ops), so packing never splits a broadcast here and the
+            // exact `broadcasts` comparison below stays one-to-one with the
+            // model's single Want/Have.
+            max_wire_bytes: dash_router::pack::DEFAULT_MAX_WIRE_BYTES,
         };
         let mut core = NodeCore::new(
             0u32,

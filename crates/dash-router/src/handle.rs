@@ -52,13 +52,15 @@ pub enum Command<L: Log> {
 
 /// A point-in-time read of the degrade counters a spawned node task
 /// maintains (spec §3): dropped wire messages, relay-store call failures
-/// the shell degraded from, and the relay store's own internally-swallowed
-/// errors (e.g. `DiskRelayStore::io_errors`).
+/// the shell degraded from, the relay store's own internally-swallowed
+/// errors (e.g. `DiskRelayStore::io_errors`), and items left out of a
+/// broadcast because they could not fit `CoreConfig::max_wire_bytes` alone.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StatsSnapshot {
     pub dropped_msgs: u64,
     pub relay_errors: u64,
     pub relay_store_errors: u64,
+    pub oversize_drops: u64,
 }
 
 /// The embedder's handle to a spawned node task (spec §5). Cloning shares
