@@ -18,7 +18,7 @@ use anyhow::Result;
 use dash_router_core::router::RouterStateMachine;
 use dash_router_core::{
     Effect, Log, LogRanges, Op, Ranges, RouterAction, RouterConfig, RouterMachine, RouterState,
-    Seq, Units, WireBody, WireLog, WireMessage, eviction_candidates, group_ops, ranges_of,
+    Seq, Units, WireBody, WireLog, WireMessage, eviction_candidates, ranges_of,
 };
 use dash_router_policy::{IntervalPolicy, PushDebouncePolicy};
 use polestar::prelude::*;
@@ -29,6 +29,7 @@ use tokio::task::JoinHandle;
 
 use crate::handle::{Command, RouterEvent, RouterHandle, StatsSnapshot, StorageErrorReport};
 use crate::lan::is_lan;
+use crate::pack::{pack_have, pack_want};
 use crate::storage::{AsyncEvictableStorage, AsyncStorage, WatchableStorage};
 use crate::transport::{Incoming, PeerIdentity, Transport};
 
@@ -66,6 +67,9 @@ pub struct CoreConfig {
     /// Maintenance evicts once relay usage reaches `evict_at * relay_cap`.
     pub evict_at: f64,
     pub debounce: PushDebouncePolicy,
+    /// Every broadcast is packed to encode at or under this many bytes; see
+    /// [`pack::DEFAULT_MAX_WIRE_BYTES`](crate::pack::DEFAULT_MAX_WIRE_BYTES).
+    pub max_wire_bytes: usize,
 }
 
 /// A single unit of shell output: either a wire message to broadcast, or an
@@ -94,6 +98,7 @@ pub struct NodeCore<N: Id, L: Log, E, R, I> {
     debounce: PushDebouncePolicy,
     relay_cap: Units,
     evict_at: f64,
+    max_wire_bytes: usize,
     pending_push: LogRanges<L>,
     pending_since: Option<Duration>,
     latest_append: Duration,
@@ -101,6 +106,9 @@ pub struct NodeCore<N: Id, L: Log, E, R, I> {
     now: Duration,
     pub dropped_msgs: u64,
     pub relay_errors: u64,
+    /// Items (ops, prefixes, per-log ranges) that could not fit
+    /// `max_wire_bytes` even alone and were left out of a broadcast.
+    pub oversize_drops: u64,
 }
 
 impl<N, L, E, R, I> NodeCore<N, L, E, R, I>
@@ -135,12 +143,14 @@ where
             debounce: config.debounce,
             relay_cap: config.relay_cap,
             evict_at: config.evict_at,
+            max_wire_bytes: config.max_wire_bytes,
             pending_push: LogRanges::empty(),
             pending_since: None,
             latest_append: Duration::ZERO,
             now: Duration::ZERO,
             dropped_msgs: 0,
             relay_errors: 0,
+            oversize_drops: 0,
         }
     }
 
@@ -536,14 +546,13 @@ where
                     }
                 }
                 Effect::SendWant { ranges, prefixes } => {
-                    out.push(Out::Broadcast(WireMessage::want(
-                        self.router.id,
-                        ranges,
-                        prefixes,
-                    )));
+                    let (msgs, dropped) =
+                        pack_want(self.router.id, ranges, prefixes, self.max_wire_bytes);
+                    self.oversize_drops += dropped;
+                    out.extend(msgs.into_iter().map(Out::Broadcast));
                 }
                 Effect::SendHave(r) => {
-                    if let Some(msg) = self.hydrate(&r, out).await? {
+                    for msg in self.hydrate(&r, out).await? {
                         out.push(Out::Broadcast(msg));
                     }
                 }
@@ -552,15 +561,20 @@ where
         Ok(())
     }
 
-    /// Merge relay + ext fetches into one hydrated Have, byte-for-byte the
-    /// `SendHave` arm of `route_router_fx` (binding semantics #3). Relay
-    /// errors are silent shrinkage (counted in `relay_errors`); ext errors
-    /// are reported but don't stop hydration.
+    /// Merge relay + ext fetches into hydrated Haves, mirroring the
+    /// `SendHave` arm of `route_router_fx` (binding semantics #3). Yields
+    /// one *or more* Haves (none if nothing is held): the ops are packed
+    /// under `max_wire_bytes` (spec 2026-09-22 §3.3), so the model's single
+    /// Have and the shell's split Haves carry the same ops in the same
+    /// `(log, seq)` order — save that an op too big to fit alone goes
+    /// header-only, and a header too big to fit alone is dropped (counted in
+    /// `oversize_drops`). Relay errors are silent shrinkage (counted in
+    /// `relay_errors`); ext errors are reported but don't stop hydration.
     async fn hydrate(
         &mut self,
         r: &LogRanges<L>,
         out: &mut Vec<Out<N, L>>,
-    ) -> Result<Option<WireMessage<N, L>>> {
+    ) -> Result<Vec<WireMessage<N, L>>> {
         let mut ops = match self.relay.fetch(r).await {
             Ok(v) => v,
             Err(_) => {
@@ -587,11 +601,9 @@ where
                 .then_with(|| b.2.payload.is_some().cmp(&a.2.payload.is_some()))
         });
         ops.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
-        if ops.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(WireMessage::have(self.router.id, group_ops(ops))))
-        }
+        let (msgs, dropped) = pack_have(self.router.id, ops, self.max_wire_bytes);
+        self.oversize_drops += dropped;
+        Ok(msgs)
     }
 
     /// Cheap and unconditional after any storage change (binding semantics
@@ -824,6 +836,7 @@ where
                                 dropped_msgs: core.dropped_msgs,
                                 relay_errors: core.relay_errors,
                                 relay_store_errors: core.relay.error_count(),
+                                oversize_drops: core.oversize_drops,
                             });
                         }
                     }
@@ -968,6 +981,7 @@ mod tests {
                 window_ms: 100,
                 max_latency_ms: 250,
             },
+            max_wire_bytes: 3800,
         }
     }
 
@@ -1269,6 +1283,73 @@ mod tests {
             "the have-timer's own fire hydrates and replies — the debounced push, by \
              construction, could not have produced this broadcast"
         );
+    }
+
+    /// Spec 2026-09-22 §3.3: a Have reply bigger than `max_wire_bytes` is
+    /// split into several Haves, each under budget, together carrying every
+    /// op in `(log, seq)` order.
+    #[tokio::test]
+    async fn have_reply_is_packed_under_max_wire_bytes() {
+        let mut config = config(100);
+        config.max_wire_bytes = 600;
+        config.debounce = PushDebouncePolicy {
+            window_ms: 100_000,
+            max_latency_ms: 100_000,
+        }; // the appends' own push never flushes; only the have timer replies
+        // Scripted: [0] initial Want arm, far out of reach; [1..] the Have
+        // arm on witnessing the peer's Want (fires 100ms later).
+        let mut c: Core = NodeCore::new(
+            0u32,
+            config,
+            BTreeSet::from([0u8]),
+            OpsMap::default(),
+            OpsMap::default(),
+            Scripted::ms(&[100_000, 100]),
+        );
+        c.init().await.unwrap();
+        let big = |h: u8| Op {
+            header: vec![h],
+            payload: Some(vec![h; 300]),
+        };
+        for q in 0..3u32 {
+            let _ = c
+                .on_append(Duration::from_millis(1), 0, q, big(q as u8))
+                .await
+                .unwrap();
+        }
+        let want = WireMessage::want(
+            7,
+            LogRanges::from_pairs([(0u8, Ranges::full())]),
+            BTreeSet::new(),
+        );
+        let _ = c
+            .on_wire(Duration::from_millis(10), wire(want))
+            .await
+            .unwrap();
+        let out = c.advance_to(Duration::from_millis(200)).await.unwrap();
+        let haves: Vec<_> = broadcasts(&out)
+            .into_iter()
+            .filter(|m| matches!(m.body, WireBody::Have(_)))
+            .collect();
+        assert!(
+            haves.len() >= 2,
+            "3 × ~305 bytes cannot fit one 600-byte Have"
+        );
+        let mut seen = Vec::new();
+        for m in &haves {
+            assert!(m.encode().len() <= 600, "Have over max_wire_bytes");
+            let WireBody::Have(groups) = &m.body else {
+                unreachable!()
+            };
+            for (log, seqs) in groups {
+                for (seq, op) in seqs {
+                    assert!(op.payload.is_some(), "fits alone, so sent whole");
+                    seen.push((*log, *seq));
+                }
+            }
+        }
+        assert_eq!(seen, vec![(0, 0), (0, 1), (0, 2)], "all ops, in order");
+        assert_eq!(c.oversize_drops, 0);
     }
 
     /// Maintenance evicts payloads nobody wants once usage crosses the line.

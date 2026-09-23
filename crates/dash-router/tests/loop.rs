@@ -23,6 +23,7 @@ fn config() -> CoreConfig {
             window_ms: 50,
             max_latency_ms: 200,
         },
+        max_wire_bytes: dash_router::pack::DEFAULT_MAX_WIRE_BYTES,
     }
 }
 

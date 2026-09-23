@@ -6,6 +6,7 @@ pub mod disk;
 pub mod handle;
 pub mod lan;
 pub mod mem;
+pub mod pack;
 #[cfg(feature = "p2panda")]
 pub mod panda;
 pub mod shell;
