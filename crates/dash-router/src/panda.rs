@@ -1,6 +1,12 @@
 //! The real transport behind the boundary (spec §6.1): p2panda-net's gossip
 //! protocol scoped to the local-area network via active mDNS discovery.
 //!
+//! [`PandaTransport`] is the standalone transport (own p2panda stack,
+//! unsigned gossip, `author: None`). An embedder with its own p2panda node
+//! uses [`crate::transport::GossipTransport`] over its ephemeral stream
+//! instead, and the shell then checks `WireMessage::sender` against the
+//! envelope's verified author.
+//!
 //! ## Trust stance \[approved\]
 //!
 //! Wire messages carry no signatures in v1 (spec §9): the transport itself
@@ -38,7 +44,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
-use dash_router_core::WIRE_VERSION;
+use dash_router_core::GOSSIP_TOPIC;
 use futures_util::StreamExt;
 use p2panda_core::{Hash, SigningKey, Topic, VerifyingKey};
 use p2panda_net::gossip::{GossipEvent, GossipHandle, GossipSubscription};
@@ -46,20 +52,32 @@ use p2panda_net::iroh_mdns::MdnsDiscoveryMode;
 use p2panda_net::{AddressBook, Discovery, Endpoint, Gossip, MdnsDiscovery};
 use tokio::sync::{broadcast, watch};
 
-use crate::transport::{Incoming, Transport};
+use crate::transport::{Incoming, PeerIdentity, PeerKey, Transport};
 
-/// The well-known gossip topic name for this application's wire protocol.
-/// Bump the suffix together with [`WIRE_VERSION`] on any breaking wire
-/// change -- see the compile-time reminder below.
-const TOPIC_NAME: &str = "dash-router/v0";
+impl From<VerifyingKey> for PeerKey {
+    fn from(k: VerifyingKey) -> Self {
+        PeerKey(*k.as_bytes())
+    }
+}
 
-const _: () = assert!(
-    WIRE_VERSION == 0,
-    "bump the gossip topic suffix with the wire version"
-);
+impl TryFrom<PeerKey> for VerifyingKey {
+    type Error = anyhow::Error;
+    fn try_from(k: PeerKey) -> Result<Self> {
+        VerifyingKey::from_bytes(&k.0).map_err(|e| anyhow::anyhow!("invalid peer key: {e}"))
+    }
+}
 
+impl PeerIdentity for VerifyingKey {
+    fn peer_key(&self) -> Option<PeerKey> {
+        Some((*self).into())
+    }
+}
+
+/// The overlay topic: [`GOSSIP_TOPIC`], the one name shared with every
+/// other transport of this wire version (its tie to `WIRE_VERSION` is
+/// checked at compile time next to both constants in the core).
 fn topic() -> Topic {
-    Hash::digest(TOPIC_NAME.as_bytes()).into()
+    Hash::digest(GOSSIP_TOPIC.as_bytes()).into()
 }
 
 /// A [`Transport`] backed by a real p2panda-net gossip overlay, scoped to
@@ -216,6 +234,10 @@ impl Transport for PandaTransport {
                         // The overlay membership is the LAN boundary; see
                         // module docs.
                         remote: None,
+                        // p2panda-net's gossip subscription hands us bytes,
+                        // not a verified envelope; the sender check in
+                        // `NodeCore::on_wire` is a no-op here.
+                        author: None,
                         bytes,
                     });
                 }
@@ -234,7 +256,7 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "binds real sockets and mDNS; run manually: cargo test -p dash-router-net --features p2panda -- --ignored"]
+    #[ignore = "binds real sockets and mDNS; run manually: cargo test -p dash-router --features p2panda -- --ignored"]
     async fn two_panda_nodes_gossip_on_localhost() {
         let (mut a, _a_key) = spawn_panda(SigningKey::generate())
             .await

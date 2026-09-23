@@ -2,7 +2,7 @@
 //! The router decides ranges only; hydration, storage and delivery live in
 //! the shell above it (spec §5) and are out of scope here.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use dash_router_core::{
     Effect, LogRanges, Ranges, RouterAction as A, RouterConfig, RouterMachine, RouterState,
@@ -45,16 +45,16 @@ fn disabled(m: &Router, s: &State, action: A<N, L, T>) {
     );
 }
 
-fn sends_want(fx: &[Effect<L>]) -> Vec<&LogRanges<L>> {
+fn sends_want(fx: &[Effect<N, L>]) -> Vec<&LogRanges<L>> {
     fx.iter()
         .filter_map(|e| match e {
-            Effect::SendWant(r) => Some(r),
+            Effect::SendWant { ranges, .. } => Some(ranges),
             _ => None,
         })
         .collect()
 }
 
-fn sends_have(fx: &[Effect<L>]) -> Vec<&LogRanges<L>> {
+fn sends_have(fx: &[Effect<N, L>]) -> Vec<&LogRanges<L>> {
     fx.iter()
         .filter_map(|e| match e {
             Effect::SendHave(r) => Some(r),
@@ -75,7 +75,9 @@ fn a_want_floods_once_per_hop_and_never_echoes() {
     let fx = b
         .step(A::RecvWant {
             from: n(0),
+            origin: n(0),
             ranges: full.clone(),
+            prefixes: BTreeSet::new(),
         })
         .unwrap();
     assert_eq!(sends_want(&fx), vec![&full]);
@@ -84,7 +86,9 @@ fn a_want_floods_once_per_hop_and_never_echoes() {
     let fx = b
         .step(A::RecvWant {
             from: n(0),
+            origin: n(0),
             ranges: full.clone(),
+            prefixes: BTreeSet::new(),
         })
         .unwrap();
     assert!(
@@ -97,7 +101,9 @@ fn a_want_floods_once_per_hop_and_never_echoes() {
     let fx = b
         .step(A::RecvWant {
             from: n(0),
+            origin: n(0),
             ranges: full.clone(),
+            prefixes: BTreeSet::new(),
         })
         .unwrap();
     assert_eq!(sends_want(&fx), vec![&full], "relays again after expiry");
@@ -247,7 +253,9 @@ fn want_then_have_backfills_a_late_subscriber() {
 
     a.step(A::RecvWant {
         from: n(1),
+        origin: n(1),
         ranges: lr([(0, Ranges::full())]),
+        prefixes: BTreeSet::new(),
     })
     .unwrap();
     a.step(A::ArmHaveTimer(t(0))).unwrap();
@@ -277,4 +285,395 @@ fn want_timer_follows_the_fetch_timed_idiom() {
     let fx = a.step(A::FireWant).unwrap();
     assert_eq!(sends_want(&fx), vec![&lr([(0, Ranges::from(2))])]);
     assert!(a.want_timer.is_none(), "must re-arm explicitly");
+}
+
+mod prefix {
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    use dash_router_core::{
+        Effect, LogRanges, Pair, Ranges, RouterAction, RouterConfig, RouterMachine, RouterState,
+    };
+    use polestar::prelude::*;
+    use polestar::time::RealTime;
+
+    type M = RouterMachine<u32, Pair, RealTime>;
+    type A = RouterAction<u32, Pair, RealTime>;
+
+    fn machine() -> M {
+        RouterMachine::new(RouterConfig {
+            want_ttl: Duration::from_millis(500).into(),
+            have_ttl: Duration::from_millis(500).into(),
+        })
+    }
+
+    fn held(pairs: &[(Pair, Ranges)]) -> LogRanges<Pair> {
+        LogRanges::from_pairs(pairs.iter().cloned())
+    }
+
+    fn sent_have(fx: &[Effect<u32, Pair>]) -> Option<LogRanges<Pair>> {
+        fx.iter().find_map(|e| match e {
+            Effect::SendHave(r) => Some(r.clone()),
+            _ => None,
+        })
+    }
+
+    fn sent_want(fx: &[Effect<u32, Pair>]) -> Option<(LogRanges<Pair>, BTreeSet<u8>)> {
+        fx.iter().find_map(|e| match e {
+            Effect::SendWant {
+                ranges, prefixes, ..
+            } => Some((ranges.clone(), prefixes.clone())),
+            _ => None,
+        })
+    }
+
+    /// Spec §3.5: a prefix Want is answered with every held log under the
+    /// prefix that the wanter did not name explicitly; a log it named gets
+    /// only its named ranges.
+    #[test]
+    fn prefix_want_excludes_logs_the_wanter_named() {
+        let m = machine();
+        let a1 = Pair::new(1, 1);
+        let a2 = Pair::new(1, 2);
+        let other = Pair::new(2, 1);
+        let s = RouterState::new(
+            0u32,
+            held(&[
+                (a1, Ranges::range(0, 10)),
+                (a2, Ranges::range(0, 5)),
+                (other, Ranges::range(0, 3)),
+            ]),
+        );
+        // Peer 7 holds a1 up to 4 and wants its tail; knows nothing else under prefix 1.
+        let (s, _) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 7,
+                    origin: 7,
+                    ranges: held(&[(a1, Ranges::from(4))]),
+                    prefixes: BTreeSet::from([1u8]),
+                },
+            )
+            .unwrap();
+        let (s, _) = m
+            .transition(s, A::ArmHaveTimer(Duration::ZERO.into()))
+            .unwrap();
+        let (_, fx) = m.transition(s, A::FireHave).unwrap();
+        let have = sent_have(&fx).expect("a Have is sent");
+        assert_eq!(
+            have.get(&a1),
+            Some(&Ranges::range(4, 10)),
+            "named log: only the named tail"
+        );
+        assert_eq!(
+            have.get(&a2),
+            Some(&Ranges::range(0, 5)),
+            "unnamed log under prefix: wholesale"
+        );
+        assert_eq!(have.get(&other), None, "other prefix: untouched");
+    }
+
+    /// `Open` prefixes ride on every own Want even when no ranges are wanted.
+    #[test]
+    fn open_prefixes_are_sent_with_fire_want() {
+        let m = machine();
+        let s = RouterState::new(0u32, LogRanges::empty());
+        let (s, _) = m
+            .transition(s, A::Open(BTreeSet::from([4u8, 5u8])))
+            .unwrap();
+        let (s, _) = m
+            .transition(s, A::ArmWantTimer(Duration::ZERO.into()))
+            .unwrap();
+        let (_, fx) = m.transition(s, A::FireWant).unwrap();
+        let (ranges, prefixes) = sent_want(&fx).expect("a Want is sent");
+        assert!(ranges.is_empty());
+        assert_eq!(prefixes, BTreeSet::from([4u8, 5u8]));
+    }
+
+    /// A received Want's prefixes are relayed once (seen-set), like ranges.
+    #[test]
+    fn received_prefixes_are_relayed_once() {
+        let m = machine();
+        let s = RouterState::new(0u32, LogRanges::empty());
+        let want = |from| A::RecvWant {
+            from,
+            origin: from,
+            ranges: LogRanges::empty(),
+            prefixes: BTreeSet::from([9u8]),
+        };
+        let (s, fx1) = m.transition(s, want(1)).unwrap();
+        assert_eq!(sent_want(&fx1).map(|(_, p)| p), Some(BTreeSet::from([9u8])));
+        let (_, fx2) = m.transition(s, want(2)).unwrap();
+        assert!(sent_want(&fx2).is_none(), "already relayed within want_ttl");
+    }
+
+    /// Eviction policy input: logs under a peer's wanted prefix count as wanted.
+    #[test]
+    fn others_wants_includes_held_logs_under_wanted_prefixes() {
+        let m = machine();
+        let a1 = Pair::new(1, 1);
+        let s = RouterState::new(0u32, held(&[(a1, Ranges::range(0, 10))]));
+        let (s, _) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 7,
+                    origin: 7,
+                    ranges: LogRanges::empty(),
+                    prefixes: BTreeSet::from([1u8]),
+                },
+            )
+            .unwrap();
+        assert_eq!(s.others_wants().get(&a1), Some(&Ranges::range(0, 10)));
+    }
+
+    /// Spec §3.5: a log this node knows under its own open prefix stays
+    /// named in its Want even when a peer already wants the same ranges,
+    /// or answerers would treat it as unnamed and send it wholesale. Logs
+    /// under other prefixes are still suppressed as before.
+    #[test]
+    fn logs_under_own_open_prefix_stay_named_when_suppressed() {
+        let m = machine();
+        let a1 = Pair::new(1, 1);
+        let b1 = Pair::new(2, 1);
+        let s = RouterState::new(
+            0u32,
+            held(&[(a1, Ranges::range(0, 4)), (b1, Ranges::range(0, 4))]),
+        );
+        let (s, _) = m.transition(s, A::Open(BTreeSet::from([1u8]))).unwrap();
+        // Peer Y already wants both open tails, with no prefixes.
+        let (s, _) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 7,
+                    origin: 7,
+                    ranges: held(&[(a1, Ranges::from(4)), (b1, Ranges::from(4))]),
+                    prefixes: BTreeSet::new(),
+                },
+            )
+            .unwrap();
+        let (s, _) = m
+            .transition(s, A::ArmWantTimer(Duration::ZERO.into()))
+            .unwrap();
+        let (_, fx) = m.transition(s, A::FireWant).unwrap();
+        let (ranges, prefixes) = sent_want(&fx).expect("a Want is sent");
+        assert_eq!(prefixes, BTreeSet::from([1u8]));
+        assert_eq!(
+            ranges.get(&a1),
+            Some(&Ranges::from(4)),
+            "log under own open prefix stays named"
+        );
+        assert_eq!(
+            ranges.get(&b1),
+            None,
+            "log under another prefix is suppressed"
+        );
+    }
+
+    /// A relayed prefix Want keeps the wanter's named ranges, even ranges
+    /// this relayer already relayed for someone else, so a two-hop
+    /// answerer never sends a named log wholesale.
+    #[test]
+    fn relayed_prefixes_carry_the_wanters_named_ranges() {
+        let m = machine();
+        let a1 = Pair::new(1, 1);
+        let s = RouterState::new(0u32, LogRanges::empty());
+        let tail = || held(&[(a1, Ranges::from(4))]);
+        // Y's Want for a1's tail is relayed first.
+        let (s, fx) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 1,
+                    origin: 1,
+                    ranges: tail(),
+                    prefixes: BTreeSet::new(),
+                },
+            )
+            .unwrap();
+        assert!(sent_want(&fx).is_some(), "Y's Want is relayed");
+        // X names the same tail and adds prefix 1.
+        let (s, fx) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 2,
+                    origin: 2,
+                    ranges: tail(),
+                    prefixes: BTreeSet::from([1u8]),
+                },
+            )
+            .unwrap();
+        let (ranges, prefixes) = sent_want(&fx).expect("X's Want is relayed");
+        assert_eq!(prefixes, BTreeSet::from([1u8]));
+        assert_eq!(
+            ranges.get(&a1),
+            Some(&Ranges::from(4)),
+            "named ranges travel with the prefixes"
+        );
+        // Z repeats X's Want: both halves already relayed.
+        let (_, fx) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 3,
+                    origin: 3,
+                    ranges: tail(),
+                    prefixes: BTreeSet::from([1u8]),
+                },
+            )
+            .unwrap();
+        assert!(sent_want(&fx).is_none(), "already relayed within want_ttl");
+    }
+
+    fn ms(n: u64) -> RealTime {
+        Duration::from_millis(n).into()
+    }
+
+    /// A Want split across wire messages (the shell's `pack_want` puts
+    /// prefixes and ranges in different pieces) is recorded whole: the
+    /// pieces union, and a log named in one piece is still answered by name,
+    /// not wholesale, even though another piece carries its prefix.
+    #[test]
+    fn split_wants_from_one_peer_accumulate() {
+        let m = machine();
+        let a1 = Pair::new(1, 1);
+        let b1 = Pair::new(1, 2);
+        let s = RouterState::new(
+            0u32,
+            held(&[(a1, Ranges::range(0, 10)), (b1, Ranges::range(0, 10))]),
+        );
+        let (s, _) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 7,
+                    origin: 7,
+                    ranges: held(&[(a1, Ranges::from(5))]),
+                    prefixes: BTreeSet::new(),
+                },
+            )
+            .unwrap();
+        let (s, _) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 7,
+                    origin: 7,
+                    ranges: LogRanges::empty(),
+                    prefixes: BTreeSet::from([1u8]),
+                },
+            )
+            .unwrap();
+        let have = s.next_have();
+        assert_eq!(
+            have.get(&a1),
+            Some(&Ranges::range(5, 10)),
+            "named in one piece: only the named tail, not wholesale"
+        );
+        assert_eq!(
+            have.get(&b1),
+            Some(&Ranges::range(0, 10)),
+            "unnamed under the other piece's prefix: wholesale"
+        );
+        let (s, _) = m.transition(s, A::Tick(ms(501))).unwrap();
+        assert!(s.wants.is_empty(), "every piece expires after want_ttl");
+    }
+
+    /// Final review F1: an answerer's own Want, echoed back by a relay,
+    /// must not name logs on anyone else's behalf. C (id 2) holds two logs
+    /// under prefix 1; A (id 0) wants the prefix knowing nothing, via relay
+    /// B (id 1). B also relays C's own Want back to C. The echo carries
+    /// C's named tails; were it filed with A's interest, C would treat
+    /// both logs as named and answer only the (unheld) tails, never the
+    /// logs wholesale.
+    #[test]
+    fn own_echoed_want_does_not_name_logs_for_others() {
+        let m = machine();
+        let (a, b, c) = (0u32, 1u32, 2u32);
+        let x = Pair::new(1, 1);
+        let y = Pair::new(1, 2);
+        let s = RouterState::new(
+            c,
+            held(&[(x, Ranges::range(0, 4)), (y, Ranges::range(0, 3))]),
+        );
+        let (s, _) = m.transition(s, A::Open(BTreeSet::from([1u8]))).unwrap();
+        let (s, _) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: b,
+                    origin: a,
+                    ranges: LogRanges::empty(),
+                    prefixes: BTreeSet::from([1u8]),
+                },
+            )
+            .unwrap();
+        // C's own Want, relayed back by B.
+        let (s, _) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: b,
+                    origin: c,
+                    ranges: held(&[(x, Ranges::from(4)), (y, Ranges::from(3))]),
+                    prefixes: BTreeSet::from([1u8]),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            s.next_have(),
+            held(&[(x, Ranges::range(0, 4)), (y, Ranges::range(0, 3))]),
+            "both logs go wholesale to the prefix wanter"
+        );
+        assert!(
+            !s.wants.contains_key(&c),
+            "an echo of this node's own Want is recorded under no key"
+        );
+        assert!(s.wants.contains_key(&a), "A's Want is keyed by its origin");
+        assert!(!s.wants.contains_key(&b), "never by the relayer");
+    }
+
+    /// Each received Want dies `want_ttl` after its own arrival, so a stale
+    /// piece falls out while a later one from the same peer lives on.
+    #[test]
+    fn stale_want_pieces_expire_independently() {
+        let m = machine();
+        let a1 = Pair::new(1, 1);
+        let s = RouterState::new(0u32, LogRanges::empty());
+        let (s, _) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 7,
+                    origin: 7,
+                    ranges: held(&[(a1, Ranges::from(5))]),
+                    prefixes: BTreeSet::new(),
+                },
+            )
+            .unwrap();
+        let (s, _) = m.transition(s, A::Tick(ms(250))).unwrap();
+        let (s, _) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 7,
+                    origin: 7,
+                    ranges: held(&[(a1, Ranges::from(8))]),
+                    prefixes: BTreeSet::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(s.wants[&7].len(), 2, "both pieces live");
+        assert_eq!(s.others_wants().get(&a1), Some(&Ranges::from(5)));
+        let (s, _) = m.transition(s, A::Tick(ms(260))).unwrap();
+        assert_eq!(s.wants[&7].len(), 1, "the first piece expired");
+        assert_eq!(
+            s.others_wants().get(&a1),
+            Some(&Ranges::from(8)),
+            "only the later piece remains"
+        );
+    }
 }

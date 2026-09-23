@@ -33,7 +33,7 @@ const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ops");
 /// bytes redb hands back from disk: a key shorter than `WIDTH` is a
 /// malformed row (corruption, a foreign writer, a truncated file), not a
 /// programmer error, and trait methods here never panic on that — see
-/// [`row_seq`] and the fix-round-2 note on [`DiskRelayStore`].
+/// `row_seq` and the fix-round-2 note on [`DiskRelayStore`].
 pub trait LogKey: Ord + Clone {
     const WIDTH: usize;
     fn write_key(&self, out: &mut Vec<u8>);
@@ -49,6 +49,20 @@ impl LogKey for [u8; 32] {
 
     fn read_key(bytes: &[u8]) -> Option<Self> {
         bytes.get(..32)?.try_into().ok()
+    }
+}
+
+/// Two 32-byte halves (Dash Chat: `LogId ++ author`), prefix first so a
+/// prefix's logs are one contiguous key range.
+impl LogKey for [u8; 64] {
+    const WIDTH: usize = 64;
+
+    fn write_key(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self);
+    }
+
+    fn read_key(bytes: &[u8]) -> Option<Self> {
+        bytes.get(..64)?.try_into().ok()
     }
 }
 
@@ -119,7 +133,7 @@ fn set_log_entry<L: LogKey>(map: &mut LogRanges<L>, log: &L, ranges: Ranges) {
     }
 }
 
-/// The relay's disk cache: a redb-backed [`AsyncEvictableStorage`].
+/// The relay's disk cache: a redb-backed [`AsyncEvictableStorage`](crate::AsyncEvictableStorage).
 ///
 /// Spec §3: relay-store errors are indistinguishable from sheds/evictions —
 /// a transient disk hiccup must not kill the node task. So every fallible
@@ -138,8 +152,8 @@ fn set_log_entry<L: LogKey>(map: &mut LogRanges<L>, log: &L, ranges: Ranges) {
 /// treats un-advertised data as absent and repairs it through the normal
 /// want/have cycle or the next reopen's full scan; over-reporting would
 /// promise data a `fetch` can't actually produce. This is why a failed
-/// [`Self::rebuild_log`] after a *committed* evict drops that log from the
-/// cache entirely (see [`Self::drop_log_from_cache`]) rather than leaving
+/// `Self::rebuild_log` after a *committed* evict drops that log from the
+/// cache entirely (see `Self::drop_log_from_cache`) rather than leaving
 /// the pre-eviction entries in place.
 pub struct DiskRelayStore<L: LogKey> {
     db: Database,
@@ -916,6 +930,12 @@ mod tests {
         assert_eq!(<u32 as LogKey>::read_key(&[1, 2]), None);
         assert_eq!(<[u8; 32] as LogKey>::read_key(&[1, 2]), None);
         assert_eq!(<u8 as LogKey>::read_key(&[]), None);
+        let k64 = [0xABu8; 64];
+        let mut b = Vec::new();
+        k64.write_key(&mut b);
+        assert_eq!(b.len(), <[u8; 64] as LogKey>::WIDTH);
+        assert_eq!(<[u8; 64] as LogKey>::read_key(&b), Some(k64));
+        assert_eq!(<[u8; 64] as LogKey>::read_key(&b[..63]), None);
     }
 
     /// A tiny op-log for the proptest, run against both the disk store and

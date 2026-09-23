@@ -323,7 +323,7 @@ impl SimBehavior {
         }
         for flight in new {
             match &flight.message.body {
-                WireBody::Want(_) => self.metrics.want_msgs += 1,
+                WireBody::Want { .. } => self.metrics.want_msgs += 1,
                 WireBody::Have(_) => self.metrics.have_msgs += 1,
             }
             if matches!(flight.message.body, WireBody::Have(_))
@@ -415,7 +415,11 @@ impl Behavior for SimBehavior {
                     .binary_search(&flight)
                     .map_err(|_| anyhow::anyhow!("scheduled flight not in flight: {flight:?}"))?;
                 let to = flight.to;
-                let is_want = matches!(flight.message.body, WireBody::Want(_));
+                let is_want = matches!(flight.message.body, WireBody::Want { .. });
+                // An echo of `to`'s own Want is not recorded, so it
+                // witnesses nothing and must not arm the Have timer.
+                let foreign_want =
+                    matches!(flight.message.body, WireBody::Want { origin, .. } if origin != to);
                 let held_before = state.node(&to).router.held.clone();
                 let origin = self.flight_origins.remove(&flight);
                 self.advance(state, to, &mut actions);
@@ -428,7 +432,7 @@ impl Behavior for SimBehavior {
                 });
                 // A witnessed Want is what makes arming the Have timer
                 // legal; do it in the same tick, right after the Recv.
-                if is_want && state.node(&to).router.have_timer.is_none() {
+                if foreign_want && state.node(&to).router.have_timer.is_none() {
                     self.arm_have(to, &mut actions);
                 }
             }
@@ -486,6 +490,7 @@ impl Behavior for SimBehavior {
                                 .router
                                 .wants
                                 .values()
+                                .flatten()
                                 .any(|r| dt < *r.ttl_left);
                             if wants_survive {
                                 self.arm_have(n, &mut actions);

@@ -6,6 +6,7 @@ pub mod disk;
 pub mod handle;
 pub mod lan;
 pub mod mem;
+pub mod pack;
 #[cfg(feature = "p2panda")]
 pub mod panda;
 pub mod shell;
@@ -18,4 +19,16 @@ pub use lan::is_lan;
 pub use mem::MemStore;
 pub use shell::{CoreConfig, IntervalSource, NodeCore, Out, PolicyIntervals, spawn};
 pub use storage::{AsyncEvictableStorage, AsyncStorage, WatchableStorage};
-pub use transport::{Incoming, LoopbackHub, LoopbackTransport, Transport};
+pub use transport::{
+    GossipPublisher, GossipSubscription, GossipTransport, Incoming, LoopbackHub, LoopbackTransport,
+    PeerIdentity, PeerKey, Transport,
+};
+
+/// The gossip topic name every transport of this wire version shares;
+/// embedders running their own overlay derive their topic from it.
+pub use dash_router_core::{GOSSIP_TOPIC, WIRE_VERSION};
+
+/// The pure protocol core, re-exported so an embedder depends on one crate.
+pub use dash_router_core as core;
+/// The interval/debounce policies, likewise.
+pub use dash_router_policy as policy;
