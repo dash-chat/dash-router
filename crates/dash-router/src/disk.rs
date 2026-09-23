@@ -52,6 +52,20 @@ impl LogKey for [u8; 32] {
     }
 }
 
+/// Two 32-byte halves (Dash Chat: `LogId ++ author`), prefix first so a
+/// prefix's logs are one contiguous key range.
+impl LogKey for [u8; 64] {
+    const WIDTH: usize = 64;
+
+    fn write_key(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self);
+    }
+
+    fn read_key(bytes: &[u8]) -> Option<Self> {
+        bytes.get(..64)?.try_into().ok()
+    }
+}
+
 impl LogKey for u32 {
     const WIDTH: usize = 4;
 
@@ -916,6 +930,12 @@ mod tests {
         assert_eq!(<u32 as LogKey>::read_key(&[1, 2]), None);
         assert_eq!(<[u8; 32] as LogKey>::read_key(&[1, 2]), None);
         assert_eq!(<u8 as LogKey>::read_key(&[]), None);
+        let k64 = [0xABu8; 64];
+        let mut b = Vec::new();
+        k64.write_key(&mut b);
+        assert_eq!(b.len(), <[u8; 64] as LogKey>::WIDTH);
+        assert_eq!(<[u8; 64] as LogKey>::read_key(&b), Some(k64));
+        assert_eq!(<[u8; 64] as LogKey>::read_key(&b[..63]), None);
     }
 
     /// A tiny op-log for the proptest, run against both the disk store and
