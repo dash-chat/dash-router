@@ -44,7 +44,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
-use dash_router_core::WIRE_VERSION;
+use dash_router_core::GOSSIP_TOPIC;
 use futures_util::StreamExt;
 use p2panda_core::{Hash, SigningKey, Topic, VerifyingKey};
 use p2panda_net::gossip::{GossipEvent, GossipHandle, GossipSubscription};
@@ -73,18 +73,11 @@ impl PeerIdentity for VerifyingKey {
     }
 }
 
-/// The well-known gossip topic name for this application's wire protocol.
-/// Bump the suffix together with [`WIRE_VERSION`] on any breaking wire
-/// change -- see the compile-time reminder below.
-const TOPIC_NAME: &str = "dash-router/v1";
-
-const _: () = assert!(
-    WIRE_VERSION == 1,
-    "bump the gossip topic suffix with the wire version"
-);
-
+/// The overlay topic: [`GOSSIP_TOPIC`], the one name shared with every
+/// other transport of this wire version (its tie to `WIRE_VERSION` is
+/// checked at compile time next to both constants in the core).
 fn topic() -> Topic {
-    Hash::digest(TOPIC_NAME.as_bytes()).into()
+    Hash::digest(GOSSIP_TOPIC.as_bytes()).into()
 }
 
 /// A [`Transport`] backed by a real p2panda-net gossip overlay, scoped to

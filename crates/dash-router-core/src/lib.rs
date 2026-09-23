@@ -17,4 +17,4 @@ pub use storage::{
     EvictableStorage, ExtStoreAction, ExtStoreMachine, ExtStoreState, OpsMap, RelayStoreAction,
     RelayStoreMachine, RelayStoreState, Storage, StoreEffect, Units,
 };
-pub use wire::{WIRE_VERSION, WireBody, WireMessage};
+pub use wire::{GOSSIP_TOPIC, WIRE_VERSION, WireBody, WireMessage};

@@ -24,6 +24,10 @@ pub use transport::{
     PeerIdentity, PeerKey, Transport,
 };
 
+/// The gossip topic name every transport of this wire version shares;
+/// embedders running their own overlay derive their topic from it.
+pub use dash_router_core::{GOSSIP_TOPIC, WIRE_VERSION};
+
 /// The pure protocol core, re-exported so an embedder depends on one crate.
 pub use dash_router_core as core;
 /// The interval/debounce policies, likewise.

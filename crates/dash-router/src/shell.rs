@@ -758,6 +758,14 @@ where
 /// The thin rind (spec §2, §5): one tokio task running [`NodeCore`] behind
 /// a [`RouterHandle`] and an event stream, wired to a real [`Transport`].
 ///
+/// `subscriptions` are the prefixes subscribed from the start. Unlike
+/// [`RouterHandle::subscribe`], they do not migrate: relay logs already on
+/// disk under those prefixes (parked while the node was not subscribed)
+/// stay in the relay store and are not delivered or moved to `ext`. Only
+/// `RouterHandle::subscribe` migrates relay-held logs under its prefix; an
+/// embedder that wants them migrated subscribes through the handle after
+/// spawning.
+///
 /// `hints = ext.changed()` is taken before `ext` moves into the `NodeCore`
 /// (the core's stored sender keeps the broadcast channel alive, so `hints`
 /// never sees `Closed` while the task runs).

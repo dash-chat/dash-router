@@ -103,10 +103,12 @@ pub struct RouterState<N: Ord, L: Log, T> {
     /// split across several wire messages (the shell's `pack_want`), and a
     /// node's successive Wants overlap; each record dies `want_ttl` after
     /// its own arrival, so pieces union and stale ranges expire on their
-    /// own schedule. A stale record can still
-    /// trigger one bounded re-send if this node's own `haves` entry was
-    /// replaced by a Push in the meantime; it dies within `want_ttl`. A
-    /// peer is present iff it has at least one live record.
+    /// own schedule. A stale record can trigger a re-send each time this
+    /// node's own `haves` entry (or a relayer's) is replaced within
+    /// `want_ttl`, because `haves` keeps one record per node — the
+    /// replacement drops the ranges the earlier entry suppressed; bounded
+    /// by `want_ttl`, when the stale record dies. A wanter is present iff
+    /// it has at least one live record.
     pub wants: BTreeMap<N, Vec<Record<L, T>>>,
     /// Recent Haves from other nodes, plus this node's own last Have
     /// emission (keyed by its own id) for §3 suppression.
