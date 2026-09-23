@@ -4,10 +4,10 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use dash_router_core::{Op, OpsMap, RouterConfig, Storage, Units};
+use dash_router_core::{Op, OpsMap, Pair, RouterConfig, Storage, Units, WireMessage};
 // The relay store is a plain OpsMap through the blanket sync bridge:
 // MemStore is the *watchable ext* store and implements no eviction.
-use dash_router::{CoreConfig, LoopbackHub, MemStore, PolicyIntervals, RouterEvent, spawn};
+use dash_router::{CoreConfig, LoopbackHub, MemStore, PolicyIntervals, RouterEvent, Transport, spawn};
 use dash_router_policy::{IntervalPolicy, PushDebouncePolicy};
 use rand::SeedableRng;
 
@@ -251,4 +251,64 @@ async fn late_joiner_under_prefix_is_served_before_want_ttl() {
             }
         }
     }
+}
+
+/// A Have from a peer for a log nobody subscribes parks in the relay, and
+/// `relay_held` reports it.
+#[tokio::test]
+async fn relay_held_reports_parked_ops() {
+    let hub = LoopbackHub::new();
+    let (handle, _events, task) = spawn(
+        1u32,
+        config(),
+        Duration::from_secs(1),
+        BTreeSet::new(),
+        MemStore::<Pair>::new(),
+        OpsMap::<Pair>::default(),
+        hub.join("192.168.0.1".parse().unwrap()),
+        intervals(1),
+    );
+    let mut peer = hub.join("192.168.0.9".parse().unwrap());
+    let log = Pair::new(1, 1);
+    let op = Op {
+        header: vec![1],
+        payload: Some(vec![9; 16]),
+    };
+    peer.broadcast(WireMessage::have(7u32, vec![(log, vec![(0, op)])]).encode())
+        .await
+        .unwrap();
+    let held = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let held = handle.relay_held().await.unwrap();
+            if !held.is_empty() {
+                return held;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the relay holds the parked op");
+    assert!(held.contains(&log, 0));
+    handle.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+}
+
+/// Review focus 3: a read on a finished task errors instead of hanging.
+#[tokio::test]
+async fn relay_held_errors_after_shutdown() {
+    let hub = LoopbackHub::new();
+    let (handle, _events, task) = spawn(
+        1u32,
+        config(),
+        Duration::from_secs(1),
+        BTreeSet::new(),
+        MemStore::<Pair>::new(),
+        OpsMap::<Pair>::default(),
+        hub.join("192.168.0.1".parse().unwrap()),
+        intervals(1),
+    );
+    handle.clone().shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), handle.relay_held()).await;
+    assert!(matches!(result, Ok(Err(_))), "errors, does not hang: {result:?}");
 }
