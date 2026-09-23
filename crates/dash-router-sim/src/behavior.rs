@@ -486,6 +486,7 @@ impl Behavior for SimBehavior {
                                 .router
                                 .wants
                                 .values()
+                                .flatten()
                                 .any(|r| dt < *r.ttl_left);
                             if wants_survive {
                                 self.arm_have(n, &mut actions);

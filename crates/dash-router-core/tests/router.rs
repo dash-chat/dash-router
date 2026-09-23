@@ -514,4 +514,95 @@ mod prefix {
             .unwrap();
         assert!(sent_want(&fx).is_none(), "already relayed within want_ttl");
     }
+
+    fn ms(n: u64) -> RealTime {
+        Duration::from_millis(n).into()
+    }
+
+    /// A Want split across wire messages (the shell's `pack_want` puts
+    /// prefixes and ranges in different pieces) is recorded whole: the
+    /// pieces union, and a log named in one piece is still answered by name,
+    /// not wholesale, even though another piece carries its prefix.
+    #[test]
+    fn split_wants_from_one_peer_accumulate() {
+        let m = machine();
+        let a1 = Pair::new(1, 1);
+        let b1 = Pair::new(1, 2);
+        let s = RouterState::new(
+            0u32,
+            held(&[(a1, Ranges::range(0, 10)), (b1, Ranges::range(0, 10))]),
+        );
+        let (s, _) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 7,
+                    ranges: held(&[(a1, Ranges::from(5))]),
+                    prefixes: BTreeSet::new(),
+                },
+            )
+            .unwrap();
+        let (s, _) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 7,
+                    ranges: LogRanges::empty(),
+                    prefixes: BTreeSet::from([1u8]),
+                },
+            )
+            .unwrap();
+        let have = s.next_have();
+        assert_eq!(
+            have.get(&a1),
+            Some(&Ranges::range(5, 10)),
+            "named in one piece: only the named tail, not wholesale"
+        );
+        assert_eq!(
+            have.get(&b1),
+            Some(&Ranges::range(0, 10)),
+            "unnamed under the other piece's prefix: wholesale"
+        );
+        let (s, _) = m.transition(s, A::Tick(ms(501))).unwrap();
+        assert!(s.wants.is_empty(), "every piece expires after want_ttl");
+    }
+
+    /// Each received Want dies `want_ttl` after its own arrival, so a stale
+    /// piece falls out while a later one from the same peer lives on.
+    #[test]
+    fn stale_want_pieces_expire_independently() {
+        let m = machine();
+        let a1 = Pair::new(1, 1);
+        let s = RouterState::new(0u32, LogRanges::empty());
+        let (s, _) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 7,
+                    ranges: held(&[(a1, Ranges::from(5))]),
+                    prefixes: BTreeSet::new(),
+                },
+            )
+            .unwrap();
+        let (s, _) = m.transition(s, A::Tick(ms(250))).unwrap();
+        let (s, _) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 7,
+                    ranges: held(&[(a1, Ranges::from(8))]),
+                    prefixes: BTreeSet::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(s.wants[&7].len(), 2, "both pieces live");
+        assert_eq!(s.others_wants().get(&a1), Some(&Ranges::from(5)));
+        let (s, _) = m.transition(s, A::Tick(ms(260))).unwrap();
+        assert_eq!(s.wants[&7].len(), 1, "the first piece expired");
+        assert_eq!(
+            s.others_wants().get(&a1),
+            Some(&Ranges::from(8)),
+            "only the later piece remains"
+        );
+    }
 }
