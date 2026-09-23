@@ -70,8 +70,12 @@ where
 /// unknown-author subscription rides on), then one log's ranges at a
 /// time. A single log whose ranges alone exceed the budget is dropped
 /// and counted; the next Want cycle retries with whatever changed.
+/// Every piece is signed by `sender` and carries `origin` (the router's
+/// `Effect::SendWant` origin: `sender` for an own Want, the wanter for a
+/// relay), so the receiver files all pieces under one wanter.
 pub fn pack_want<N, L>(
     sender: N,
+    origin: N,
     ranges: LogRanges<L>,
     prefixes: BTreeSet<L::Prefix>,
     budget: usize,
@@ -85,7 +89,7 @@ where
     let mut cur_ranges: LogRanges<L> = LogRanges::empty();
     let mut cur_prefixes: BTreeSet<L::Prefix> = BTreeSet::new();
     let len = |r: &LogRanges<L>, p: &BTreeSet<L::Prefix>| {
-        WireMessage::want(sender, r.clone(), p.clone())
+        WireMessage::want(sender, origin, r.clone(), p.clone())
             .encode()
             .len()
     };
@@ -94,6 +98,7 @@ where
             if !r.is_empty() || !p.is_empty() {
                 msgs.push(WireMessage::want(
                     sender,
+                    origin,
                     std::mem::replace(r, LogRanges::empty()),
                     std::mem::take(p),
                 ));
@@ -203,14 +208,20 @@ mod tests {
     fn want_splits_ranges_and_carries_prefixes_first() {
         let ranges = LogRanges::from_pairs((0..200u8).map(|l| (l, Ranges::from(3))));
         let prefixes: BTreeSet<u8> = (0..50).collect();
-        let (msgs, dropped) = pack_want(1u32, ranges, prefixes.clone(), 300);
+        let (msgs, dropped) = pack_want(1u32, 9u32, ranges, prefixes.clone(), 300);
         assert_eq!(dropped, 0);
         assert!(msgs.len() > 1);
         assert!(msgs.iter().all(|m| m.encode().len() <= 300));
         let mut got_prefixes = BTreeSet::new();
         let mut got_logs = 0;
         for m in &msgs {
-            if let WireBody::Want { ranges, prefixes } = &m.body {
+            if let WireBody::Want {
+                origin,
+                ranges,
+                prefixes,
+            } = &m.body
+            {
+                assert_eq!(*origin, 9, "every piece carries the origin");
                 got_prefixes.extend(prefixes.iter().copied());
                 got_logs += ranges.iter().count();
             }
@@ -223,7 +234,7 @@ mod tests {
     fn empty_input_packs_to_nothing() {
         let (msgs, _) = pack_have(1u32, Vec::<(u8, Seq, Op)>::new(), 1000);
         assert!(msgs.is_empty());
-        let (msgs, _) = pack_want(1u32, LogRanges::<u8>::empty(), BTreeSet::new(), 1000);
+        let (msgs, _) = pack_want(1u32, 1u32, LogRanges::<u8>::empty(), BTreeSet::new(), 1000);
         assert!(msgs.is_empty());
     }
 }

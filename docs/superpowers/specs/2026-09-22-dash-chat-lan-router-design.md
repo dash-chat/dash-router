@@ -185,12 +185,16 @@ subscription to `7` is a subscription to log `7`). Dash Chat's
 **Wire.** `WireBody::Want` becomes
 
 ```rust
-Want { ranges: LogRanges<L>, prefixes: BTreeSet<L::Prefix> }
+Want { origin: N, ranges: LogRanges<L>, prefixes: BTreeSet<L::Prefix> }
 ```
 
 `ranges` is what it is today: gaps and open tails for logs the wanter
 already knows. `prefixes` says "and every log under these that I have not
-named in `ranges`". Have is unchanged.
+named in `ranges`". `origin` is the wanting node: a relayer re-signs the
+message (`sender`) but keeps `origin`, and an answerer keys recent Wants by
+origin and records nothing for an echo of its own Want (otherwise a relayed
+echo would name the answerer's logs on the relayer's behalf and stop them
+going wholesale to a prefix wanter behind it). Have is unchanged.
 
 **Router state and actions.** `RouterState` gains `open:
 BTreeSet<L::Prefix>` (this node's wholesale interests), set by a new

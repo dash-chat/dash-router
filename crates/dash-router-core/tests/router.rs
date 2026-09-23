@@ -45,7 +45,7 @@ fn disabled(m: &Router, s: &State, action: A<N, L, T>) {
     );
 }
 
-fn sends_want(fx: &[Effect<L>]) -> Vec<&LogRanges<L>> {
+fn sends_want(fx: &[Effect<N, L>]) -> Vec<&LogRanges<L>> {
     fx.iter()
         .filter_map(|e| match e {
             Effect::SendWant { ranges, .. } => Some(ranges),
@@ -54,7 +54,7 @@ fn sends_want(fx: &[Effect<L>]) -> Vec<&LogRanges<L>> {
         .collect()
 }
 
-fn sends_have(fx: &[Effect<L>]) -> Vec<&LogRanges<L>> {
+fn sends_have(fx: &[Effect<N, L>]) -> Vec<&LogRanges<L>> {
     fx.iter()
         .filter_map(|e| match e {
             Effect::SendHave(r) => Some(r),
@@ -75,6 +75,7 @@ fn a_want_floods_once_per_hop_and_never_echoes() {
     let fx = b
         .step(A::RecvWant {
             from: n(0),
+            origin: n(0),
             ranges: full.clone(),
             prefixes: BTreeSet::new(),
         })
@@ -85,6 +86,7 @@ fn a_want_floods_once_per_hop_and_never_echoes() {
     let fx = b
         .step(A::RecvWant {
             from: n(0),
+            origin: n(0),
             ranges: full.clone(),
             prefixes: BTreeSet::new(),
         })
@@ -99,6 +101,7 @@ fn a_want_floods_once_per_hop_and_never_echoes() {
     let fx = b
         .step(A::RecvWant {
             from: n(0),
+            origin: n(0),
             ranges: full.clone(),
             prefixes: BTreeSet::new(),
         })
@@ -250,6 +253,7 @@ fn want_then_have_backfills_a_late_subscriber() {
 
     a.step(A::RecvWant {
         from: n(1),
+        origin: n(1),
         ranges: lr([(0, Ranges::full())]),
         prefixes: BTreeSet::new(),
     })
@@ -307,16 +311,18 @@ mod prefix {
         LogRanges::from_pairs(pairs.iter().cloned())
     }
 
-    fn sent_have(fx: &[Effect<Pair>]) -> Option<LogRanges<Pair>> {
+    fn sent_have(fx: &[Effect<u32, Pair>]) -> Option<LogRanges<Pair>> {
         fx.iter().find_map(|e| match e {
             Effect::SendHave(r) => Some(r.clone()),
             _ => None,
         })
     }
 
-    fn sent_want(fx: &[Effect<Pair>]) -> Option<(LogRanges<Pair>, BTreeSet<u8>)> {
+    fn sent_want(fx: &[Effect<u32, Pair>]) -> Option<(LogRanges<Pair>, BTreeSet<u8>)> {
         fx.iter().find_map(|e| match e {
-            Effect::SendWant { ranges, prefixes } => Some((ranges.clone(), prefixes.clone())),
+            Effect::SendWant {
+                ranges, prefixes, ..
+            } => Some((ranges.clone(), prefixes.clone())),
             _ => None,
         })
     }
@@ -344,6 +350,7 @@ mod prefix {
                 s,
                 A::RecvWant {
                     from: 7,
+                    origin: 7,
                     ranges: held(&[(a1, Ranges::from(4))]),
                     prefixes: BTreeSet::from([1u8]),
                 },
@@ -391,6 +398,7 @@ mod prefix {
         let s = RouterState::new(0u32, LogRanges::empty());
         let want = |from| A::RecvWant {
             from,
+            origin: from,
             ranges: LogRanges::empty(),
             prefixes: BTreeSet::from([9u8]),
         };
@@ -411,6 +419,7 @@ mod prefix {
                 s,
                 A::RecvWant {
                     from: 7,
+                    origin: 7,
                     ranges: LogRanges::empty(),
                     prefixes: BTreeSet::from([1u8]),
                 },
@@ -439,6 +448,7 @@ mod prefix {
                 s,
                 A::RecvWant {
                     from: 7,
+                    origin: 7,
                     ranges: held(&[(a1, Ranges::from(4)), (b1, Ranges::from(4))]),
                     prefixes: BTreeSet::new(),
                 },
@@ -477,6 +487,7 @@ mod prefix {
                 s,
                 A::RecvWant {
                     from: 1,
+                    origin: 1,
                     ranges: tail(),
                     prefixes: BTreeSet::new(),
                 },
@@ -489,6 +500,7 @@ mod prefix {
                 s,
                 A::RecvWant {
                     from: 2,
+                    origin: 2,
                     ranges: tail(),
                     prefixes: BTreeSet::from([1u8]),
                 },
@@ -507,6 +519,7 @@ mod prefix {
                 s,
                 A::RecvWant {
                     from: 3,
+                    origin: 3,
                     ranges: tail(),
                     prefixes: BTreeSet::from([1u8]),
                 },
@@ -537,6 +550,7 @@ mod prefix {
                 s,
                 A::RecvWant {
                     from: 7,
+                    origin: 7,
                     ranges: held(&[(a1, Ranges::from(5))]),
                     prefixes: BTreeSet::new(),
                 },
@@ -547,6 +561,7 @@ mod prefix {
                 s,
                 A::RecvWant {
                     from: 7,
+                    origin: 7,
                     ranges: LogRanges::empty(),
                     prefixes: BTreeSet::from([1u8]),
                 },
@@ -567,6 +582,60 @@ mod prefix {
         assert!(s.wants.is_empty(), "every piece expires after want_ttl");
     }
 
+    /// Final review F1: an answerer's own Want, echoed back by a relay,
+    /// must not name logs on anyone else's behalf. C (id 2) holds two logs
+    /// under prefix 1; A (id 0) wants the prefix knowing nothing, via relay
+    /// B (id 1). B also relays C's own Want back to C. The echo carries
+    /// C's named tails; were it filed with A's interest, C would treat
+    /// both logs as named and answer only the (unheld) tails, never the
+    /// logs wholesale.
+    #[test]
+    fn own_echoed_want_does_not_name_logs_for_others() {
+        let m = machine();
+        let (a, b, c) = (0u32, 1u32, 2u32);
+        let x = Pair::new(1, 1);
+        let y = Pair::new(1, 2);
+        let s = RouterState::new(
+            c,
+            held(&[(x, Ranges::range(0, 4)), (y, Ranges::range(0, 3))]),
+        );
+        let (s, _) = m.transition(s, A::Open(BTreeSet::from([1u8]))).unwrap();
+        let (s, _) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: b,
+                    origin: a,
+                    ranges: LogRanges::empty(),
+                    prefixes: BTreeSet::from([1u8]),
+                },
+            )
+            .unwrap();
+        // C's own Want, relayed back by B.
+        let (s, _) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: b,
+                    origin: c,
+                    ranges: held(&[(x, Ranges::from(4)), (y, Ranges::from(3))]),
+                    prefixes: BTreeSet::from([1u8]),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            s.next_have(),
+            held(&[(x, Ranges::range(0, 4)), (y, Ranges::range(0, 3))]),
+            "both logs go wholesale to the prefix wanter"
+        );
+        assert!(
+            !s.wants.contains_key(&c),
+            "an echo of this node's own Want is recorded under no key"
+        );
+        assert!(s.wants.contains_key(&a), "A's Want is keyed by its origin");
+        assert!(!s.wants.contains_key(&b), "never by the relayer");
+    }
+
     /// Each received Want dies `want_ttl` after its own arrival, so a stale
     /// piece falls out while a later one from the same peer lives on.
     #[test]
@@ -579,6 +648,7 @@ mod prefix {
                 s,
                 A::RecvWant {
                     from: 7,
+                    origin: 7,
                     ranges: held(&[(a1, Ranges::from(5))]),
                     prefixes: BTreeSet::new(),
                 },
@@ -590,6 +660,7 @@ mod prefix {
                 s,
                 A::RecvWant {
                     from: 7,
+                    origin: 7,
                     ranges: held(&[(a1, Ranges::from(8))]),
                     prefixes: BTreeSet::new(),
                 },

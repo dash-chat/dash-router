@@ -170,3 +170,85 @@ async fn stats_reports_a_zeroed_snapshot_for_a_fresh_node() {
     assert_eq!(snapshot.relay_errors, 0);
     assert_eq!(snapshot.relay_store_errors, 0);
 }
+
+/// Final review F1 in the real shell: a late joiner subscribing to a prefix
+/// under which it knows no author is served every log under it within one
+/// Want/Have cycle, not only after `want_ttl`. The holder's own Want is
+/// relayed back to it by the joiner; that echo must not count as the
+/// joiner naming the holder's logs.
+#[tokio::test(start_paused = true)]
+async fn late_joiner_under_prefix_is_served_before_want_ttl() {
+    use dash_router_core::Pair;
+
+    let want_ttl = Duration::from_secs(6);
+    let config = || CoreConfig {
+        router: RouterConfig {
+            want_ttl: want_ttl.into(),
+            have_ttl: want_ttl.into(),
+        },
+        ..config()
+    };
+    let intervals = |seed: u64| PolicyIntervals {
+        want: IntervalPolicy::Fixed {
+            min_ms: 500.0,
+            max_ms: 1500.0,
+        },
+        have: IntervalPolicy::Fixed {
+            min_ms: 50.0,
+            max_ms: 250.0,
+        },
+        n: 2,
+        rng: rand::rngs::StdRng::seed_from_u64(seed),
+    };
+    for seed in 0..4u64 {
+        let hub = LoopbackHub::new();
+        let (holder, _holder_events, _holder_task) = spawn(
+            1u32,
+            config(),
+            Duration::from_secs(1),
+            BTreeSet::from([1u8]),
+            MemStore::<Pair>::new(),
+            OpsMap::<Pair>::default(),
+            hub.join("192.168.0.1".parse().unwrap()),
+            intervals(seed * 2 + 1),
+        );
+        let mut all = BTreeSet::new();
+        for author in [1u8, 2] {
+            for seq in 0..3u32 {
+                let op = Op {
+                    header: vec![author, seq as u8],
+                    payload: Some(vec![author; 8]),
+                };
+                holder.append(Pair::new(1, author), seq, op).await.unwrap();
+                all.insert((Pair::new(1, author), seq));
+            }
+        }
+        // Let the push flood into an empty room and the holder settle.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let (_joiner, mut events, _joiner_task) = spawn(
+            2u32,
+            config(),
+            Duration::from_secs(1),
+            BTreeSet::from([1u8]),
+            MemStore::<Pair>::new(),
+            OpsMap::<Pair>::default(),
+            hub.join("192.168.0.2".parse().unwrap()),
+            intervals(seed * 2 + 2),
+        );
+        // One joiner Want (≤ 1.5 s) plus one holder Have (≤ 0.25 s), with
+        // room to spare, and well under `want_ttl`.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut got = BTreeSet::new();
+        while got != all {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Some(RouterEvent::Delivered(log, seq))) => {
+                    got.insert((log, seq));
+                }
+                Ok(Some(RouterEvent::StorageError(e))) => panic!("storage error: {e:?}"),
+                Ok(None) => panic!("event stream closed"),
+                Err(_) => panic!("seed {seed}: joiner got only {got:?} within 3 s"),
+            }
+        }
+    }
+}

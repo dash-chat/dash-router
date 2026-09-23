@@ -93,11 +93,17 @@ pub struct RouterState<N: Ord, L: Log, T> {
     /// ("known-but-empty"): that log wants everything.
     pub held: LogRanges<L>,
     /// Recent Wants from other nodes: one record per received Want, each
-    /// with its own TTL (the `relayed_wants` mechanism, keyed by peer). A
-    /// Want may arrive split across several wire messages (the shell's
-    /// `pack_want`), and a peer's successive Wants overlap; each record
-    /// dies `want_ttl` after its own arrival, so pieces union and stale
-    /// ranges expire on their own schedule. A stale record can still
+    /// with its own TTL (the `relayed_wants` mechanism), keyed by the
+    /// Want's *origin* — the node that wanted, not the relayer that
+    /// delivered it — so every piece of one node's Want lands under one
+    /// key whichever path it took, and an echo of this node's own Want
+    /// (relayed back to it) is never recorded at all: it would otherwise
+    /// name this node's logs on a relayer's behalf and stop them going
+    /// wholesale to a prefix wanter behind that relayer. A Want may arrive
+    /// split across several wire messages (the shell's `pack_want`), and a
+    /// node's successive Wants overlap; each record dies `want_ttl` after
+    /// its own arrival, so pieces union and stale ranges expire on their
+    /// own schedule. A stale record can still
     /// trigger one bounded re-send if this node's own `haves` entry was
     /// replaced by a Push in the meantime; it dies within `want_ttl`. A
     /// peer is present iff it has at least one live record.
@@ -160,11 +166,11 @@ impl<N: Id, L: Log, T: TimeInterval> RouterState<N, L, T> {
         )
     }
 
-    /// Union of recent Wants from other nodes, with each peer's prefix
-    /// interests expanded over what this node holds (spec §3.5). A peer's
-    /// live records are unioned *before* the prefix expansion, so a log the
-    /// peer named in one piece of a split Want is not sent wholesale because
-    /// of a prefix carried in another piece.
+    /// Union of recent Wants from other nodes, with each wanter's prefix
+    /// interests expanded over what this node holds (spec §3.5). A wanter's
+    /// live records (keyed by origin) are unioned *before* the prefix
+    /// expansion, so a log the wanter named in one piece of a split Want is
+    /// not sent wholesale because of a prefix carried in another piece.
     pub fn others_wants(&self) -> LogRanges<L> {
         self.wants
             .values()
@@ -278,9 +284,12 @@ pub enum RouterAction<N, L: Log, T> {
     /// Replace this node's wholesale interests (the node glue's
     /// subscriptions, by prefix).
     Open(BTreeSet<L::Prefix>),
-    /// A Want message arrives from another node.
+    /// A Want message arrives from another node. `from` is the wire
+    /// sender (the last relayer, or the wanter itself); `origin` is the
+    /// node that wanted, carried unchanged through every relay.
     RecvWant {
         from: N,
+        origin: N,
         ranges: LogRanges<L>,
         prefixes: BTreeSet<L::Prefix>,
     },
@@ -295,9 +304,11 @@ pub enum RouterAction<N, L: Log, T> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Effect<L: Log> {
-    /// Broadcast a Want to the LAN.
+pub enum Effect<N, L: Log> {
+    /// Broadcast a Want to the LAN on behalf of `origin`: this node for its
+    /// own Wants, the incoming Want's origin for a relay.
     SendWant {
+        origin: N,
         ranges: LogRanges<L>,
         prefixes: BTreeSet<L::Prefix>,
     },
@@ -311,7 +322,7 @@ pub enum Effect<L: Log> {
 impl<N: Id, L: Log, T: TimeInterval> Machine for RouterMachine<N, L, T> {
     type State = RouterState<N, L, T>;
     type Action = RouterAction<N, L, T>;
-    type Fx = Vec<Effect<L>>;
+    type Fx = Vec<Effect<N, L>>;
     type Error = anyhow::Error;
 
     fn transition(&self, mut s: Self::State, action: Self::Action) -> TransitionResult<Self> {
@@ -374,7 +385,11 @@ impl<N: Id, L: Log, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                     // Own emissions count as relayed, or the flood's echo
                     // would be re-flooded by its own author.
                     s.note_relayed_wants(ranges.clone(), prefixes.clone(), self.config.want_ttl);
-                    fx.push(Effect::SendWant { ranges, prefixes });
+                    fx.push(Effect::SendWant {
+                        origin: s.id,
+                        ranges,
+                        prefixes,
+                    });
                 }
             }
 
@@ -415,6 +430,7 @@ impl<N: Id, L: Log, T: TimeInterval> Machine for RouterMachine<N, L, T> {
 
             RouterAction::RecvWant {
                 from,
+                origin,
                 ranges,
                 prefixes,
             } => {
@@ -442,16 +458,21 @@ impl<N: Id, L: Log, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                         self.config.want_ttl,
                     );
                     fx.push(Effect::SendWant {
+                        origin,
                         ranges: relay_ranges,
                         prefixes: relay_prefixes,
                     });
                 }
-                // Accumulate, never replace: see `RouterState::wants`.
-                s.wants.entry(from).or_default().push(Record {
-                    ranges,
-                    prefixes,
-                    ttl_left: self.config.want_ttl,
-                });
+                // Keyed by origin, never by `from`; an echo of this node's
+                // own Want is not recorded (see `RouterState::wants`).
+                // Accumulate, never replace.
+                if origin != s.id {
+                    s.wants.entry(origin).or_default().push(Record {
+                        ranges,
+                        prefixes,
+                        ttl_left: self.config.want_ttl,
+                    });
+                }
             }
 
             RouterAction::RecvHave { from, ranges } => {

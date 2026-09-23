@@ -69,8 +69,10 @@ impl IntervalSource for Scripted {
 
 #[derive(Clone, Debug)]
 enum Step {
+    /// `origin` 0 is this node: its own Want, echoed back by `from`.
     RecvWant {
         from: u32,
+        origin: u32,
         log: u8,
         start: u32,
         end: u32,
@@ -79,6 +81,7 @@ enum Step {
     /// `u8` logs are their own prefix.
     RecvPrefixWant {
         from: u32,
+        origin: u32,
         prefix: u8,
     },
     RecvHave {
@@ -103,9 +106,11 @@ enum Step {
 
 fn step_strategy() -> impl Strategy<Value = Step> {
     prop_oneof![
-        3 => (1u32..4, 0u8..3, 0u32..8, 0u32..8)
-            .prop_map(|(from, log, start, end)| Step::RecvWant { from, log, start, end }),
-        1 => (1u32..4, 0u8..3).prop_map(|(from, prefix)| Step::RecvPrefixWant { from, prefix }),
+        3 => (1u32..4, 0u32..5, 0u8..3, 0u32..8, 0u32..8).prop_map(
+            |(from, origin, log, start, end)| Step::RecvWant { from, origin, log, start, end }
+        ),
+        1 => (1u32..4, 0u32..5, 0u8..3)
+            .prop_map(|(from, origin, prefix)| Step::RecvPrefixWant { from, origin, prefix }),
         3 => (1u32..4, 0u8..3, proptest::collection::vec((0u32..8, any::<bool>()), 0..4))
             .prop_map(|(from, log, seqs)| Step::RecvHave { from, log, seqs }),
         2 => (0u8..3).prop_map(|log| Step::Append { log }),
@@ -413,17 +418,23 @@ impl Driver {
             }
             Step::RecvWant {
                 from,
+                origin,
                 log,
                 start,
                 end,
             } => {
                 let ranges = LogRanges::from_pairs([(log, Ranges::range(start, end))]);
-                let msg: WireMessage<u32, u8> = WireMessage::want(from, ranges, BTreeSet::new());
+                let msg: WireMessage<u32, u8> =
+                    WireMessage::want(from, origin, ranges, BTreeSet::new());
                 (sut_out, ref_fx) = self.recv_want(idx, msg).await?;
             }
-            Step::RecvPrefixWant { from, prefix } => {
+            Step::RecvPrefixWant {
+                from,
+                origin,
+                prefix,
+            } => {
                 let msg: WireMessage<u32, u8> =
-                    WireMessage::want(from, LogRanges::empty(), BTreeSet::from([prefix]));
+                    WireMessage::want(from, origin, LogRanges::empty(), BTreeSet::from([prefix]));
                 (sut_out, ref_fx) = self.recv_want(idx, msg).await?;
             }
             Step::RecvHave { from, log, seqs } => {
@@ -465,19 +476,27 @@ impl Driver {
     /// Finding 8(a) / review focus 6: the SUT only arms the have timer when
     /// the RECEIVED Want names something — ranges or prefixes (an empty
     /// Want must not arm a forever no-op fire/re-arm loop; a prefix-only
-    /// Want is a real request and must arm). Mirror that exact gate here,
-    /// not `wants.is_empty()` (which is always false after this Recv, since
-    /// `RouterAction::RecvWant` records the witnessing peer's entry in
-    /// `wants` regardless of whether its ranges were empty).
+    /// Want is a real request and must arm) and only when it is someone
+    /// else's (an echo of this node's own Want is not recorded, so arming
+    /// on it would be illegal). Mirror that exact gate here, not
+    /// `wants.is_empty()` (which is always false after a foreign Want,
+    /// since `RouterAction::RecvWant` records its origin's entry in `wants`
+    /// regardless of whether its ranges were empty).
     async fn recv_want(
         &mut self,
         idx: usize,
         msg: WireMessage<u32, u8>,
     ) -> Result<(Vec<Out<u32, u8>>, Vec<NodeEffect<u32, u8>>), TestCaseError> {
-        let WireBody::Want { ranges, prefixes } = &msg.body else {
+        let WireBody::Want {
+            origin,
+            ranges,
+            prefixes,
+        } = &msg.body
+        else {
             unreachable!("recv_want is only called with a Want");
         };
         let want_nonempty = !ranges.is_empty() || !prefixes.is_empty();
+        let foreign = *origin != self.ref_state.router.id;
         let sut_out = self
             .core
             .on_wire(self.now, incoming(&msg))
@@ -487,7 +506,7 @@ impl Driver {
         // Binding semantics #1: a witnessed non-empty Want arms the Have
         // timer when none is armed. Mirror the SUT's arm-on-recv, in the
         // same call.
-        if want_nonempty && self.ref_state.router.have_timer.is_none() {
+        if want_nonempty && foreign && self.ref_state.router.have_timer.is_none() {
             let next = self.ref_script.next_have();
             let more = self.ref_step(
                 idx,
@@ -610,6 +629,7 @@ fn fixed_regression_sequence() {
         Step::Advance(150), // past the initial 100ms want interval
         Step::RecvWant {
             from: 1,
+            origin: 1,
             log: 1,
             start: 0,
             end: 5,

@@ -12,7 +12,7 @@ use crate::{
 };
 
 /// Bump together with the gossip topic on breaking change.
-/// v1: Want carries prefixes (spec 2026-09-22 §3.5).
+/// v1: Want carries prefixes (spec 2026-09-22 §3.5) and its origin.
 pub const WIRE_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -25,18 +25,22 @@ pub struct WireMessage<N, L: Log> {
     /// Gossip strips the transport sender; we carry our own. Checked
     /// against the transport's verified author when it has one (shell).
     pub sender: N,
-    pub body: WireBody<L>,
+    pub body: WireBody<N, L>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "L: Serialize, L::Prefix: Serialize",
-    deserialize = "L: Deserialize<'de>, L::Prefix: Deserialize<'de>"
+    serialize = "N: Serialize, L: Serialize, L::Prefix: Serialize",
+    deserialize = "N: Deserialize<'de>, L: Deserialize<'de>, L::Prefix: Deserialize<'de>"
 ))]
-pub enum WireBody<L: Log> {
+pub enum WireBody<N, L: Log> {
+    /// `origin`: the node that wants, preserved by every relayer (the
+    /// message's `sender` is re-signed at each hop), so an answerer keys
+    /// the Want by its wanter and ignores echoes of its own.
     /// `ranges`: gaps and open tails for logs the wanter already knows.
     /// `prefixes`: "and every log under these that I did not name".
     Want {
+        origin: N,
         ranges: LogRanges<L>,
         prefixes: BTreeSet<L::Prefix>,
     },
@@ -46,11 +50,17 @@ pub enum WireBody<L: Log> {
 }
 
 impl<N: Serialize + DeserializeOwned, L: WireLog> WireMessage<N, L> {
-    pub fn want(sender: N, ranges: LogRanges<L>, prefixes: BTreeSet<L::Prefix>) -> Self {
+    /// A Want signed by `sender` on behalf of `origin` (`sender` itself
+    /// for an own Want, the incoming Want's origin for a relay).
+    pub fn want(sender: N, origin: N, ranges: LogRanges<L>, prefixes: BTreeSet<L::Prefix>) -> Self {
         Self {
             version: WIRE_VERSION,
             sender,
-            body: WireBody::Want { ranges, prefixes },
+            body: WireBody::Want {
+                origin,
+                ranges,
+                prefixes,
+            },
         }
     }
 
@@ -89,11 +99,17 @@ mod tests {
     fn wire_messages_round_trip_and_reject_unknown_versions() {
         let want: WireMessage<u32, u8> = WireMessage::want(
             7,
+            5,
             LogRanges::from_pairs([(1u8, Ranges::from(3))]),
             BTreeSet::from([2u8]),
         );
         match &want.body {
-            WireBody::Want { prefixes, .. } => assert_eq!(prefixes, &BTreeSet::from([2u8])),
+            WireBody::Want {
+                origin, prefixes, ..
+            } => {
+                assert_eq!(*origin, 5, "the origin survives a relayer's re-signing");
+                assert_eq!(prefixes, &BTreeSet::from([2u8]));
+            }
             WireBody::Have(_) => unreachable!(),
         }
         let have: WireMessage<u32, u8> = WireMessage::have(
@@ -114,7 +130,8 @@ mod tests {
             assert_eq!(WireMessage::decode(&bytes).unwrap(), msg);
         }
 
-        let mut bad = WireMessage::<u32, u8>::want(7, LogRanges::empty(), BTreeSet::new()).encode();
+        let mut bad =
+            WireMessage::<u32, u8>::want(7, 7, LogRanges::empty(), BTreeSet::new()).encode();
         bad[0] = WIRE_VERSION + 1; // version is the first postcard field (u8)
         assert!(WireMessage::<u32, u8>::decode(&bad).is_err());
     }

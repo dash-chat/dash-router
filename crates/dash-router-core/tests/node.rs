@@ -310,6 +310,7 @@ fn ext_spontaneity_reconciles_and_smuggled_recvs_are_disabled() {
             s.clone(),
             NodeAction::Router(RouterAction::RecvWant {
                 from: n(1),
+                origin: n(1),
                 ranges: lr([(0, Ranges::full())]),
                 prefixes: BTreeSet::new(),
             })
@@ -374,6 +375,7 @@ fn send_have_hydration_prefers_the_payload_bearing_copy() {
             s,
             NodeAction::Recv(WireMessage::want(
                 n(1),
+                n(1),
                 lr([(0, Ranges::full())]),
                 BTreeSet::new(),
             )),
@@ -415,7 +417,7 @@ fn relay_evict_payloads_frees_units_and_keeps_advertising() {
     assert_eq!(s.relay.0.usage(), 4);
 
     // Peer 2 wants seq 0: its payload must survive to answer the Want.
-    let want = WireMessage::want(n(2), lr([(1, Ranges::range(0, 1))]), BTreeSet::new());
+    let want = WireMessage::want(n(2), n(2), lr([(1, Ranges::range(0, 1))]), BTreeSet::new());
     let (s, _) = m.transition(s, NodeAction::Recv(want)).unwrap();
     let candidates = s.eviction_candidates();
     assert_eq!(
@@ -570,11 +572,65 @@ mod prefix {
             .unwrap();
         let want = fx.iter().find_map(|e| match e {
             NodeEffect::Broadcast(WireMessage {
-                body: WireBody::Want { ranges, prefixes },
+                body:
+                    WireBody::Want {
+                        origin,
+                        ranges,
+                        prefixes,
+                    },
                 ..
-            }) => Some((ranges.clone(), prefixes.clone())),
+            }) => Some((*origin, ranges.clone(), prefixes.clone())),
             _ => None,
         });
-        assert_eq!(want, Some((LogRanges::empty(), BTreeSet::from([1u8]))));
+        assert_eq!(
+            want,
+            Some((0u32, LogRanges::empty(), BTreeSet::from([1u8]))),
+            "an own Want names this node as its origin"
+        );
+    }
+
+    /// Final review F1: a relayer re-signs a Want but keeps its origin, so
+    /// the answerer keys it by the wanter and recognises its own echoes.
+    #[test]
+    fn relayed_want_keeps_its_origin() {
+        let m = machine();
+        let s = NodeState::new(1u32, m.clone(), []);
+        let (s, fx) = m
+            .transition(
+                s,
+                NodeAction::Recv(WireMessage::want(
+                    0u32,
+                    0u32,
+                    LogRanges::empty(),
+                    BTreeSet::from([1u8]),
+                )),
+            )
+            .unwrap();
+        let relayed: Vec<_> = fx
+            .iter()
+            .filter_map(|e| match e {
+                NodeEffect::Broadcast(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            relayed,
+            vec![WireMessage::want(
+                1u32,
+                0u32,
+                LogRanges::empty(),
+                BTreeSet::from([1u8])
+            )]
+        );
+        assert!(s.router.wants.contains_key(&0), "keyed by the origin");
+        // The same Want, relayed back to its origin by this node: no record.
+        let s0 = NodeState::new(0u32, m.clone(), [1u8]);
+        let (s0, _) = m
+            .transition(s0, NodeAction::Recv(relayed[0].clone()))
+            .unwrap();
+        assert!(
+            s0.router.wants.is_empty(),
+            "an echo of an own Want is ignored"
+        );
     }
 }
