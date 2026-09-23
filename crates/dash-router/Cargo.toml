@@ -1,5 +1,5 @@
 [package]
-name = "dash-router-net"
+name = "dash-router"
 description = "The tokio shell: a real Dash Router node over async storage and a LAN transport"
 version.workspace = true
 edition.workspace = true
@@ -17,6 +17,7 @@ serde = { workspace = true }
 rand = { workspace = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 trait-variant = "0.1"
+tracing = "0.1"
 redb = "4.3.0"
 p2panda-net = { version = "0.7", optional = true }
 p2panda-core = { version = "0.7", optional = true }

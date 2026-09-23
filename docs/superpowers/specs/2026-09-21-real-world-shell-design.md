@@ -1,4 +1,4 @@
-# Real World: the `dash-router-net` Tokio Shell — design draft
+# Real World: the `dash-router` Tokio Shell — design draft
 
 **Status: ACCEPTED, implemented by docs/superpowers/plans/2026-09-21-real-world-shell.md.**
 Expands §3.3, §3.5, §7, §8 and the §10 open questions of
@@ -8,6 +8,9 @@ left a question open, this draft takes a position and marks it
 world; the pure-world plan executes independently.
 
 ## Resolved
+
+Wire is now v1 with prefix Wants; see
+`docs/superpowers/specs/2026-09-22-dash-chat-lan-router-design.md`.
 
 All five §9 open questions were approved as drafted, user-approved
 2026-09-21:
@@ -20,7 +23,7 @@ All five §9 open questions were approved as drafted, user-approved
 4. **`Delivered(L, Seq)` without bytes** (§5): kept byte-less; consumers
    re-read their own store.
 5. **`dash-router-policy` as a third crate** (§1): kept as a separate
-   crate rather than folded into `dash-router-net`.
+   crate rather than folded into `dash-router`.
 
 **Relay-pull ruling** (user-chosen 2026-09-21): DESIGN.md's wanting
 semantics are kept as-is; the shed-at-cap churn loop and `Unsubscribe`
@@ -54,13 +57,13 @@ implementation:
   walking those same peers to learn who shares the topic. LAN scoping is
   preserved because `Discovery` only ever walks nodes the address book
   already knows, and mDNS is the only source of those nodes. See
-  `crates/dash-router-net/src/panda.rs` module docs.
+  `crates/dash-router/src/panda.rs` module docs.
 
 ## 1. Shape and scope
 
 Two new crates:
 
-- **`dash-router-net`** — the tokio shell: node task, async storage traits,
+- **`dash-router`** — the tokio shell: node task, async storage traits,
   standalone stores (in-memory selfish store, disk relay store), command
   API, lockstep conformance tests. Depends on `dash-router-core`, tokio,
   postcard; p2panda only behind the transport boundary (§6).
@@ -215,7 +218,7 @@ snapshots next start — wants/haves/seen-sets are deliberately ephemeral).
 
 ## 6. p2panda integration
 
-### 6.1 Transport (in `dash-router-net`)
+### 6.1 Transport (in `dash-router`)
 
 - Gossip via p2panda-net ephemeral streams on the well-known topic
   `"dash-router/v0"` — the version suffix bumps with `WIRE_VERSION`.
@@ -229,7 +232,7 @@ snapshots next start — wants/haves/seen-sets are deliberately ephemeral).
   **[decision]** — signing every message is cheap to add later inside
   `WireMessage` without touching the core.
 
-### 6.2 Standalone stores (in `dash-router-net`)
+### 6.2 Standalone stores (in `dash-router`)
 
 - **Selfish store**: in-memory `OpsMap` behind the blanket sync→async
   impl, plus a trivial `changed()` stream fed by its own writes.
@@ -260,7 +263,7 @@ any notification we can subscribe to directly (spec §10 carry-over).
 
 ```
 crates/dash-router-policy/src/lib.rs        IntervalPolicy, PushDebouncePolicy
-crates/dash-router-net/src/
+crates/dash-router/src/
   storage.rs      AsyncStorage/AsyncEvictableStorage/WatchableStorage + blanket sync impl
   mem.rs          in-memory selfish store + changed() stream
   disk.rs         redb relay store
@@ -299,4 +302,4 @@ routing table (§3) earns its keep or gets caught.
 4. **`Delivered(L, Seq)` without bytes** (§5) — does Dash Chat want the
    op bytes in the event instead of re-reading its own store?
 5. **`dash-router-policy` as a third crate** (§1) vs folding policies into
-   `dash-router-net` and letting the sim depend on a feature-gated subset.
+   `dash-router` and letting the sim depend on a feature-gated subset.

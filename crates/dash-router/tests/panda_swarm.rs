@@ -3,7 +3,7 @@
 //! sockets and multicasts on the host; run manually with
 //!
 //! ```text
-//! cargo test -p dash-router-net --features p2panda --test panda_swarm -- --ignored --nocapture
+//! cargo test -p dash-router --features p2panda --test panda_swarm -- --ignored --nocapture
 //! ```
 //!
 //! One swarm, two claims:
@@ -24,9 +24,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+use dash_router::panda::{PandaTransport, spawn_panda};
+use dash_router::{CoreConfig, MemStore, PolicyIntervals, RouterEvent, RouterHandle, spawn};
 use dash_router_core::{Op, OpsMap, RouterConfig, Storage};
-use dash_router_net::panda::{PandaTransport, spawn_panda};
-use dash_router_net::{CoreConfig, MemStore, PolicyIntervals, RouterEvent, RouterHandle, spawn};
 use dash_router_policy::{IntervalPolicy, PushDebouncePolicy};
 use p2panda_core::{SigningKey, VerifyingKey};
 use rand::SeedableRng;
@@ -52,6 +52,7 @@ fn config() -> CoreConfig {
             window_ms: 50,
             max_latency_ms: 200,
         },
+        max_wire_bytes: dash_router::pack::DEFAULT_MAX_WIRE_BYTES,
     }
 }
 
@@ -148,7 +149,7 @@ fn assert_sparse_overlay(nodes: &[Node], when: &str) -> Vec<usize> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "binds 50 real sockets and mDNS; run manually: cargo test -p dash-router-net --features p2panda --test panda_swarm -- --ignored --nocapture"]
+#[ignore = "binds 50 real sockets and mDNS; run manually: cargo test -p dash-router --features p2panda --test panda_swarm -- --ignored --nocapture"]
 async fn fifty_nodes_form_a_sparse_overlay_and_fully_replicate() {
     let t0 = Instant::now();
     let mut nodes = Vec::with_capacity(N);

@@ -185,12 +185,16 @@ subscription to `7` is a subscription to log `7`). Dash Chat's
 **Wire.** `WireBody::Want` becomes
 
 ```rust
-Want { ranges: LogRanges<L>, prefixes: BTreeSet<L::Prefix> }
+Want { origin: N, ranges: LogRanges<L>, prefixes: BTreeSet<L::Prefix> }
 ```
 
 `ranges` is what it is today: gaps and open tails for logs the wanter
 already knows. `prefixes` says "and every log under these that I have not
-named in `ranges`". Have is unchanged.
+named in `ranges`". `origin` is the wanting node: a relayer re-signs the
+message (`sender`) but keeps `origin`, and an answerer keys recent Wants by
+origin and records nothing for an echo of its own Want (otherwise a relayed
+echo would name the answerer's logs on the relayer's behalf and stop them
+going wholesale to a prefix wanter behind it). Have is unchanged.
 
 **Router state and actions.** `RouterState` gains `open:
 BTreeSet<L::Prefix>` (this node's wholesale interests), set by a new
@@ -296,9 +300,10 @@ A new actor `Command::RouterStream { topic, reply }` calls
 `inner.ephemeral_stream::<ByteBuf>(topic)` and replies with the pair.
 `lan_router.rs` implements the two gossip traits from §3.1 over the pair
 and builds a `GossipTransport`. Router
-topic: `Topic::from(Hash::digest(b"dash-router/v0"))`, hashed with the
-network id the same way Dash Chat's other ALPNs/topics are, so different
-networks never share an overlay.
+topic: `Topic::from(Hash::digest(dash_router::GOSSIP_TOPIC.as_bytes()))`
+(the exported constant, currently `"dash-router/v1"`, whose suffix tracks
+`WIRE_VERSION`), hashed with the network id the same way Dash Chat's other
+ALPNs/topics are, so different networks never share an overlay.
 
 ### 4.5 Config and lifecycle
 

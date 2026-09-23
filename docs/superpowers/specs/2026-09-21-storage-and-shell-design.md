@@ -4,7 +4,7 @@
 **Date:** 2026-09-21
 **Scope:** the storage-less router refactor, the two storage machines, the
 `Storage` trait, the `NodeMachine` glue, the wire format, and the
-`dash-router-net` tokio shell over p2panda. Out of scope: the `Rewire`
+`dash-router` tokio shell over p2panda. Out of scope: the `Rewire`
 net-model action, interval retuning, `dash-router-model-check`.
 
 ## 1. Goal
@@ -17,7 +17,7 @@ gossip brain over `LogRanges`. Everything else is layered around it.
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│ dash-router-net (tokio shell)                              │
+│ dash-router (tokio shell)                              │
 │   gossip pub/sub · timers · async Storage impls · postcard │
 ├────────────────────────────────────────────────────────────┤
 │ NodeMachine (pure glue; the routing table)                 │
@@ -298,12 +298,12 @@ pub trait WatchableStorage<L>: AsyncStorage<L> {
 |---|---|---|---|
 | `ExtStoreState` (BTreeMap) | `Storage` | core | model, sim, conformance |
 | `RelayStoreState` (BTreeMap) | `Storage + Evictable` | core | model, sim, conformance |
-| Relay disk store (redb/fjall/sqlite, TBD at impl time) | `AsyncStorage + AsyncEvictable` | dash-router-net | production, both modes |
+| Relay disk store (redb/fjall/sqlite, TBD at impl time) | `AsyncStorage + AsyncEvictable` | dash-router | production, both modes |
 | Dash Chat's p2panda wrapper | `AsyncStorage + Watchable` | Dash Chat | integrated production |
-| Standalone selfish store | `AsyncStorage + Watchable` | dash-router-net | standalone production |
+| Standalone selfish store | `AsyncStorage + Watchable` | dash-router | standalone production |
 
 **Standalone is not the null store.** A standalone node still authors and
-subscribes, so it still needs a selfish-side store; `dash-router-net` ships
+subscribes, so it still needs a selfish-side store; `dash-router` ships
 a simple one. Keeping it as a genuine external store (rather than folding
 authored ops into the relay store) preserves the authored/relayed
 distinction — GC exemption, Deliver, and the push path all key off it. The
@@ -327,7 +327,7 @@ stays ours:
   shape for an open-ended broadcast protocol; nothing there maps.
 
 What *is* worth building once, by us rather than by every embedder: a
-`dash-router-p2panda` adapter (crate or module in `dash-router-net`)
+`dash-router-p2panda` adapter (crate or module in `dash-router`)
 implementing `AsyncStorage + WatchableStorage` generically over
 p2panda-store's traits — the held-summary maintenance, the header/body ↔
 `Op` packing, and the change-hint stream live there. **To verify at impl
@@ -461,7 +461,7 @@ enum WireBody<L> {
   bytes. (This deletes a work item from the original report.)
 - Wire round-trip proptests live beside the module; they need no tokio.
 
-## 7. dash-router-net: the tokio shell
+## 7. dash-router: the tokio shell
 
 One task per node, structured as `tokio::select!` over:
 
@@ -526,7 +526,7 @@ topic name.
 6. **sim update**: behavior proposes `NodeAction`s (incl. `NativeSync`/
    `AppGc`/`RelayEvict` with policy); rerun scenarios, record the new
    baseline, quantify §2.4.
-7. **`dash-router-net`**: async traits, shell loop, standalone stores,
+7. **`dash-router`**: async traits, shell loop, standalone stores,
    command API; lockstep conformance test; the `dash-router-p2panda`
    adapter (§3.5).
 8. **DESIGN.md edit**: remove `fresh` from the message enum and reword §2
