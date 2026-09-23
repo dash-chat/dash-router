@@ -114,6 +114,101 @@ impl Transport for LoopbackTransport {
     }
 }
 
+/// What an embedder that already runs a gossip overlay hands us: publish
+/// bytes on the well-known topic, and a stream of `(verified author,
+/// bytes)`. Dash Chat implements these over p2panda's ephemeral stream,
+/// whose signed envelope is where `PeerKey` comes from (spec §3.1).
+#[trait_variant::make(Send)]
+pub trait GossipPublisher {
+    async fn publish(&mut self, bytes: Vec<u8>) -> Result<()>;
+}
+
+#[trait_variant::make(Send)]
+pub trait GossipSubscription {
+    /// `None` = the overlay is gone; the transport reports shutdown.
+    async fn next(&mut self) -> Option<(PeerKey, Vec<u8>)>;
+}
+
+/// A [`Transport`] over an embedder-supplied gossip pair. The overlay's
+/// membership is the LAN boundary, so `remote` is always `None`.
+pub struct GossipTransport<P, S> {
+    publisher: P,
+    subscription: S,
+}
+
+impl<P, S> GossipTransport<P, S> {
+    pub fn new(publisher: P, subscription: S) -> Self {
+        Self {
+            publisher,
+            subscription,
+        }
+    }
+}
+
+impl<P: GossipPublisher, S: GossipSubscription> Transport for GossipTransport<P, S> {
+    async fn broadcast(&mut self, bytes: Vec<u8>) -> Result<()> {
+        self.publisher.publish(bytes).await
+    }
+
+    async fn recv(&mut self) -> Option<Incoming> {
+        let (author, bytes) = self.subscription.next().await?;
+        Some(Incoming {
+            remote: None,
+            author: Some(author),
+            bytes,
+        })
+    }
+}
+
+#[cfg(test)]
+mod gossip_tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    struct ChanPub(mpsc::Sender<Vec<u8>>);
+    impl GossipPublisher for ChanPub {
+        async fn publish(&mut self, bytes: Vec<u8>) -> Result<()> {
+            self.0
+                .send(bytes)
+                .await
+                .map_err(|_| anyhow::anyhow!("closed"))
+        }
+    }
+    struct ChanSub(mpsc::Receiver<(PeerKey, Vec<u8>)>);
+    impl GossipSubscription for ChanSub {
+        async fn next(&mut self) -> Option<(PeerKey, Vec<u8>)> {
+            self.0.recv().await
+        }
+    }
+
+    #[tokio::test]
+    async fn gossip_transport_forwards_publishes_and_tags_incoming_with_author() {
+        let (pub_tx, mut pub_rx) = mpsc::channel(4);
+        let (sub_tx, sub_rx) = mpsc::channel(4);
+        let mut t = GossipTransport::new(ChanPub(pub_tx), ChanSub(sub_rx));
+
+        t.broadcast(vec![1, 2, 3]).await.unwrap();
+        assert_eq!(pub_rx.recv().await, Some(vec![1, 2, 3]));
+
+        sub_tx.send((PeerKey([9; 32]), vec![4])).await.unwrap();
+        assert_eq!(
+            t.recv().await,
+            Some(Incoming {
+                remote: None,
+                author: Some(PeerKey([9; 32])),
+                bytes: vec![4]
+            })
+        );
+
+        drop(sub_tx);
+        assert_eq!(
+            t.recv().await,
+            None,
+            "closed subscription = transport shut down"
+        );
+    }
+}
+
 #[tokio::test]
 async fn loopback_broadcasts_to_everyone_but_the_sender() {
     let hub = LoopbackHub::new();
