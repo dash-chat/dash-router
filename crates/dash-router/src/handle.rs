@@ -1,7 +1,7 @@
 //! The embedding API's data types (spec §5): the command channel and
 //! `RouterHandle` that Task 10's `spawn` returns alongside the node task.
 
-use dash_router_core::{Log, Op, Seq};
+use dash_router_core::{Log, LogRanges, Op, Seq};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,6 +46,12 @@ pub enum Command<L: Log> {
     /// plain read of already-maintained counters.
     Stats {
         reply: oneshot::Sender<StatsSnapshot>,
+    },
+    /// What the relay store holds right now, per log: what a peer's Want
+    /// could be answered with from this node without the ext store. A
+    /// plain read, like `Stats`.
+    RelayHeld {
+        reply: oneshot::Sender<anyhow::Result<LogRanges<L>>>,
     },
     Shutdown,
 }
@@ -125,6 +131,19 @@ impl<L: Log + Send> RouterHandle<L> {
         reply_rx
             .await
             .map_err(|_| anyhow::anyhow!("router task dropped the reply"))
+    }
+
+    /// Everything the relay store holds, per log. The ext store is not
+    /// included: this is what the node relays for others.
+    pub async fn relay_held(&self) -> anyhow::Result<LogRanges<L>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Command::RelayHeld { reply: reply_tx })
+            .await
+            .map_err(|_| anyhow::anyhow!("router task is gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("router task dropped the reply"))?
     }
 
     /// A closed channel means the task is already down — that's not a
