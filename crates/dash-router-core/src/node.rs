@@ -241,9 +241,14 @@ where
                 self.route_router_fx(&mut s, fx, &BTreeMap::new(), &mut out)?;
             }
             NodeAction::Recv(wire) => match wire.body {
-                WireBody::Want { ranges, prefixes } => {
+                WireBody::Want {
+                    origin,
+                    ranges,
+                    prefixes,
+                } => {
                     let fx = s.router.step(RouterAction::RecvWant {
                         from: wire.sender,
+                        origin,
                         ranges,
                         prefixes,
                     })?;
@@ -363,7 +368,7 @@ where
     fn route_router_fx(
         &self,
         s: &mut NodeState<N, L, T>,
-        fx: Vec<Effect<L>>,
+        fx: Vec<Effect<N, L>>,
         parked: &BTreeMap<(L, Seq), Op>,
         out: &mut Vec<NodeEffect<N, L>>,
     ) -> anyhow::Result<()> {
@@ -383,9 +388,14 @@ where
                         }
                     }
                 }
-                Effect::SendWant { ranges, prefixes } => {
+                Effect::SendWant {
+                    origin,
+                    ranges,
+                    prefixes,
+                } => {
                     out.push(NodeEffect::Broadcast(WireMessage::want(
                         s.router.id,
+                        origin,
                         ranges,
                         prefixes,
                     )));

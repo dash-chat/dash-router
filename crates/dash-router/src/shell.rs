@@ -281,17 +281,25 @@ where
             return Ok(out);
         }
         match msg.body {
-            WireBody::Want { ranges, prefixes } => {
+            WireBody::Want {
+                origin,
+                ranges,
+                prefixes,
+            } => {
                 // Finding 8(a): an EMPTY Want must not arm the have timer —
                 // otherwise it arms a forever no-op fire/re-arm loop (fire
                 // finds nothing to reply to, re-arms, repeats). Gate on the
                 // received Want naming something — ranges or prefixes (a
                 // prefix-only Want is a real request: it asks for every log
-                // under the prefix) — mirrored exactly by the conformance
-                // driver (see tests/conformance.rs).
+                // under the prefix) — and on it being someone else's: an
+                // echo of this node's own Want is not recorded, so it
+                // witnesses nothing to answer. Mirrored exactly by the
+                // conformance driver (see tests/conformance.rs).
                 let want_nonempty = !ranges.is_empty() || !prefixes.is_empty();
+                let foreign = origin != self.router.id;
                 let fx = self.router.step(RouterAction::RecvWant {
                     from: msg.sender,
+                    origin,
                     ranges,
                     prefixes,
                 })?;
@@ -300,7 +308,7 @@ where
                 // A witnessed Want is what makes arming the Have timer
                 // legal (mirrors the sim behavior's arm-on-recv): do it
                 // right after the Recv, in the same call.
-                if want_nonempty && self.router.have_timer.is_none() {
+                if want_nonempty && foreign && self.router.have_timer.is_none() {
                     let next = self.intervals.next_have();
                     self.router.step(RouterAction::ArmHaveTimer(next.into()))?;
                 }
@@ -507,7 +515,7 @@ where
 
     /// Take the accumulated pending push and run it through the router, if
     /// non-empty.
-    fn flush_push(&mut self) -> Result<Vec<Effect<L>>> {
+    fn flush_push(&mut self) -> Result<Vec<Effect<N, L>>> {
         let ranges = std::mem::replace(&mut self.pending_push, LogRanges::empty());
         self.pending_since = None;
         if ranges.is_empty() {
@@ -521,7 +529,7 @@ where
     /// the async transcription of `NodeMachine::route_router_fx`.
     async fn route_fx(
         &mut self,
-        fx: Vec<Effect<L>>,
+        fx: Vec<Effect<N, L>>,
         parked: &BTreeMap<(L, Seq), Op>,
         failed: &BTreeSet<(L, Seq)>,
         out: &mut Vec<Out<N, L>>,
@@ -545,9 +553,18 @@ where
                         }
                     }
                 }
-                Effect::SendWant { ranges, prefixes } => {
-                    let (msgs, dropped) =
-                        pack_want(self.router.id, ranges, prefixes, self.max_wire_bytes);
+                Effect::SendWant {
+                    origin,
+                    ranges,
+                    prefixes,
+                } => {
+                    let (msgs, dropped) = pack_want(
+                        self.router.id,
+                        origin,
+                        ranges,
+                        prefixes,
+                        self.max_wire_bytes,
+                    );
                     self.oversize_drops += dropped;
                     out.extend(msgs.into_iter().map(Out::Broadcast));
                 }
@@ -931,7 +948,7 @@ mod tests {
     use std::time::Duration;
 
     use dash_router_core::{
-        EvictableStorage, LogRanges, Op, OpsMap, Ranges, RouterConfig, Storage, WireBody,
+        EvictableStorage, LogRanges, Op, OpsMap, Pair, Ranges, RouterConfig, Storage, WireBody,
         WireMessage,
     };
     // NOTE: OpsMap has both the sync traits and (via the blanket bridge) the
@@ -968,6 +985,7 @@ mod tests {
     }
 
     type Core = NodeCore<u32, u8, OpsMap<u8>, OpsMap<u8>, Scripted>;
+    type PairCore = NodeCore<u32, Pair, OpsMap<Pair>, OpsMap<Pair>, Scripted>;
 
     fn config(cap: Units) -> CoreConfig {
         CoreConfig {
@@ -1005,7 +1023,7 @@ mod tests {
         }
     }
 
-    fn wire(msg: WireMessage<u32, u8>) -> Incoming {
+    fn wire<L: WireLog>(msg: WireMessage<u32, L>) -> Incoming {
         Incoming {
             remote: Some("192.168.0.9".parse().unwrap()),
             author: None,
@@ -1146,12 +1164,12 @@ mod tests {
     #[tokio::test]
     async fn prefix_only_want_arms_have_timer_but_empty_want_does_not() {
         let mut c = core(100, &[]).await;
-        let empty = WireMessage::want(7, LogRanges::<u8>::empty(), BTreeSet::new());
+        let empty = WireMessage::want(7, 7, LogRanges::<u8>::empty(), BTreeSet::new());
         c.on_wire(Duration::from_millis(1), wire(empty))
             .await
             .unwrap();
         assert!(c.router.have_timer.is_none(), "empty Want must not arm");
-        let prefix_only = WireMessage::want(7, LogRanges::<u8>::empty(), BTreeSet::from([0u8]));
+        let prefix_only = WireMessage::want(7, 7, LogRanges::<u8>::empty(), BTreeSet::from([0u8]));
         c.on_wire(Duration::from_millis(2), wire(prefix_only))
             .await
             .unwrap();
@@ -1227,7 +1245,7 @@ mod tests {
         assert!(
             matches!(
                 &bs[0].body,
-                WireBody::Want { ranges, prefixes }
+                WireBody::Want { origin: 0, ranges, prefixes }
                     if prefixes.contains(&0) && ranges.get(&0).is_none()
             ),
             "fresh subscription wants the whole prefix"
@@ -1243,6 +1261,7 @@ mod tests {
             .unwrap();
 
         let want = WireMessage::want(
+            7,
             7,
             LogRanges::from_pairs([(0u8, Ranges::full())]),
             BTreeSet::new(),
@@ -1319,6 +1338,7 @@ mod tests {
         }
         let want = WireMessage::want(
             7,
+            7,
             LogRanges::from_pairs([(0u8, Ranges::full())]),
             BTreeSet::new(),
         );
@@ -1355,21 +1375,76 @@ mod tests {
     /// Spec 2026-09-22 §3.3 end to end: a Want that `pack_want` splits into
     /// several wire messages is recorded whole by the receiver — prefixes
     /// (first piece) and every piece's ranges — not just the last piece.
+    ///
+    /// Final review F1: the receiver holds two logs under the wanted
+    /// prefix, `a` (named by the split Want) and `b` (not named). The split
+    /// Want arrives relayed by 7, as does the receiver's own Want, echoed
+    /// back. The echo names both logs; it must not count as the wanter
+    /// naming them, so `a` goes as its named tail and `b` wholesale.
     #[tokio::test]
     async fn split_want_is_fully_recorded_by_the_receiver() {
-        let ranges = LogRanges::from_pairs((0..200u8).map(|l| (l, Ranges::from(3))));
-        let prefixes: BTreeSet<u8> = (100..110).collect();
-        let (msgs, dropped) = crate::pack::pack_want(7u32, ranges.clone(), prefixes.clone(), 200);
+        let a = Pair::new(1, 1);
+        let b = Pair::new(1, 2);
+        let mut c: PairCore = NodeCore::new(
+            0u32,
+            config(100),
+            BTreeSet::from([1u8]),
+            OpsMap::default(),
+            OpsMap::default(),
+            Scripted::ms(&[100]),
+        );
+        c.init().await.unwrap();
+        let have = WireMessage::have(
+            9u32,
+            vec![
+                (a, (0..10).map(|q| (q, op(q as u8, true))).collect()),
+                (b, (0..5).map(|q| (q, op(q as u8, true))).collect()),
+            ],
+        );
+        let _ = c.on_wire(Duration::ZERO, wire(have)).await.unwrap();
+        // Past have_ttl, so 9's Have no longer suppresses an answer. The
+        // receiver's own Want timer fires every 100 ms meanwhile.
+        let out = c.advance_to(Duration::from_millis(600)).await.unwrap();
+        let own_want = out
+            .iter()
+            .rev()
+            .find_map(|o| match o {
+                Out::Broadcast(m) if matches!(m.body, WireBody::Want { .. }) => Some(m.clone()),
+                _ => None,
+            })
+            .expect("the receiver fires its own Want");
+
+        let ranges = LogRanges::from_pairs(
+            std::iter::once((a, Ranges::from(5)))
+                .chain((0..200u8).map(|l| (Pair::new(2, l), Ranges::from(3)))),
+        );
+        let prefixes: BTreeSet<u8> = std::iter::once(1).chain(100..110).collect();
+        let (msgs, dropped) =
+            crate::pack::pack_want(8u32, 8u32, ranges.clone(), prefixes.clone(), 200);
         assert_eq!(dropped, 0);
         assert!(msgs.len() >= 3, "the Want must actually split");
-        let mut c = core(100, &[]).await;
-        for (i, msg) in msgs.into_iter().enumerate() {
+        // Relayer 7 re-signs; the origin rides through unchanged.
+        for (i, mut msg) in msgs.into_iter().chain([own_want]).enumerate() {
+            msg.sender = 7;
             let _ = c
-                .on_wire(Duration::from_millis(i as u64), wire(msg))
+                .on_wire(Duration::from_millis(600 + i as u64), wire(msg))
                 .await
                 .unwrap();
         }
-        assert_eq!(c.router.others_wants(), ranges, "every piece's ranges");
+        assert_eq!(
+            c.router.next_have(),
+            LogRanges::from_pairs([(a, Ranges::range(5, 10)), (b, Ranges::range(0, 5))]),
+            "named log: its tail only; unnamed log under the prefix: wholesale"
+        );
+        assert_eq!(
+            c.router.wants.keys().copied().collect::<Vec<_>>(),
+            vec![8],
+            "recorded under the origin only: not the relayer, not the echo"
+        );
+        let recorded = c.router.wants[&8]
+            .iter()
+            .fold(LogRanges::empty(), |acc, r| acc.union(&r.ranges));
+        assert_eq!(recorded, ranges, "every piece's ranges");
         assert_eq!(c.router.others_prefixes(), prefixes, "the prefix piece too");
     }
 
@@ -1409,6 +1484,7 @@ mod tests {
             bytes: vec![0xff, 0x00],
         };
         let echo = wire(WireMessage::want(
+            0,
             0,
             LogRanges::from_pairs([(0u8, Ranges::full())]),
             BTreeSet::new(),
@@ -1459,6 +1535,7 @@ mod tests {
         );
         c.init().await.unwrap();
         let msg = WireMessage::want(
+            Keyed(2),
             Keyed(2),
             LogRanges::from_pairs([(0u8, Ranges::full())]),
             BTreeSet::new(),

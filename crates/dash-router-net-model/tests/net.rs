@@ -232,6 +232,7 @@ fn absent_messages_and_smuggled_recvs_are_disabled() {
             n(1),
             NodeAction::Router(RouterAction::RecvWant {
                 from: n(0),
+                origin: n(0),
                 ranges: LogRanges::empty(),
                 prefixes: BTreeSet::new(),
             }),
@@ -303,4 +304,130 @@ fn the_inflight_cap_disables_overflowing_actions() {
             .is_err(),
         "duplicate past the cap should not be enabled"
     );
+}
+
+/// Final review F1, end to end: prefix subscribers behind a relay, with
+/// two-level logs so one prefix holds several logs.
+mod prefix_behind_relay {
+    use std::{sync::Arc, time::Duration};
+
+    use dash_router_core::{
+        NodeAction, NodeMachine, NodeState, Op, Pair, Ranges, RouterAction, RouterConfig,
+    };
+    use dash_router_net_model::{NetAction, NetMachine, NetState, Topology};
+    use polestar::{StateMachine, prelude::*, time::RealTime};
+
+    const K: usize = 64;
+    type Net = NetMachine<u32, Pair, RealTime, K>;
+    type A = NetAction<u32, Pair, RealTime, K>;
+
+    const X: Pair = Pair::new(1, 1);
+    const Y: Pair = Pair::new(1, 2);
+    const SUB: u32 = 0;
+    const RELAY: u32 = 1;
+    const HOLDER: u32 = 2;
+
+    fn ms(n: u64) -> RealTime {
+        Duration::from_millis(n).into()
+    }
+
+    fn op(b: u8) -> Op {
+        Op {
+            header: vec![b],
+            payload: Some(vec![b; 4]),
+        }
+    }
+
+    fn drain(net: &mut StateMachine<Net>) {
+        for _ in 0..1000 {
+            if net.inflight.is_empty() {
+                return;
+            }
+            net.step(A::Deliver(UpTo::new(0))).unwrap();
+        }
+        panic!("flood did not terminate");
+    }
+
+    fn router(net: &mut StateMachine<Net>, id: u32, action: RouterAction<u32, Pair, RealTime>) {
+        net.step(A::Node(id, NodeAction::Router(action))).unwrap();
+    }
+
+    /// Every node fires a Want, then every node that witnessed one fires a
+    /// Have, each fully delivered; then time moves on well inside `want_ttl`.
+    fn round(net: &mut StateMachine<Net>) {
+        let ids = [SUB, RELAY, HOLDER];
+        for id in ids {
+            router(net, id, RouterAction::ArmWantTimer(ms(0)));
+            router(net, id, RouterAction::FireWant);
+            drain(net);
+        }
+        for id in ids {
+            if !net.nodes[&id].router.wants.is_empty() {
+                router(net, id, RouterAction::ArmHaveTimer(ms(0)));
+                router(net, id, RouterAction::FireHave);
+                drain(net);
+            }
+        }
+        for id in ids {
+            router(net, id, RouterAction::Tick(ms(200)));
+        }
+    }
+
+    /// Path SUB — RELAY — HOLDER. SUB subscribes to prefix 1; RELAY is a
+    /// pure relay; HOLDER authored `1/1` seqs 0..4 and `1/2` seqs 0..3 with
+    /// the flood lost. HOLDER's own Want comes back to it relayed by RELAY,
+    /// which must not stop it answering SUB's prefix with the logs SUB did
+    /// not name. `sub_holds` is what SUB already holds of `1/1`.
+    fn run(sub_holds: u32) {
+        let nm = NodeMachine::new(
+            RouterConfig {
+                want_ttl: ms(500),
+                have_ttl: ms(500),
+            },
+            10_000,
+        );
+        let m = Arc::new(Net::new(Topology::path([SUB, RELAY, HOLDER]), nm.clone()));
+        let mut net = m.state_machine(NetState::new([
+            NodeState::new(SUB, nm.clone(), [1u8]),
+            NodeState::new(RELAY, nm.clone(), []),
+            NodeState::new(HOLDER, nm.clone(), [1u8]),
+        ]));
+        for (log, n) in [(X, 4), (Y, 3)] {
+            for seq in 0..n {
+                net.step(A::Node(
+                    HOLDER,
+                    NodeAction::Authored(log, seq, op(seq as u8)),
+                ))
+                .unwrap();
+                while !net.inflight.is_empty() {
+                    net.step(A::Drop(UpTo::new(0))).unwrap();
+                }
+            }
+        }
+        for seq in 0..sub_holds {
+            net.step(A::Node(SUB, NodeAction::NativeSync(X, seq, op(seq as u8))))
+                .unwrap();
+        }
+        for _ in 0..4 {
+            round(&mut net);
+        }
+        let held = &net.nodes[&SUB].router.held;
+        assert_eq!(
+            held.get(&X),
+            Some(&Ranges::range(0, 4)),
+            "SUB holding {sub_holds} of 1/1: all of 1/1"
+        );
+        assert_eq!(
+            held.get(&Y),
+            Some(&Ranges::range(0, 3)),
+            "SUB holding {sub_holds} of 1/1: the unknown author 1/2 wholesale"
+        );
+    }
+
+    #[test]
+    fn late_subscriber_behind_a_relay_receives_unknown_authors() {
+        for sub_holds in [0, 1, 4] {
+            run(sub_holds);
+        }
+    }
 }
