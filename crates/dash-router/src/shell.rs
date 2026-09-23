@@ -952,6 +952,9 @@ where
                                 oversize_drops: core.oversize_drops,
                             });
                         }
+                        Some(Command::RelayHeld { reply }) => {
+                            let _ = reply.send(core.relay.held_all().await);
+                        }
                     }
                 }
                 inc = transport.recv() => {
