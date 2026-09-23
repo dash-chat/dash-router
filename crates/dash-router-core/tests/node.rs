@@ -458,11 +458,11 @@ mod prefix {
     use std::collections::BTreeSet;
     use std::time::Duration;
 
-    use dash_router_core::{RouterAction, Storage};
     use dash_router_core::{
         LogRanges, NodeAction, NodeEffect, NodeMachine, NodeState, Op, Pair, Ranges, RouterConfig,
         WireBody, WireMessage,
     };
+    use dash_router_core::{RouterAction, Storage};
     use polestar::prelude::*;
     use polestar::time::RealTime;
 
@@ -479,11 +479,17 @@ mod prefix {
     }
 
     fn op(b: u8) -> Op {
-        Op { header: vec![b], payload: Some(vec![b; 4]) }
+        Op {
+            header: vec![b],
+            payload: Some(vec![b; 4]),
+        }
     }
 
     fn have(from: u32, log: Pair, seqs: &[u32]) -> WireMessage<u32, Pair> {
-        WireMessage::have(from, vec![(log, seqs.iter().map(|&q| (q, op(q as u8))).collect())])
+        WireMessage::have(
+            from,
+            vec![(log, seqs.iter().map(|&q| (q, op(q as u8))).collect())],
+        )
     }
 
     /// Review focus 1: a never-seen author under a subscribed prefix is ext data.
@@ -492,10 +498,15 @@ mod prefix {
         let m = machine();
         let s = NodeState::new(0u32, m.clone(), [1u8]);
         let new_author = Pair::new(1, 42);
-        let (s, fx) = m.transition(s, NodeAction::Recv(have(7, new_author, &[0, 1]))).unwrap();
+        let (s, fx) = m
+            .transition(s, NodeAction::Recv(have(7, new_author, &[0, 1])))
+            .unwrap();
         assert!(fx.contains(&NodeEffect::Deliver(new_author, 0)));
         assert!(fx.contains(&NodeEffect::Deliver(new_author, 1)));
-        assert_eq!(s.ext.0.held_all().get(&new_author), Some(&Ranges::range(0, 2)));
+        assert_eq!(
+            s.ext.0.held_all().get(&new_author),
+            Some(&Ranges::range(0, 2))
+        );
         assert!(s.relay.0.held_all().get(&new_author).is_none());
     }
 
@@ -507,9 +518,15 @@ mod prefix {
         let a1 = Pair::new(1, 1);
         let a2 = Pair::new(1, 2);
         let other = Pair::new(2, 1);
-        let (s, _) = m.transition(s, NodeAction::Recv(have(7, a1, &[0]))).unwrap();
-        let (s, _) = m.transition(s, NodeAction::Recv(have(7, a2, &[0, 1]))).unwrap();
-        let (s, _) = m.transition(s, NodeAction::Recv(have(7, other, &[0]))).unwrap();
+        let (s, _) = m
+            .transition(s, NodeAction::Recv(have(7, a1, &[0])))
+            .unwrap();
+        let (s, _) = m
+            .transition(s, NodeAction::Recv(have(7, a2, &[0, 1])))
+            .unwrap();
+        let (s, _) = m
+            .transition(s, NodeAction::Recv(have(7, other, &[0])))
+            .unwrap();
         let (s, _) = m.transition(s, NodeAction::Subscribe(1u8)).unwrap();
         assert!(s.is_subscribed(&a1) && s.is_subscribed(&a2) && !s.is_subscribed(&other));
         assert_eq!(s.ext.0.held_all().get(&a1), Some(&Ranges::range(0, 1)));
@@ -528,7 +545,9 @@ mod prefix {
         let (s, _) = m.transition(s, NodeAction::Unsubscribe(1u8)).unwrap();
         assert!(s.router.open.is_empty());
         let a1 = Pair::new(1, 1);
-        let (s, fx) = m.transition(s, NodeAction::Recv(have(7, a1, &[0]))).unwrap();
+        let (s, fx) = m
+            .transition(s, NodeAction::Recv(have(7, a1, &[0])))
+            .unwrap();
         assert!(!fx.iter().any(|e| matches!(e, NodeEffect::Deliver(..))));
         assert_eq!(s.relay.0.held_all().get(&a1), Some(&Ranges::range(0, 1)));
     }
@@ -541,13 +560,19 @@ mod prefix {
         let s = NodeState::new(0u32, m.clone(), [1u8]);
         assert!(s.held_union().is_empty(), "no marker");
         let (s, _) = m
-            .transition(s, NodeAction::Router(RouterAction::ArmWantTimer(Duration::ZERO.into())))
+            .transition(
+                s,
+                NodeAction::Router(RouterAction::ArmWantTimer(Duration::ZERO.into())),
+            )
             .unwrap();
-        let (_, fx) = m.transition(s, NodeAction::Router(RouterAction::FireWant)).unwrap();
+        let (_, fx) = m
+            .transition(s, NodeAction::Router(RouterAction::FireWant))
+            .unwrap();
         let want = fx.iter().find_map(|e| match e {
-            NodeEffect::Broadcast(WireMessage { body: WireBody::Want { ranges, prefixes }, .. }) => {
-                Some((ranges.clone(), prefixes.clone()))
-            }
+            NodeEffect::Broadcast(WireMessage {
+                body: WireBody::Want { ranges, prefixes },
+                ..
+            }) => Some((ranges.clone(), prefixes.clone())),
             _ => None,
         });
         assert_eq!(want, Some((LogRanges::empty(), BTreeSet::from([1u8]))));

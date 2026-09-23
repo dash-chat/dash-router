@@ -24,9 +24,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use dash_router_core::{Op, OpsMap, RouterConfig, Storage};
 use dash_router::panda::{PandaTransport, spawn_panda};
 use dash_router::{CoreConfig, MemStore, PolicyIntervals, RouterEvent, RouterHandle, spawn};
+use dash_router_core::{Op, OpsMap, RouterConfig, Storage};
 use dash_router_policy::{IntervalPolicy, PushDebouncePolicy};
 use p2panda_core::{SigningKey, VerifyingKey};
 use rand::SeedableRng;
