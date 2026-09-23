@@ -109,6 +109,11 @@ pub struct NodeCore<N: Id, L: Log, E, R, I> {
     /// Items (ops, prefixes, per-log ranges) that could not fit
     /// `max_wire_bytes` even alone and were left out of a broadcast.
     pub oversize_drops: u64,
+    /// Wire traffic since the last [`Self::log_summary`].
+    recv_msgs: u64,
+    sent_msgs: u64,
+    peers_heard: BTreeSet<N>,
+    peers_seen: BTreeSet<N>,
 }
 
 impl<N, L, E, R, I> NodeCore<N, L, E, R, I>
@@ -151,7 +156,41 @@ where
             dropped_msgs: 0,
             relay_errors: 0,
             oversize_drops: 0,
+            recv_msgs: 0,
+            sent_msgs: 0,
+            peers_heard: BTreeSet::new(),
+            peers_seen: BTreeSet::new(),
         }
+    }
+
+    fn relay_error(&mut self, context: &'static str, e: anyhow::Error) {
+        self.relay_errors += 1;
+        tracing::warn!(context, error = %e, "dash-router relay store error");
+    }
+
+    fn drop_msg(&mut self, reason: &'static str) {
+        self.dropped_msgs += 1;
+        tracing::debug!(reason, "dash-router dropped wire message");
+    }
+
+    /// Log what the node has heard and sent since the last call, then
+    /// reset the window.
+    pub fn log_summary(&mut self) {
+        tracing::debug!(
+            recv = self.recv_msgs,
+            sent = self.sent_msgs,
+            peers = self.peers_heard.len(),
+            subscriptions = self.subscriptions.len(),
+            held_logs = self.held_cache.iter().count(),
+            wanters = self.router.wants.len(),
+            dropped_total = self.dropped_msgs,
+            relay_errors_total = self.relay_errors,
+            oversize_drops_total = self.oversize_drops,
+            "dash-router summary"
+        );
+        self.recv_msgs = 0;
+        self.sent_msgs = 0;
+        self.peers_heard.clear();
     }
 
     /// A log is subscribed iff its prefix is (`NodeState::is_subscribed`).
@@ -257,28 +296,35 @@ where
     /// semantics #8 without touching state.
     pub async fn on_wire(&mut self, now: Duration, inc: Incoming) -> Result<Vec<Out<N, L>>> {
         let mut out = self.advance_to(now).await?;
+        self.recv_msgs += 1;
         if let Some(remote) = inc.remote
             && !is_lan(remote)
         {
-            self.dropped_msgs += 1;
+            self.drop_msg("remote is not on the LAN");
             return Ok(out);
         }
         let msg: WireMessage<N, L> = match WireMessage::decode(&inc.bytes) {
             Ok(m) => m,
-            Err(_) => {
-                self.dropped_msgs += 1;
+            Err(e) => {
+                tracing::debug!(error = %e, bytes = inc.bytes.len(), "dash-router could not decode wire message");
+                self.drop_msg("undecodable");
                 return Ok(out);
             }
         };
         if msg.sender == self.router.id {
-            self.dropped_msgs += 1;
+            self.drop_msg("our own message");
             return Ok(out);
         }
         if let Some(author) = inc.author
             && msg.sender.peer_key() != Some(author)
         {
-            self.dropped_msgs += 1;
+            tracing::debug!(sender = %msg.sender, author = ?author, "dash-router sender does not match transport author");
+            self.drop_msg("sender is not the transport author");
             return Ok(out);
+        }
+        self.peers_heard.insert(msg.sender);
+        if self.peers_seen.insert(msg.sender) {
+            tracing::info!(peer = %msg.sender, "dash-router heard from a new peer");
         }
         match msg.body {
             WireBody::Want {
@@ -286,6 +332,13 @@ where
                 ranges,
                 prefixes,
             } => {
+                tracing::trace!(
+                    from = %msg.sender,
+                    %origin,
+                    logs = ranges.iter().count(),
+                    prefixes = prefixes.len(),
+                    "dash-router received want"
+                );
                 // Finding 8(a): an EMPTY Want must not arm the have timer —
                 // otherwise it arms a forever no-op fire/re-arm loop (fire
                 // finds nothing to reply to, re-arms, repeats). Gate on the
@@ -318,6 +371,7 @@ where
                     .into_iter()
                     .flat_map(|(log, seqs)| seqs.into_iter().map(move |(q, o)| ((log, q), o)))
                     .collect();
+                tracing::debug!(from = %msg.sender, ops = parked.len(), "dash-router received have");
                 let ranges = ranges_of(&parked);
                 let fx = self.router.step(RouterAction::RecvHave {
                     from: msg.sender,
@@ -382,8 +436,8 @@ where
                     .filter(|(log, _)| log.prefix() == prefix)
                     .map(|(log, _)| (*log, Ranges::full())),
             ),
-            Err(_) => {
-                self.relay_errors += 1;
+            Err(e) => {
+                self.relay_error("on_subscribe: relay.held_all", e);
                 LogRanges::empty()
             }
         };
@@ -416,15 +470,18 @@ where
                             .into_iter()
                             .map(|(l, seqs)| (l, Ranges::from_seqs(seqs))),
                     );
-                    if !ingested.is_empty() && self.relay.evict(&ingested).await.is_err() {
-                        self.relay_errors += 1;
+                    if !ingested.is_empty()
+                        && let Err(e) = self.relay.evict(&ingested).await
+                    {
+                        self.relay_error("on_subscribe: relay.evict", e);
                     }
                 }
-                Err(_) => self.relay_errors += 1, // nothing evicted
+                Err(e) => self.relay_error("on_subscribe: relay.fetch", e), // nothing evicted
             }
         }
         self.router
             .step(RouterAction::Open(self.subscriptions.clone()))?;
+        tracing::debug!(%prefix, relay_logs_migrated = under.iter().count(), "dash-router subscribed");
         let touched: BTreeSet<L> = under.iter().map(|(l, _)| *l).collect();
         self.reconcile_held(Some(&touched), &mut out).await?;
         Ok(out)
@@ -446,6 +503,7 @@ where
         self.subscriptions.remove(&prefix);
         self.router
             .step(RouterAction::Open(self.subscriptions.clone()))?;
+        tracing::debug!(%prefix, "dash-router unsubscribed");
         self.reconcile_held(None, &mut out).await?;
         Ok(out)
     }
@@ -469,17 +527,23 @@ where
         let mut out = self.advance_to(now).await?;
         let usage = match self.relay.usage().await {
             Ok(u) => u,
-            Err(_) => {
-                self.relay_errors += 1;
+            Err(e) => {
+                self.relay_error("on_maintain: relay.usage", e);
                 return Ok(out);
             }
         };
         let threshold = ((self.evict_at * self.relay_cap as f64) as Units).max(1);
         if usage >= threshold {
+            tracing::debug!(
+                usage,
+                threshold,
+                cap = self.relay_cap,
+                "dash-router relay over threshold, evicting"
+            );
             let held_payloads = match self.relay.held_payloads().await {
                 Ok(h) => h,
-                Err(_) => {
-                    self.relay_errors += 1;
+                Err(e) => {
+                    self.relay_error("on_maintain: relay.held_payloads", e);
                     return Ok(out);
                 }
             };
@@ -488,21 +552,21 @@ where
             if !candidates.is_empty() {
                 // Payloads-first: headers survive, so no `Held` snapshot is
                 // needed.
-                if self.relay.evict_payloads(&candidates).await.is_err() {
-                    self.relay_errors += 1;
+                if let Err(e) = self.relay.evict_payloads(&candidates).await {
+                    self.relay_error("on_maintain: relay.evict_payloads", e);
                 }
             } else {
                 let held_all = match self.relay.held_all().await {
                     Ok(h) => h,
-                    Err(_) => {
-                        self.relay_errors += 1;
+                    Err(e) => {
+                        self.relay_error("on_maintain: relay.held_all", e);
                         return Ok(out);
                     }
                 };
                 let full = held_all.difference(&others_wants);
                 if !full.is_empty() {
-                    if self.relay.evict(&full).await.is_err() {
-                        self.relay_errors += 1;
+                    if let Err(e) = self.relay.evict(&full).await {
+                        self.relay_error("on_maintain: relay.evict", e);
                     } else {
                         let touched: BTreeSet<L> = full.iter().map(|(l, _)| *l).collect();
                         self.reconcile_held(Some(&touched), &mut out).await?;
@@ -558,6 +622,12 @@ where
                     ranges,
                     prefixes,
                 } => {
+                    tracing::trace!(
+                        %origin,
+                        logs = ranges.iter().count(),
+                        prefixes = prefixes.len(),
+                        "dash-router sending want"
+                    );
                     let (msgs, dropped) = pack_want(
                         self.router.id,
                         origin,
@@ -566,6 +636,7 @@ where
                         self.max_wire_bytes,
                     );
                     self.oversize_drops += dropped;
+                    self.sent_msgs += msgs.len() as u64;
                     out.extend(msgs.into_iter().map(Out::Broadcast));
                 }
                 Effect::SendHave(r) => {
@@ -594,8 +665,8 @@ where
     ) -> Result<Vec<WireMessage<N, L>>> {
         let mut ops = match self.relay.fetch(r).await {
             Ok(v) => v,
-            Err(_) => {
-                self.relay_errors += 1;
+            Err(e) => {
+                self.relay_error("hydrate: relay.fetch", e);
                 Vec::new()
             }
         };
@@ -618,8 +689,16 @@ where
                 .then_with(|| b.2.payload.is_some().cmp(&a.2.payload.is_some()))
         });
         ops.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+        let op_count = ops.len();
         let (msgs, dropped) = pack_have(self.router.id, ops, self.max_wire_bytes);
         self.oversize_drops += dropped;
+        self.sent_msgs += msgs.len() as u64;
+        tracing::debug!(
+            ops = op_count,
+            msgs = msgs.len(),
+            oversize_dropped = dropped,
+            "dash-router sending have"
+        );
         Ok(msgs)
     }
 
@@ -645,8 +724,8 @@ where
                 };
                 let relay_held = match self.relay.held_of(logs).await {
                     Ok(h) => h,
-                    Err(_) => {
-                        self.relay_errors += 1;
+                    Err(e) => {
+                        self.relay_error("reconcile_held: relay.held_of", e);
                         return Ok(()); // stale held_cache stands
                     }
                 };
@@ -673,8 +752,8 @@ where
                 };
                 let relay_all = match self.relay.held_all().await {
                     Ok(h) => h,
-                    Err(_) => {
-                        self.relay_errors += 1;
+                    Err(e) => {
+                        self.relay_error("reconcile_held: relay.held_all", e);
                         return Ok(());
                     }
                 };
@@ -723,8 +802,8 @@ where
             } else {
                 let units = match self.relay.ingest_delta(log, *seq, op).await {
                     Ok(u) => u,
-                    Err(_) => {
-                        self.relay_errors += 1;
+                    Err(e) => {
+                        self.relay_error("ingest_parked: relay.ingest_delta", e);
                         usage = None;
                         continue;
                     }
@@ -733,18 +812,19 @@ where
                     Some(u) => u,
                     None => match self.relay.usage().await {
                         Ok(u) => u,
-                        Err(_) => {
-                            self.relay_errors += 1;
+                        Err(e) => {
+                            self.relay_error("ingest_parked: relay.usage", e);
                             continue;
                         }
                     },
                 };
                 if current + units > self.relay_cap {
+                    tracing::debug!(%log, seq, usage = current, cap = self.relay_cap, "dash-router relay full, shedding op");
                     usage = Some(current);
                     continue; // shed: no room, and no eviction happened yet
                 }
-                if self.relay.ingest(*log, *seq, op.clone()).await.is_err() {
-                    self.relay_errors += 1;
+                if let Err(e) = self.relay.ingest(*log, *seq, op.clone()).await {
+                    self.relay_error("ingest_parked: relay.ingest", e);
                     usage = None;
                 } else {
                     usage = Some(current + units);
@@ -805,7 +885,8 @@ where
     let mut core = NodeCore::new(id, config, subscriptions, ext, relay, intervals);
     let mut transport = transport;
 
-    let task = tokio::spawn(async move {
+    let task = tokio::spawn(log_exit(async move {
+        tracing::info!(id = %core.router.id, subscriptions = core.subscriptions.len(), "dash-router started");
         let epoch = tokio::time::Instant::now();
         let mut maintain = tokio::time::interval(maintain_interval);
         maintain.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -824,7 +905,14 @@ where
             tokio::select! {
                 cmd = cmd_rx.recv() => {
                     match cmd {
-                        None | Some(Command::Shutdown) => break,
+                        None => {
+                            tracing::info!("dash-router command channel closed");
+                            break;
+                        }
+                        Some(Command::Shutdown) => {
+                            tracing::info!("dash-router shutdown requested");
+                            break;
+                        }
                         Some(Command::Append { log, seq, op, reply }) => {
                             let now = epoch.elapsed();
                             match core.on_append(now, log, seq, op).await {
@@ -868,7 +956,10 @@ where
                 }
                 inc = transport.recv() => {
                     match inc {
-                        None => break,
+                        None => {
+                            tracing::warn!("dash-router transport closed");
+                            break;
+                        }
                         Some(inc) => {
                             let now = epoch.elapsed();
                             let out = core.on_wire(now, inc).await?;
@@ -891,6 +982,7 @@ where
                             // hint polling so a `Closed` receiver (which
                             // would otherwise be immediately ready forever)
                             // can't busy-loop the select.
+                            tracing::warn!("dash-router storage hints closed");
                             hints_open = false;
                             Vec::new()
                         }
@@ -907,6 +999,7 @@ where
                     }
                 }
                 _ = maintain.tick() => {
+                    core.log_summary();
                     let now = epoch.elapsed();
                     let out = core.on_maintain(now).await?;
                     if !route_outs(out, &mut transport, &event_tx).await? {
@@ -916,9 +1009,18 @@ where
             }
         }
         Ok(())
-    });
+    }));
 
     (RouterHandle::new(cmd_tx), event_rx, task)
+}
+
+async fn log_exit(run: impl Future<Output = Result<()>>) -> Result<()> {
+    let result = run.await;
+    match &result {
+        Ok(()) => tracing::info!("dash-router stopped"),
+        Err(e) => tracing::error!(error = %e, "dash-router stopped with error"),
+    }
+    result
 }
 
 /// Route a batch of [`Out`] values: broadcasts go to the transport, events
@@ -938,7 +1040,8 @@ where
     for o in out {
         match o {
             Out::Broadcast(msg) => {
-                if transport.broadcast(msg.encode()).await.is_err() {
+                if let Err(e) = transport.broadcast(msg.encode()).await {
+                    tracing::warn!(error = %e, "dash-router broadcast failed; stopping");
                     return Ok(false);
                 }
             }
