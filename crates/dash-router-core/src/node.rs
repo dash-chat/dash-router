@@ -72,7 +72,8 @@ fn held_union<L: Log>(relay: &RelayStoreState<L>, ext: &ExtStoreState<L>) -> Log
 }
 
 impl<N: Id, L: Log, T: polestar::time::TimeInterval> NodeState<N, L, T> {
-    /// See [`held_union`].
+    /// Everything held, relay ∪ ext: the router's `held` snapshot (see the
+    /// private `held_union` fn for why there are no empty markers).
     pub fn held_union(&self) -> LogRanges<L> {
         held_union(&self.relay, &self.ext)
     }

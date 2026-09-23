@@ -120,6 +120,12 @@ impl Transport for LoopbackTransport {
 /// whose signed envelope is where `PeerKey` comes from (spec §3.1).
 #[trait_variant::make(Send)]
 pub trait GossipPublisher {
+    /// Publish one wire message. An `Err` stops the router task: the shell
+    /// treats a failed broadcast as the transport being gone, ends its
+    /// loop and the task's `JoinHandle` resolves to `Ok(())`, after which
+    /// every `RouterHandle` call fails. Return `Err` only when the overlay
+    /// is unusable, not for a transient hiccup (gossip is lossy anyway;
+    /// swallowing a dropped message is always safe).
     async fn publish(&mut self, bytes: Vec<u8>) -> Result<()>;
 }
 
@@ -129,8 +135,18 @@ pub trait GossipSubscription {
     async fn next(&mut self) -> Option<(PeerKey, Vec<u8>)>;
 }
 
-/// A [`Transport`] over an embedder-supplied gossip pair. The overlay's
-/// membership is the LAN boundary, so `remote` is always `None`.
+/// A [`Transport`] over an embedder-supplied gossip pair.
+///
+/// It performs no address filtering: `remote` is always `None` (the pair
+/// exposes no socket address), so the shell's `is_lan` check never fires,
+/// and every broadcast floods to every member of the embedder's gossip
+/// overlay, wherever they are. The overlay's membership *is* the router's
+/// reach. An embedder whose overlay is not LAN-scoped (e.g. one that also
+/// bootstraps or relays over the internet) is responsible for scoping it,
+/// for instance with a dedicated LAN-only topic. Otherwise Wants and Haves
+/// cross the internet too, and a Want — which lists the logs and prefixes
+/// its node is interested in — becomes an interest signal visible to every
+/// overlay member, not just to peers on the local network.
 pub struct GossipTransport<P, S> {
     publisher: P,
     subscription: S,

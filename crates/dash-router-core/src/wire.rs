@@ -11,9 +11,29 @@ use crate::{
     ranges::{LogRanges, Seq},
 };
 
-/// Bump together with the gossip topic on breaking change.
+/// Bump together with [`GOSSIP_TOPIC`] on breaking change.
 /// v1: Want carries prefixes (spec 2026-09-22 §3.5) and its origin.
 pub const WIRE_VERSION: u8 = 1;
+
+/// The well-known gossip topic name this wire protocol runs on. Every
+/// transport (the standalone p2panda one, and an embedder's own overlay
+/// behind `GossipTransport`) derives its topic from this one name, so
+/// nodes of the same wire version meet and nodes of different versions
+/// never share an overlay. Its suffix is [`WIRE_VERSION`]; bump both
+/// together (checked at compile time below).
+pub const GOSSIP_TOPIC: &str = "dash-router/v1";
+
+const _: () = {
+    assert!(
+        WIRE_VERSION == 1,
+        "bump the gossip topic suffix with the wire version"
+    );
+    let topic = GOSSIP_TOPIC.as_bytes();
+    assert!(
+        WIRE_VERSION < 10 && topic[topic.len() - 1] == b'0' + WIRE_VERSION,
+        "GOSSIP_TOPIC's suffix must be the wire version"
+    );
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(bound(

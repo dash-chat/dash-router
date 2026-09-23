@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, oneshot};
 pub enum RouterEvent<L> {
     /// Novel subscribed data landed in the ext store. No bytes: the
     /// embedder owns that store; handing bytes again would invite a
-    /// second source of truth [approved].
+    /// second source of truth \[approved\].
     Delivered(L, Seq),
     /// The ext store (the embedder's data path) failed; the node keeps
     /// gossiping from what it has [approved: degrade, don't crash].

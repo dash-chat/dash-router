@@ -300,9 +300,10 @@ A new actor `Command::RouterStream { topic, reply }` calls
 `inner.ephemeral_stream::<ByteBuf>(topic)` and replies with the pair.
 `lan_router.rs` implements the two gossip traits from §3.1 over the pair
 and builds a `GossipTransport`. Router
-topic: `Topic::from(Hash::digest(b"dash-router/v0"))`, hashed with the
-network id the same way Dash Chat's other ALPNs/topics are, so different
-networks never share an overlay.
+topic: `Topic::from(Hash::digest(dash_router::GOSSIP_TOPIC.as_bytes()))`
+(the exported constant, currently `"dash-router/v1"`, whose suffix tracks
+`WIRE_VERSION`), hashed with the network id the same way Dash Chat's other
+ALPNs/topics are, so different networks never share an overlay.
 
 ### 4.5 Config and lifecycle
 

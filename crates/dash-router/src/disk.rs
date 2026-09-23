@@ -33,7 +33,7 @@ const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ops");
 /// bytes redb hands back from disk: a key shorter than `WIDTH` is a
 /// malformed row (corruption, a foreign writer, a truncated file), not a
 /// programmer error, and trait methods here never panic on that — see
-/// [`row_seq`] and the fix-round-2 note on [`DiskRelayStore`].
+/// `row_seq` and the fix-round-2 note on [`DiskRelayStore`].
 pub trait LogKey: Ord + Clone {
     const WIDTH: usize;
     fn write_key(&self, out: &mut Vec<u8>);
@@ -133,7 +133,7 @@ fn set_log_entry<L: LogKey>(map: &mut LogRanges<L>, log: &L, ranges: Ranges) {
     }
 }
 
-/// The relay's disk cache: a redb-backed [`AsyncEvictableStorage`].
+/// The relay's disk cache: a redb-backed [`AsyncEvictableStorage`](crate::AsyncEvictableStorage).
 ///
 /// Spec §3: relay-store errors are indistinguishable from sheds/evictions —
 /// a transient disk hiccup must not kill the node task. So every fallible
@@ -152,8 +152,8 @@ fn set_log_entry<L: LogKey>(map: &mut LogRanges<L>, log: &L, ranges: Ranges) {
 /// treats un-advertised data as absent and repairs it through the normal
 /// want/have cycle or the next reopen's full scan; over-reporting would
 /// promise data a `fetch` can't actually produce. This is why a failed
-/// [`Self::rebuild_log`] after a *committed* evict drops that log from the
-/// cache entirely (see [`Self::drop_log_from_cache`]) rather than leaving
+/// `Self::rebuild_log` after a *committed* evict drops that log from the
+/// cache entirely (see `Self::drop_log_from_cache`) rather than leaving
 /// the pre-eviction entries in place.
 pub struct DiskRelayStore<L: LogKey> {
     db: Database,
