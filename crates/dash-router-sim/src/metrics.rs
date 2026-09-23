@@ -33,11 +33,9 @@ pub struct Metrics {
     expected: BTreeMap<LogId, BTreeSet<NodeId>>,
     ops: BTreeMap<(LogId, u32), OpCoverage>,
 
+    /// Want broadcasts of any origin.
     pub want_msgs: u64,
-    /// Have broadcasts, of any origin. The wire no longer marks a Have as
-    /// "fresh" (author-origin) vs. a periodic reply — that distinction was
-    /// dropped along with the storage-less router refactor — so this is a
-    /// single count where the old model split into two.
+    /// Have broadcasts of any origin.
     pub have_msgs: u64,
 
     pub receives: u64,
@@ -60,15 +58,23 @@ pub struct Metrics {
     /// Deliveries converted to drops after too many deferrals.
     pub forced_drops: u64,
 
-    relay_samples: Vec<(f64, usize)>,
-    inflight_samples: Vec<usize>,
+    /// Each sample is a mean and max relay occupancy, expressed in [`Units`].
+    pub relay_occupancy_samples: Vec<(f64, usize)>,
+    /// Each sample is the number of ops in flight.
+    pub inflight_samples: Vec<usize>,
 
-    push_latencies: Vec<f64>,
-    pull_latencies: Vec<f64>,
+    /// Time between Have push (when authoring) and delivery time as recorded by one receiver.
+    pub push_latencies: Vec<f64>,
+    /// Time between Have emitted (when responding to Wants) and delivery time as recorded by one receiver.
+    pub pull_latencies: Vec<f64>,
 
+    /// Number of payloads evicted from the relay.
     pub payload_evictions: u64,
+    /// Number of full eviction events (any number of logs) from the relay.
     pub full_evictions: u64,
+    /// Number of "native" (out-of-band) syncs performed by the router.
     pub native_syncs: u64,
+    /// Number of application garbage collection runs.
     pub app_gc_runs: u64,
 }
 
@@ -121,7 +127,7 @@ impl Metrics {
     }
 
     pub fn sample_occupancy(&mut self, relay_mean: f64, relay_max: usize, inflight: usize) {
-        self.relay_samples.push((relay_mean, relay_max));
+        self.relay_occupancy_samples.push((relay_mean, relay_max));
         self.inflight_samples.push(inflight);
     }
 
@@ -156,9 +162,9 @@ impl Metrics {
             shed_appends: self.shed_appends,
             fire_backpressure: self.fire_backpressure,
             forced_drops: self.forced_drops,
-            relay_occupancy_mean: mean(self.relay_samples.iter().map(|(m, _)| *m)),
+            relay_occupancy_mean: mean(self.relay_occupancy_samples.iter().map(|(m, _)| *m)),
             relay_occupancy_max: self
-                .relay_samples
+                .relay_occupancy_samples
                 .iter()
                 .map(|(_, x)| *x)
                 .max()
