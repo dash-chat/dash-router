@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c725e028d77ea7041d3317438dd71d3ec5433e1b68b83782d571d97da7ba2c6c # shrinks to steps = [RecvPrefixWant { from: 1, origin: 2, prefix: 0 }], intervals = [20, 20, 20, 20], subs = {}
+cc c097f3b5eddf83a9b608ebef06ab133ee8bc5eae546397be73f65884c77c0c1b # shrinks to steps = [RecvMixedWant { from: 1, origin: 0, ranges: [], prefixes: [0], budget: 11 }], intervals = [20, 20, 20, 20], subs = {}

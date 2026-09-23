@@ -14,19 +14,27 @@
 //! IS our state machine, so the crate's Reference/SUT scaffolding would
 //! duplicate what `NodeMachine` already is.
 //!
+//! Two step universes (final review F2): `u8` logs, where every prefix
+//! holds at most one log, and [`Pair`] logs, where each prefix holds two
+//! — so prefix subscriptions migrate several logs at once and a Want
+//! mixing named ranges with prefixes (and split into pieces) actually
+//! discriminates named from wholesale. The harness is generic over the
+//! log type ([`TestLog`]) and instantiated once per universe.
+//!
 //! Zero-debounce ruling: conformance runs with
 //! `PushDebouncePolicy { window_ms: 0, max_latency_ms: 0 }`, so an `Append`
 //! step's SUT call (`on_append` + `advance_to`) flushes immediately and maps
 //! to the reference's atomic `NodeAction::Authored`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Debug;
 use std::time::Duration;
 
 use dash_router::{CoreConfig, IntervalSource, NodeCore, Out, RouterEvent};
 use dash_router_core::{
-    EvictableStorage, LogRanges, NodeAction, NodeEffect, NodeMachine, NodeState, Op, OpsMap,
-    Ranges, RouterAction, RouterConfig, RouterState, Seq, Storage, Units, WireBody, WireMessage,
-    eviction_candidates,
+    EvictableStorage, Log, LogRanges, NodeAction, NodeEffect, NodeMachine, NodeState, Op, OpsMap,
+    Pair, Ranges, RouterAction, RouterConfig, RouterState, Seq, Storage, Units, WireBody, WireLog,
+    WireMessage, eviction_candidates,
 };
 use dash_router_policy::PushDebouncePolicy;
 use polestar::prelude::*;
@@ -65,34 +73,64 @@ impl IntervalSource for Scripted {
     }
 }
 
+// --- Log universes ----------------------------------------------------
+
+/// A log type the harness can be instantiated over. Both universes use
+/// `u8` prefixes.
+trait TestLog: WireLog + Log<Prefix = u8> + Default + Debug + Send + Sync + 'static {
+    /// A byte identifying the log in op headers.
+    fn tag(&self) -> u8;
+}
+
+impl TestLog for u8 {
+    fn tag(&self) -> u8 {
+        *self
+    }
+}
+
+impl TestLog for Pair {
+    fn tag(&self) -> u8 {
+        self.prefix * 16 + self.author
+    }
+}
+
 // --- Step vocabulary ---------------------------------------------------
 
 #[derive(Clone, Debug)]
-enum Step {
+enum Step<L> {
     /// `origin` 0 is this node: its own Want, echoed back by `from`.
     RecvWant {
         from: u32,
         origin: u32,
-        log: u8,
+        log: L,
         start: u32,
         end: u32,
     },
     /// A Want naming no ranges, only a prefix: "every log under it".
-    /// `u8` logs are their own prefix.
     RecvPrefixWant {
         from: u32,
         origin: u32,
         prefix: u8,
     },
+    /// A Want mixing named ranges with prefixes, packed by `pack_want`
+    /// under `budget` bytes and delivered piece by piece (a small budget
+    /// splits it), so both machines record a split Want.
+    RecvMixedWant {
+        from: u32,
+        origin: u32,
+        ranges: Vec<(L, u32, u32)>,
+        prefixes: Vec<u8>,
+        budget: usize,
+    },
     RecvHave {
         from: u32,
-        log: u8,
+        log: L,
         seqs: Vec<(u32, bool)>,
     },
     Append {
-        log: u8,
+        log: L,
     },
-    /// Subscribe to a prefix (`u8`'s `Prefix = Self`).
+    /// Subscribe to a prefix.
     Subscribe(u8),
     Unsubscribe(u8),
     Advance(u64),
@@ -104,18 +142,40 @@ enum Step {
     Maintain,
 }
 
-fn step_strategy() -> impl Strategy<Value = Step> {
+/// The step universe over logs drawn from `log` and prefixes from
+/// `prefix`.
+fn step_strategy<L: TestLog>(
+    log: impl Strategy<Value = L> + Clone + 'static,
+    prefix: impl Strategy<Value = u8> + Clone + 'static,
+) -> impl Strategy<Value = Step<L>> {
+    let mixed = (
+        1u32..4,
+        0u32..5,
+        proptest::collection::vec((log.clone(), 0u32..8, 0u32..8), 0..4),
+        proptest::collection::vec(prefix.clone(), 0..3),
+        prop_oneof![Just(11usize), Just(3800usize)],
+    )
+        .prop_map(
+            |(from, origin, ranges, prefixes, budget)| Step::RecvMixedWant {
+                from,
+                origin,
+                ranges,
+                prefixes,
+                budget,
+            },
+        );
     prop_oneof![
-        3 => (1u32..4, 0u32..5, 0u8..3, 0u32..8, 0u32..8).prop_map(
+        3 => (1u32..4, 0u32..5, log.clone(), 0u32..8, 0u32..8).prop_map(
             |(from, origin, log, start, end)| Step::RecvWant { from, origin, log, start, end }
         ),
-        1 => (1u32..4, 0u32..5, 0u8..3)
+        1 => (1u32..4, 0u32..5, prefix.clone())
             .prop_map(|(from, origin, prefix)| Step::RecvPrefixWant { from, origin, prefix }),
-        3 => (1u32..4, 0u8..3, proptest::collection::vec((0u32..8, any::<bool>()), 0..4))
+        2 => mixed,
+        3 => (1u32..4, log.clone(), proptest::collection::vec((0u32..8, any::<bool>()), 0..4))
             .prop_map(|(from, log, seqs)| Step::RecvHave { from, log, seqs }),
-        2 => (0u8..3).prop_map(|log| Step::Append { log }),
-        1 => (0u8..3).prop_map(Step::Subscribe),
-        1 => (0u8..3).prop_map(Step::Unsubscribe),
+        2 => log.prop_map(|log| Step::Append { log }),
+        1 => prefix.clone().prop_map(Step::Subscribe),
+        1 => prefix.prop_map(Step::Unsubscribe),
         2 => (10u64..600).prop_map(Step::Advance),
         1 => Just(Step::Maintain),
     ]
@@ -125,23 +185,23 @@ fn step_strategy() -> impl Strategy<Value = Step> {
 
 /// Locally authored op (brief's fixture): `header = [log, seq as u8]`,
 /// always carries a payload.
-fn authored_op(log: u8, seq: Seq) -> Op {
+fn authored_op<L: TestLog>(log: L, seq: Seq) -> Op {
     Op {
-        header: vec![log, seq as u8],
+        header: vec![log.tag(), seq as u8],
         payload: Some(vec![seq as u8]),
     }
 }
 
 /// A wire-carried op for `RecvHave`, with payload presence controlled by the
 /// generated bool.
-fn wire_op(log: u8, seq: Seq, has_payload: bool) -> Op {
+fn wire_op<L: TestLog>(log: L, seq: Seq, has_payload: bool) -> Op {
     Op {
-        header: vec![log, seq as u8],
+        header: vec![log.tag(), seq as u8],
         payload: has_payload.then(|| vec![seq as u8]),
     }
 }
 
-fn incoming(msg: &WireMessage<u32, u8>) -> dash_router::Incoming {
+fn incoming<L: TestLog>(msg: &WireMessage<u32, L>) -> dash_router::Incoming {
     dash_router::Incoming {
         remote: Some("192.168.0.9".parse().unwrap()),
         author: None,
@@ -162,44 +222,36 @@ macro_rules! check {
     };
 }
 
-fn assert_router_matches(
+fn assert_router_matches<L: TestLog>(
     idx: usize,
-    sut: &RouterState<u32, u8, RealTime>,
-    refr: &RouterState<u32, u8, RealTime>,
+    sut: &RouterState<u32, L, RealTime>,
+    refr: &RouterState<u32, L, RealTime>,
 ) -> Result<(), TestCaseError> {
     check!(idx, "held", sut.held, refr.held);
     check!(idx, "open", sut.open, refr.open);
     check!(idx, "wants", sut.wants, refr.wants);
     check!(idx, "haves", sut.haves, refr.haves);
-    check!(
-        idx,
-        "relayed_want_ranges",
-        sut.relayed_want_ranges(),
-        refr.relayed_want_ranges()
-    );
-    check!(
-        idx,
-        "relayed_have_ranges",
-        sut.relayed_have_ranges(),
-        refr.relayed_have_ranges()
-    );
+    // Final review F2: the whole seen-sets, record by record — ranges,
+    // prefixes and TTLs — not just their range unions.
+    check!(idx, "relayed_wants", sut.relayed_wants, refr.relayed_wants);
+    check!(idx, "relayed_haves", sut.relayed_haves, refr.relayed_haves);
     check!(idx, "want_timer", sut.want_timer, refr.want_timer);
     check!(idx, "have_timer", sut.have_timer, refr.have_timer);
     Ok(())
 }
 
-type Core = NodeCore<u32, u8, OpsMap<u8>, OpsMap<u8>, Scripted>;
+type Core<L> = NodeCore<u32, L, OpsMap<L>, OpsMap<L>, Scripted>;
 
 /// Drives a `NodeCore` (the SUT) and a `NodeMachine`/`NodeState` (the
 /// reference) through an identical action sequence, asserting agreement
 /// after every step.
-struct Driver {
-    core: Core,
-    ref_machine: NodeMachine<u32, u8, RealTime>,
-    ref_state: NodeState<u32, u8, RealTime>,
+struct Driver<L: TestLog> {
+    core: Core<L>,
+    ref_machine: NodeMachine<u32, L, RealTime>,
+    ref_state: NodeState<u32, L, RealTime>,
     ref_script: Scripted,
     now: Duration,
-    next_seq: BTreeMap<u8, Seq>,
+    next_seq: BTreeMap<L, Seq>,
     /// Finding 4(b): `NodeCore::on_maintain`'s policy constants, mirrored by
     /// `ref_maintain` since the pure `NodeMachine` has no maintenance
     /// action of its own to fire — only the resulting `RelayEvict(Payloads)`.
@@ -207,7 +259,7 @@ struct Driver {
     evict_at: f64,
 }
 
-impl Driver {
+impl<L: TestLog> Driver<L> {
     async fn new(
         subs: BTreeSet<u8>,
         intervals: &[u64],
@@ -269,8 +321,8 @@ impl Driver {
     fn ref_step(
         &mut self,
         idx: usize,
-        action: NodeAction<u32, u8, RealTime>,
-    ) -> Result<Vec<NodeEffect<u32, u8>>, TestCaseError> {
+        action: NodeAction<u32, L, RealTime>,
+    ) -> Result<Vec<NodeEffect<u32, L>>, TestCaseError> {
         let state = self.ref_state.clone();
         match self.ref_machine.transition(state, action) {
             Ok((s, fx)) => {
@@ -289,7 +341,7 @@ impl Driver {
         &mut self,
         idx: usize,
         target: Duration,
-    ) -> Result<Vec<NodeEffect<u32, u8>>, TestCaseError> {
+    ) -> Result<Vec<NodeEffect<u32, L>>, TestCaseError> {
         let mut out = Vec::new();
         let mut now = self.now;
         loop {
@@ -361,7 +413,7 @@ impl Driver {
     /// disabled-on-empty actions in `NodeMachine` (see `node.rs`), matching
     /// the "enabled actions only" rule the rest of this driver already
     /// follows for `ArmHaveTimer` etc.
-    fn ref_maintain(&mut self, idx: usize) -> Result<Vec<NodeEffect<u32, u8>>, TestCaseError> {
+    fn ref_maintain(&mut self, idx: usize) -> Result<Vec<NodeEffect<u32, L>>, TestCaseError> {
         let usage = EvictableStorage::usage(&self.ref_state.relay.0);
         let threshold = ((self.evict_at * self.relay_cap as f64) as Units).max(1);
         if usage < threshold {
@@ -381,9 +433,9 @@ impl Driver {
         Ok(Vec::new())
     }
 
-    async fn apply(&mut self, idx: usize, step: &Step) -> Result<(), TestCaseError> {
-        let sut_out: Vec<Out<u32, u8>>;
-        let ref_fx: Vec<NodeEffect<u32, u8>>;
+    async fn apply(&mut self, idx: usize, step: &Step<L>) -> Result<(), TestCaseError> {
+        let sut_out: Vec<Out<u32, L>>;
+        let ref_fx: Vec<NodeEffect<u32, L>>;
         match step.clone() {
             Step::Subscribe(log) => {
                 sut_out = self.core.on_subscribe(self.now, log).await.map_err(|e| {
@@ -424,7 +476,7 @@ impl Driver {
                 end,
             } => {
                 let ranges = LogRanges::from_pairs([(log, Ranges::range(start, end))]);
-                let msg: WireMessage<u32, u8> =
+                let msg: WireMessage<u32, L> =
                     WireMessage::want(from, origin, ranges, BTreeSet::new());
                 (sut_out, ref_fx) = self.recv_want(idx, msg).await?;
             }
@@ -433,16 +485,39 @@ impl Driver {
                 origin,
                 prefix,
             } => {
-                let msg: WireMessage<u32, u8> =
+                let msg: WireMessage<u32, L> =
                     WireMessage::want(from, origin, LogRanges::empty(), BTreeSet::from([prefix]));
                 (sut_out, ref_fx) = self.recv_want(idx, msg).await?;
+            }
+            Step::RecvMixedWant {
+                from,
+                origin,
+                ranges,
+                prefixes,
+                budget,
+            } => {
+                let ranges = LogRanges::from_pairs(
+                    ranges
+                        .into_iter()
+                        .map(|(log, start, end)| (log, Ranges::range(start, end))),
+                );
+                let prefixes: BTreeSet<u8> = prefixes.into_iter().collect();
+                let (pieces, _) =
+                    dash_router::pack::pack_want(from, origin, ranges, prefixes, budget);
+                let (mut sut, mut refr) = (Vec::new(), Vec::new());
+                for msg in pieces {
+                    let (s, r) = self.recv_want(idx, msg).await?;
+                    sut.extend(s);
+                    refr.extend(r);
+                }
+                (sut_out, ref_fx) = (sut, refr);
             }
             Step::RecvHave { from, log, seqs } => {
                 let group: Vec<(Seq, Op)> = seqs
                     .iter()
                     .map(|&(s, has)| (s, wire_op(log, s, has)))
                     .collect();
-                let msg: WireMessage<u32, u8> = WireMessage::have(from, vec![(log, group)]);
+                let msg: WireMessage<u32, L> = WireMessage::have(from, vec![(log, group)]);
                 sut_out = self
                     .core
                     .on_wire(self.now, incoming(&msg))
@@ -485,8 +560,8 @@ impl Driver {
     async fn recv_want(
         &mut self,
         idx: usize,
-        msg: WireMessage<u32, u8>,
-    ) -> Result<(Vec<Out<u32, u8>>, Vec<NodeEffect<u32, u8>>), TestCaseError> {
+        msg: WireMessage<u32, L>,
+    ) -> Result<(Vec<Out<u32, L>>, Vec<NodeEffect<u32, L>>), TestCaseError> {
         let WireBody::Want {
             origin,
             ranges,
@@ -520,8 +595,8 @@ impl Driver {
     fn compare(
         &self,
         idx: usize,
-        sut_out: &[Out<u32, u8>],
-        ref_fx: &[NodeEffect<u32, u8>],
+        sut_out: &[Out<u32, L>],
+        ref_fx: &[NodeEffect<u32, L>],
     ) -> Result<(), TestCaseError> {
         assert_router_matches(idx, &self.core.router, &self.ref_state.router)?;
 
@@ -557,14 +632,14 @@ impl Driver {
             self.ref_state.subscriptions
         );
 
-        let mut sut_bc: Vec<WireMessage<u32, u8>> = sut_out
+        let mut sut_bc: Vec<WireMessage<u32, L>> = sut_out
             .iter()
             .filter_map(|o| match o {
                 Out::Broadcast(m) => Some(m.clone()),
                 _ => None,
             })
             .collect();
-        let mut ref_bc: Vec<WireMessage<u32, u8>> = ref_fx
+        let mut ref_bc: Vec<WireMessage<u32, L>> = ref_fx
             .iter()
             .filter_map(|e| match e {
                 NodeEffect::Broadcast(m) => Some(m.clone()),
@@ -575,14 +650,14 @@ impl Driver {
         ref_bc.sort();
         check!(idx, "broadcasts", sut_bc, ref_bc);
 
-        let sut_delivered: BTreeSet<(u8, u32)> = sut_out
+        let sut_delivered: BTreeSet<(L, u32)> = sut_out
             .iter()
             .filter_map(|o| match o {
                 Out::Event(RouterEvent::Delivered(l, s)) => Some((*l, *s)),
                 _ => None,
             })
             .collect();
-        let ref_delivered: BTreeSet<(u8, u32)> = ref_fx
+        let ref_delivered: BTreeSet<(L, u32)> = ref_fx
             .iter()
             .filter_map(|e| match e {
                 NodeEffect::Deliver(l, s) => Some((*l, *s)),
@@ -595,21 +670,22 @@ impl Driver {
     }
 }
 
-fn run_lockstep(
+fn run_lockstep<L: TestLog>(
     subs: BTreeSet<u8>,
     intervals: Vec<u64>,
-    steps: Vec<Step>,
+    steps: Vec<Step<L>>,
 ) -> Result<(), TestCaseError> {
     tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .unwrap()
         .block_on(async move {
-            // Finding 4(a): 10, not 64 — the generated universe tops out at
-            // 48 units (3 logs × 8 seqs × up to 2 units each), so a cap of
-            // 64 could never be reached and the shed-at-cap branch in
-            // `ingest_parked` was dead in this suite. 10 makes both the
-            // shed branch and `on_maintain`'s eviction genuinely reachable.
+            // Finding 4(a): 10, not 64 — the `u8` universe tops out at 48
+            // units (3 logs × 8 seqs × up to 2 units each; the `Pair`
+            // universe at 64), so a cap of 64 could never be reached and
+            // the shed-at-cap branch in `ingest_parked` was dead in this
+            // suite. 10 makes both the shed branch and `on_maintain`'s
+            // eviction genuinely reachable.
             let mut driver = Driver::new(subs, &intervals, 10).await?;
             for (idx, step) in steps.iter().enumerate() {
                 driver.apply(idx, step).await?;
@@ -666,14 +742,85 @@ fn fixed_regression_sequence() {
     ];
     let intervals = vec![100, 90, 110, 95, 105, 100];
     let subs = BTreeSet::from([0u8]);
-    run_lockstep(subs, intervals, steps).expect("SUT and reference must agree at every step");
+    run_lockstep::<u8>(subs, intervals, steps).expect("SUT and reference must agree at every step");
+}
+
+/// Final review F2: the `Pair` universe's shape, pinned. Two logs under
+/// prefix 1 park in the relay, then a Subscribe migrates both; a peer's
+/// mixed Want (a named tail plus the prefix) arrives split into pieces, and
+/// this node's own Want comes back echoed by a relay; the Have that answers
+/// must agree between the machines.
+#[test]
+fn fixed_pair_regression_sequence() {
+    let (a, b, other) = (Pair::new(1, 0), Pair::new(1, 1), Pair::new(0, 0));
+    let mixed = |from, origin, log, budget| Step::RecvMixedWant {
+        from,
+        origin,
+        ranges: vec![(log, 1, 8)],
+        prefixes: vec![1],
+        budget,
+    };
+    let split = dash_router::pack::pack_want(
+        1u32,
+        4u32,
+        LogRanges::from_pairs([(a, Ranges::range(1, 8))]),
+        BTreeSet::from([1u8]),
+        11,
+    );
+    assert_eq!(
+        split.0.len(),
+        2,
+        "an 11-byte budget splits prefixes from ranges"
+    );
+    let steps = vec![
+        Step::RecvHave {
+            from: 2,
+            log: a,
+            seqs: vec![(0, true), (1, true)],
+        },
+        Step::RecvHave {
+            from: 3,
+            log: b,
+            seqs: vec![(0, true)],
+        },
+        Step::RecvHave {
+            from: 3,
+            log: other,
+            seqs: vec![(0, false)],
+        },
+        Step::Subscribe(1),   // migrates a and b, not `other`
+        Step::Advance(600),   // past have_ttl: the Haves above expire
+        mixed(1, 4, a, 11),   // 4 names a's tail and wants prefix 1, split
+        mixed(2, 0, b, 3800), // this node's own Want, echoed by 2
+        Step::Advance(300),   // the have timer fires and answers 4
+        Step::Unsubscribe(1),
+        Step::Append { log: other },
+        Step::Advance(700),
+    ];
+    let intervals = vec![100, 90, 110, 95, 105, 100];
+    run_lockstep(BTreeSet::new(), intervals, steps)
+        .expect("SUT and reference must agree at every step");
+}
+
+fn pair_log() -> impl Strategy<Value = Pair> + Clone {
+    (0u8..2, 0u8..2).prop_map(|(prefix, author)| Pair::new(prefix, author))
 }
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
     #[test]
     fn shell_matches_the_node_machine(
-        steps in proptest::collection::vec(step_strategy(), 1..40),
+        steps in proptest::collection::vec(step_strategy(0u8..3, 0u8..3), 1..40),
+        intervals in proptest::collection::vec(20u64..400, 4..16),
+        subs in proptest::collection::btree_set(0u8..3, 0..3),
+    ) {
+        run_lockstep(subs, intervals, steps)?;
+    }
+
+    /// Final review F2: two logs per prefix (prefix 2 holds none).
+    #[test]
+    fn shell_matches_the_node_machine_with_pair_logs(
+        steps in proptest::collection::vec(step_strategy(pair_log(), 0u8..3), 1..40),
         intervals in proptest::collection::vec(20u64..400, 4..16),
         subs in proptest::collection::btree_set(0u8..3, 0..3),
     ) {
