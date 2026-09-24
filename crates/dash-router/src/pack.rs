@@ -237,4 +237,24 @@ mod tests {
         let (msgs, _) = pack_want(1u32, 1u32, LogRanges::<u8>::empty(), BTreeSet::new(), 1000);
         assert!(msgs.is_empty());
     }
+
+    /// Review focus 5: pieces of a split Want each re-encode their own
+    /// channel key, so a channel spanning pieces never blows the budget.
+    #[test]
+    fn want_pieces_each_carry_their_channel() {
+        use dash_router_core::Pair;
+        let ranges = LogRanges::from_pairs((0..60u8).map(|a| (Pair::new(1, a), Ranges::from(3))));
+        let (msgs, dropped) = pack_want(1u32, 9u32, ranges, BTreeSet::new(), 64);
+        assert_eq!(dropped, 0);
+        assert!(msgs.len() > 1, "60 authors do not fit in 64 bytes");
+        assert!(msgs.iter().all(|m| m.encode().len() <= 64));
+        let total: usize = msgs
+            .iter()
+            .map(|m| match &m.body {
+                WireBody::Want { ranges, .. } => ranges.len(),
+                WireBody::Have(_) => 0,
+            })
+            .sum();
+        assert_eq!(total, 60);
+    }
 }
