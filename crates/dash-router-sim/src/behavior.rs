@@ -16,17 +16,21 @@
 //! (timer fires: the node's clock freezes at the due time, which the
 //! protocol permits) or shed (appends: the writer backs off), and both
 //! are counted — that's the saturation signal, not a crash.
+//!
+//! The behavior drives the net through [`Metered`], which does the
+//! protocol accounting and hands back the flights each transition sent;
+//! all this one records is what it did itself ([`DriverMetrics`]). Each
+//! action goes out stamped with `now`, the meter's clock.
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
+    collections::{BTreeMap, BTreeSet, BinaryHeap},
     time::Duration,
 };
 
-use anyhow::ensure;
 use dash_router_core::{
-    EvictableStorage, LogRanges, NodeAction, NodeEffect, Op, Ranges, RouterAction, Seq, Storage,
-    Units, WireBody,
+    EvictableStorage, LogRanges, NodeAction, Op, Ranges, RouterAction, Seq, Storage, Units,
+    WireBody,
 };
 use dash_router_net_model::Flight;
 use polestar::prelude::*;
@@ -34,8 +38,9 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 use crate::{
-    K, LogId, Metrics, NodeId, SimNet, SimNetAction, SimNetState,
-    metrics::HaveOrigin,
+    K, LogId, NodeId, SimNet, SimNetAction, SimNetState,
+    metered::{Meter, Metered, MeteredFx},
+    metrics::DriverMetrics,
     policy::IntervalPolicy,
     scenario::{AppGcSpec, LatencySpec},
 };
@@ -110,28 +115,6 @@ impl Ord for Entry {
     }
 }
 
-/// What each proposed action was, so `handle_fx` can attribute effects.
-#[derive(Clone, Debug)]
-enum Tag {
-    Plumbing,
-    /// `is_have` distinguishes a Have receipt from a Want receipt (the wire
-    /// no longer marks a Have as fresh-vs-reply, so that finer split is
-    /// gone). `held_before` is the receiving node's router-held snapshot
-    /// just before this transition, for the growth check in `handle_fx`.
-    /// `origin` is the Have-flight's push-vs-repair attribution (`None`
-    /// for Want receipts and out-of-band arrivals).
-    Recv {
-        to: NodeId,
-        is_have: bool,
-        held_before: LogRanges<LogId>,
-        origin: Option<HaveOrigin>,
-    },
-    Append,
-    /// A `RouterAction::FireHave` proposal: roots a repair-origin Have
-    /// flight.
-    FireHave,
-}
-
 /// The seeded discrete-event driver. See the [module docs](self).
 #[derive(Clone, Debug)]
 pub struct SimBehavior {
@@ -149,16 +132,10 @@ pub struct SimBehavior {
     /// from.
     authored_ops: BTreeMap<(LogId, Seq), Op>,
     clocks: BTreeMap<NodeId, Duration>,
-    known_inflight: Vec<Flight<NodeId, LogId>>,
-    /// Push-vs-repair attribution for in-flight Have messages, keyed by
-    /// flight identity. Populated when a new Have flight is observed
-    /// (`sync_inflight`), consumed on `Deliver`, and removed on both
-    /// `Deliver` and `Drop` to bound the map.
-    flight_origins: BTreeMap<Flight<NodeId, LogId>, HaveOrigin>,
-    tags: VecDeque<Tag>,
     initialized: bool,
     append_count: u64,
-    pub metrics: Metrics,
+    /// What the driver itself did: backpressure applied, samples taken.
+    pub driver: DriverMetrics,
 }
 
 impl SimBehavior {
@@ -167,7 +144,6 @@ impl SimBehavior {
         params: SimParams,
         seed: u64,
     ) -> Self {
-        let metrics = Metrics::new(params.expected.clone());
         Self {
             topology,
             params,
@@ -178,12 +154,9 @@ impl SimBehavior {
             authored_seq: BTreeMap::new(),
             authored_ops: BTreeMap::new(),
             clocks: BTreeMap::new(),
-            known_inflight: Vec::new(),
-            flight_origins: BTreeMap::new(),
-            tags: VecDeque::new(),
             initialized: false,
             append_count: 0,
-            metrics,
+            driver: DriverMetrics::default(),
         }
     }
 
@@ -246,7 +219,6 @@ impl SimBehavior {
                 n,
                 NodeAction::Router(RouterAction::Tick(dt.into())),
             ));
-            self.tags.push_back(Tag::Plumbing);
         }
         (dt, want_rem.map(|r| r - dt), have_rem.map(|r| r - dt))
     }
@@ -257,7 +229,6 @@ impl SimBehavior {
             n,
             NodeAction::Router(RouterAction::ArmWantTimer(interval.into())),
         ));
-        self.tags.push_back(Tag::Plumbing);
         let due = self.clocks.get(&n).copied().unwrap_or_default() + interval;
         self.schedule(due.max(self.now), Ev::FireWant(n));
     }
@@ -268,7 +239,6 @@ impl SimBehavior {
             n,
             NodeAction::Router(RouterAction::ArmHaveTimer(interval.into())),
         ));
-        self.tags.push_back(Tag::Plumbing);
         let due = self.clocks.get(&n).copied().unwrap_or_default() + interval;
         self.schedule(due.max(self.now), Ev::FireHave(n));
     }
@@ -295,57 +265,22 @@ impl SimBehavior {
         self.schedule(self.now + gap, Ev::NativeSync);
     }
 
-    /// Register flights the model created since we last looked, sampling
-    /// each one's fate (latency, loss) and scheduling it.
-    fn sync_inflight(&mut self, state: &SimNetState, origin: Option<HaveOrigin>) {
-        // Sorted-multiset difference: state.inflight \ known_inflight.
-        let mut new = Vec::new();
-        let mut old = self.known_inflight.iter().peekable();
-        for f in &state.inflight {
-            loop {
-                match old.peek() {
-                    // Known entry no longer present (delivered/dropped).
-                    Some(o) if *o < f => {
-                        old.next();
-                    }
-                    // Matched: consumes one known copy per present copy.
-                    Some(o) if *o == f => {
-                        old.next();
-                        break;
-                    }
-                    // Nothing known at or below f: it is new.
-                    _ => {
-                        new.push(f.clone());
-                        break;
-                    }
-                }
-            }
+    /// A flight the model just sent: sample its fate (latency, loss) and
+    /// schedule it.
+    fn schedule_flight(&mut self, flight: Flight<NodeId, LogId>) {
+        let latency = self.params.latency.sample(&mut self.rng);
+        let at = self.now + latency;
+        if self.rng.random_bool(self.params.loss) {
+            self.schedule(at, Ev::Drop { flight });
+        } else {
+            self.schedule(
+                at,
+                Ev::Deliver {
+                    flight,
+                    deferrals: 0,
+                },
+            );
         }
-        for flight in new {
-            match &flight.message.body {
-                WireBody::Want { .. } => self.metrics.want_msgs += 1,
-                WireBody::Have(_) => self.metrics.have_msgs += 1,
-            }
-            if matches!(flight.message.body, WireBody::Have(_))
-                && let Some(o) = origin
-            {
-                self.flight_origins.entry(flight.clone()).or_insert(o);
-            }
-            let latency = self.params.latency.sample(&mut self.rng);
-            let at = self.now + latency;
-            if self.rng.random_bool(self.params.loss) {
-                self.schedule(at, Ev::Drop { flight });
-            } else {
-                self.schedule(
-                    at,
-                    Ev::Deliver {
-                        flight,
-                        deferrals: 0,
-                    },
-                );
-            }
-        }
-        self.known_inflight = state.inflight.clone();
     }
 
     fn op(&mut self) -> Op {
@@ -358,16 +293,39 @@ impl SimBehavior {
 }
 
 impl Behavior for SimBehavior {
-    type Model = SimNet;
+    type Model = Metered<SimNet>;
 
-    fn next_tick(&mut self, state: &SimNetState) -> anyhow::Result<Vec<SimNetAction>> {
+    fn next_tick(
+        &mut self,
+        (state, _): &(SimNetState, Meter),
+    ) -> anyhow::Result<Vec<(Duration, SimNetAction)>> {
         let mut actions = Vec::new();
+        self.tick(state, &mut actions)?;
+        // One event per tick, so everything proposed happened at `now`.
+        Ok(actions.into_iter().map(|a| (self.now, a)).collect())
+    }
 
+    fn handle_fx(
+        &mut self,
+        _state: &(SimNetState, Meter),
+        fx: MeteredFx,
+    ) -> anyhow::Result<Option<MeteredFx>> {
+        for flight in fx.sent {
+            self.schedule_flight(flight);
+        }
+        // Node effects are the meter's business; nothing above wants them.
+        Ok(None)
+    }
+}
+
+impl SimBehavior {
+    /// Process one pending event, proposing the actions it amounts to.
+    fn tick(&mut self, state: &SimNetState, actions: &mut Vec<SimNetAction>) -> anyhow::Result<()> {
         if !self.initialized {
             self.initialized = true;
             for n in state.nodes.keys().copied().collect::<Vec<_>>() {
                 self.clocks.insert(n, Duration::ZERO);
-                self.arm_want(n, &mut actions);
+                self.arm_want(n, actions);
             }
             self.schedule_next_append();
             self.schedule(self.params.sample_interval, Ev::Sample);
@@ -382,11 +340,11 @@ impl Behavior for SimBehavior {
             if let Some(gc) = &self.params.app_gc {
                 self.schedule(Duration::from_millis(gc.interval_ms), Ev::AppGc);
             }
-            return Ok(actions);
+            return Ok(());
         }
 
         let Some(entry) = self.queue.pop() else {
-            return Ok(actions);
+            return Ok(());
         };
         self.now = entry.at;
 
@@ -397,7 +355,7 @@ impl Behavior for SimBehavior {
                 // tick would fail mid-flight.
                 if self.headroom(state) < self.degree(flight.to) {
                     if deferrals >= MAX_DEFERRALS {
-                        self.metrics.forced_drops += 1;
+                        self.driver.forced_drops += 1;
                         self.schedule(self.now, Ev::Drop { flight });
                     } else {
                         self.schedule(
@@ -408,32 +366,23 @@ impl Behavior for SimBehavior {
                             },
                         );
                     }
-                    return Ok(actions);
+                    return Ok(());
                 }
                 let idx = state
                     .inflight
                     .binary_search(&flight)
                     .map_err(|_| anyhow::anyhow!("scheduled flight not in flight: {flight:?}"))?;
                 let to = flight.to;
-                let is_want = matches!(flight.message.body, WireBody::Want { .. });
                 // An echo of `to`'s own Want is not recorded, so it
                 // witnesses nothing and must not arm the Have timer.
                 let foreign_want =
                     matches!(flight.message.body, WireBody::Want { origin, .. } if origin != to);
-                let held_before = state.node(&to).router.held.clone();
-                let origin = self.flight_origins.remove(&flight);
-                self.advance(state, to, &mut actions);
+                self.advance(state, to, actions);
                 actions.push(SimNetAction::Deliver(UpTo::new(idx)));
-                self.tags.push_back(Tag::Recv {
-                    to,
-                    is_have: !is_want,
-                    held_before,
-                    origin,
-                });
                 // A witnessed Want is what makes arming the Have timer
                 // legal; do it in the same tick, right after the Recv.
                 if foreign_want && state.node(&to).router.have_timer.is_none() {
-                    self.arm_have(to, &mut actions);
+                    self.arm_have(to, actions);
                 }
             }
 
@@ -442,14 +391,11 @@ impl Behavior for SimBehavior {
                     .inflight
                     .binary_search(&flight)
                     .map_err(|_| anyhow::anyhow!("scheduled flight not in flight: {flight:?}"))?;
-                self.metrics.drops += 1;
-                self.flight_origins.remove(&flight);
                 actions.push(SimNetAction::Drop(UpTo::new(idx)));
-                self.tags.push_back(Tag::Plumbing);
             }
 
             Ev::FireWant(n) => {
-                let (_, want_rem, _) = self.advance(state, n, &mut actions);
+                let (_, want_rem, _) = self.advance(state, n, actions);
                 match want_rem {
                     Some(rem) if rem.is_zero() => {
                         if self.headroom(state) >= self.degree(n) {
@@ -457,10 +403,9 @@ impl Behavior for SimBehavior {
                                 n,
                                 NodeAction::Router(RouterAction::FireWant),
                             ));
-                            self.tags.push_back(Tag::Plumbing);
-                            self.arm_want(n, &mut actions);
+                            self.arm_want(n, actions);
                         } else {
-                            self.metrics.fire_backpressure += 1;
+                            self.driver.fire_backpressure += 1;
                             self.schedule(self.now + BACKOFF, Ev::FireWant(n));
                         }
                     }
@@ -473,7 +418,7 @@ impl Behavior for SimBehavior {
             }
 
             Ev::FireHave(n) => {
-                let (dt, _, have_rem) = self.advance(state, n, &mut actions);
+                let (dt, _, have_rem) = self.advance(state, n, actions);
                 match have_rem {
                     Some(rem) if rem.is_zero() => {
                         if self.headroom(state) >= self.degree(n) {
@@ -481,7 +426,6 @@ impl Behavior for SimBehavior {
                                 n,
                                 NodeAction::Router(RouterAction::FireHave),
                             ));
-                            self.tags.push_back(Tag::FireHave);
                             // Wants may still be outstanding — but only the
                             // ones that survive the tick we just proposed:
                             // arming with none witnessed is not enabled.
@@ -493,10 +437,10 @@ impl Behavior for SimBehavior {
                                 .flatten()
                                 .any(|r| dt < *r.ttl_left);
                             if wants_survive {
-                                self.arm_have(n, &mut actions);
+                                self.arm_have(n, actions);
                             }
                         } else {
-                            self.metrics.fire_backpressure += 1;
+                            self.driver.fire_backpressure += 1;
                             self.schedule(self.now + BACKOFF, Ev::FireHave(n));
                         }
                     }
@@ -510,18 +454,16 @@ impl Behavior for SimBehavior {
                     let writer: NodeId = self.rng.random_range(0..self.params.writers as u32);
                     let log: LogId = writer as LogId;
                     if self.headroom(state) >= self.degree(writer) {
-                        self.advance(state, writer, &mut actions);
+                        self.advance(state, writer, actions);
                         let op = self.op();
                         let seq = self.next_authored_seq(writer, log);
-                        self.metrics.authored(log, seq, self.now);
                         self.authored_ops.insert((log, seq), op.clone());
                         actions.push(SimNetAction::Node(
                             writer,
                             NodeAction::Authored(log, seq, op),
                         ));
-                        self.tags.push_back(Tag::Append);
                     } else {
-                        self.metrics.shed_appends += 1;
+                        self.driver.shed_appends += 1;
                     }
                     self.schedule_next_append();
                 }
@@ -535,7 +477,7 @@ impl Behavior for SimBehavior {
                     .collect();
                 let mean = usages.iter().sum::<usize>() as f64 / usages.len().max(1) as f64;
                 let max = usages.iter().copied().max().unwrap_or(0);
-                self.metrics
+                self.driver
                     .sample_occupancy(mean, max, state.inflight.len());
                 if self.now < self.params.duration * 2 {
                     self.schedule(self.now + self.params.sample_interval, Ev::Sample);
@@ -549,15 +491,11 @@ impl Behavior for SimBehavior {
                 if node.relay.0.usage() >= threshold {
                     let candidates = node.eviction_candidates();
                     if !candidates.is_empty() {
-                        // Payloads-first (DESIGN.md GC): units freed = one per payload.
-                        let freed: usize = candidates.iter().filter_map(|(_, r)| r.len()).sum();
-                        self.metrics.payload_evictions += freed as u64;
-                        self.advance(state, n, &mut actions);
+                        self.advance(state, n, actions);
                         actions.push(SimNetAction::Node(
                             n,
                             NodeAction::RelayEvictPayloads(candidates),
                         ));
-                        self.tags.push_back(Tag::Plumbing);
                     } else {
                         // Headers-later stage: shed whole non-wanted ranges.
                         let full = node
@@ -566,10 +504,8 @@ impl Behavior for SimBehavior {
                             .held_all()
                             .difference(&node.router.others_wants());
                         if !full.is_empty() {
-                            self.metrics.full_evictions += 1;
-                            self.advance(state, n, &mut actions);
+                            self.advance(state, n, actions);
                             actions.push(SimNetAction::Node(n, NodeAction::RelayEvict(full)));
-                            self.tags.push_back(Tag::Plumbing);
                         }
                     }
                 }
@@ -600,16 +536,11 @@ impl Behavior for SimBehavior {
                             .unwrap_or_default();
                         if !subs.is_empty() {
                             let node = subs[self.rng.random_range(0..subs.len())];
-                            self.advance(state, node, &mut actions);
+                            self.advance(state, node, actions);
                             actions.push(SimNetAction::Node(
                                 node,
                                 NodeAction::NativeSync(log, seq, op),
                             ));
-                            self.tags.push_back(Tag::Plumbing);
-                            self.metrics.native_syncs += 1;
-                            // Out-of-band arrival still counts as this node having the
-                            // op: no NodeEffect::Deliver fires for a NativeSync.
-                            self.metrics.delivered(node, log, seq, self.now, None);
                         }
                     }
                     self.schedule_next_native_sync();
@@ -633,10 +564,8 @@ impl Behavior for SimBehavior {
                         }
                     }
                     if !gc.is_empty() {
-                        self.metrics.app_gc_runs += 1;
-                        self.advance(state, n, &mut actions);
+                        self.advance(state, n, actions);
                         actions.push(SimNetAction::Node(n, NodeAction::AppGc(gc)));
-                        self.tags.push_back(Tag::Plumbing);
                     }
                 }
                 if self.now < self.params.duration {
@@ -648,69 +577,6 @@ impl Behavior for SimBehavior {
             }
         }
 
-        Ok(actions)
-    }
-
-    fn handle_fx(
-        &mut self,
-        state: &SimNetState,
-        fx: Vec<(NodeId, NodeEffect<NodeId, LogId>)>,
-    ) -> anyhow::Result<Option<Vec<(NodeId, NodeEffect<NodeId, LogId>)>>> {
-        let tag = self.tags.pop_front();
-        ensure!(
-            tag.is_some(),
-            "effects arrived with no proposed action to attribute them to"
-        );
-        let tag = tag.unwrap();
-        let ctx = match &tag {
-            Tag::Append => Some(HaveOrigin::Push),
-            Tag::FireHave => Some(HaveOrigin::Repair),
-            Tag::Recv { origin, .. } => *origin,
-            Tag::Plumbing => None,
-        };
-        match tag {
-            Tag::Recv {
-                to,
-                is_have,
-                held_before,
-                origin,
-            } => {
-                self.metrics.receives += 1;
-                let mut taught = false;
-                for (node, effect) in &fx {
-                    if let NodeEffect::Deliver(log, seq) = effect {
-                        taught = true;
-                        self.metrics.delivered(*node, *log, *seq, self.now, origin);
-                    }
-                }
-                // "Taught nothing" also covers state growth with no
-                // subscriber delivery: e.g. relay-only ingest of an
-                // unsubscribed log's bytes. `Deliver` only fires for novel
-                // subscribed data (Task 6 brief), so the held-ranges
-                // comparison is the only way to see that.
-                if !taught {
-                    let held_after = &state.node(&to).router.held;
-                    taught = !held_after.difference(&held_before).is_empty();
-                }
-                if !taught {
-                    self.metrics.redundant_receives += 1;
-                    if is_have {
-                        self.metrics.duplicate_replies += 1;
-                    }
-                } else if is_have {
-                    self.metrics.backfill_receives += 1;
-                }
-            }
-            Tag::Append => {
-                // `metrics.authored` is recorded eagerly in `next_tick`,
-                // since `Authored` takes an explicit seq the behavior
-                // already knows — there is no `Effect::Store` to wait for
-                // anymore.
-            }
-            Tag::FireHave => {}
-            Tag::Plumbing => {}
-        }
-        self.sync_inflight(state, ctx);
-        Ok(None)
+        Ok(())
     }
 }

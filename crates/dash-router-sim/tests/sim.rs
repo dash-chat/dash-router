@@ -221,7 +221,7 @@ fn jump_to_replays_to_the_same_state() {
 /// separate latency buckets; out-of-band (None) deliveries in neither.
 #[test]
 fn delivery_latency_splits_by_have_origin() {
-    use dash_router_sim::metrics::{HaveOrigin, Metrics};
+    use dash_router_sim::metrics::{DriverMetrics, HaveOrigin, Metrics};
     use std::collections::{BTreeMap, BTreeSet};
     use std::time::Duration;
 
@@ -234,7 +234,7 @@ fn delivery_latency_splits_by_have_origin() {
     m.delivered(3, 0, 0, ms(20), None); // e.g. native sync
     // A repeat never double-counts.
     m.delivered(1, 0, 0, ms(999), Some(HaveOrigin::Repair));
-    let r = m.finish(0);
+    let r = m.finish(&DriverMetrics::default(), 0);
     assert_eq!(r.push_deliveries, 1);
     assert_eq!(r.pull_deliveries, 1);
     assert_eq!(r.t_push_ms.max, 10.0);

@@ -7,13 +7,15 @@
 //! latency, loss, timer intervals — from seeded distributions. The
 //! behavior rides inside a [`polestar::BehaviorModel`], so a whole run is
 //! one deterministic machine: replay from the initial state is exact,
-//! which is what makes [`Simulation::jump_to`] free.
+//! which is what makes [`Simulation::jump_to`] free. Between the two sits
+//! [`Metered`], the observer that turns transitions into [`Metrics`].
 //!
 //! The tuning question lives in [`policy`]: interval policies are pure
 //! functions, separately testable, and are what the production shell will
 //! eventually sample from too.
 
 pub mod behavior;
+pub mod metered;
 pub mod metrics;
 pub mod report;
 pub mod scenario;
@@ -22,6 +24,7 @@ pub mod sweep;
 
 pub use dash_router_policy as policy;
 
+use dash_router_core::NodeEffect;
 use dash_router_net_model::{NetAction, NetMachine, NetState};
 use polestar::time::RealTime;
 
@@ -39,8 +42,11 @@ pub type SimNet = NetMachine<NodeId, LogId, RealTime, K>;
 pub type SimNetState = NetState<NodeId, LogId, RealTime>;
 /// Its actions.
 pub type SimNetAction = NetAction<NodeId, LogId, RealTime, K>;
+/// Its effects.
+pub type SimNetFx = Vec<(NodeId, NodeEffect<NodeId, LogId>)>;
 
 pub use behavior::SimBehavior;
-pub use metrics::{HaveOrigin, Metrics, RunRecord};
+pub use metered::{Meter, Metered, MeteredFx};
+pub use metrics::{DriverMetrics, HaveOrigin, Metrics, RunRecord};
 pub use scenario::{Config, ScenarioSpec, StorageSpec};
 pub use sim::Simulation;

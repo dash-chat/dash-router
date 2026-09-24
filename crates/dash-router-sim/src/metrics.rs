@@ -25,7 +25,33 @@ struct OpCoverage {
     full_at: Option<Duration>,
 }
 
-/// Live collectors, updated by the behavior as effects flow past.
+/// What the driver did of its own accord, as opposed to what the protocol
+/// did: backpressure it applied, and the samples it took. Lives in the
+/// behavior, since none of it is a transition.
+#[derive(Clone, Debug, Default)]
+pub struct DriverMetrics {
+    /// Appends skipped because the in-flight buffer had no headroom.
+    pub shed_appends: u64,
+    /// Timer fires deferred for the same reason.
+    pub fire_backpressure: u64,
+    /// Deliveries converted to drops after too many deferrals.
+    pub forced_drops: u64,
+
+    /// Each sample is a mean and max relay occupancy, expressed in [`Units`].
+    pub relay_occupancy_samples: Vec<(f64, usize)>,
+    /// Each sample is the number of ops in flight.
+    pub inflight_samples: Vec<usize>,
+}
+
+impl DriverMetrics {
+    pub fn sample_occupancy(&mut self, relay_mean: f64, relay_max: usize, inflight: usize) {
+        self.relay_occupancy_samples.push((relay_mean, relay_max));
+        self.inflight_samples.push(inflight);
+    }
+}
+
+/// Live protocol collectors, updated by [`Metered`](crate::Metered) as
+/// transitions flow past.
 #[derive(Clone, Debug, Default)]
 pub struct Metrics {
     /// Per-log coverage targets: the subscriber set (minus the author) that
@@ -51,17 +77,6 @@ pub struct Metrics {
     pub backfill_receives: u64,
 
     pub drops: u64,
-    /// Appends skipped because the in-flight buffer had no headroom.
-    pub shed_appends: u64,
-    /// Timer fires deferred for the same reason.
-    pub fire_backpressure: u64,
-    /// Deliveries converted to drops after too many deferrals.
-    pub forced_drops: u64,
-
-    /// Each sample is a mean and max relay occupancy, expressed in [`Units`].
-    pub relay_occupancy_samples: Vec<(f64, usize)>,
-    /// Each sample is the number of ops in flight.
-    pub inflight_samples: Vec<usize>,
 
     /// Time between Have push (when authoring) and delivery time as recorded by one receiver.
     pub push_latencies: Vec<f64>,
@@ -126,18 +141,14 @@ impl Metrics {
         }
     }
 
-    pub fn sample_occupancy(&mut self, relay_mean: f64, relay_max: usize, inflight: usize) {
-        self.relay_occupancy_samples.push((relay_mean, relay_max));
-        self.inflight_samples.push(inflight);
-    }
-
     /// Whether every authored op has reached full coverage.
     pub fn all_covered(&self) -> bool {
         self.ops.values().all(|op| op.full_at.is_some())
     }
 
-    /// Freeze into the serializable record.
-    pub fn finish(&self, seed: u64) -> RunRecord {
+    /// Freeze, together with the driver's own counters, into the
+    /// serializable record.
+    pub fn finish(&self, driver: &DriverMetrics, seed: u64) -> RunRecord {
         let full_times: Vec<f64> = self
             .ops
             .values()
@@ -159,18 +170,18 @@ impl Metrics {
             duplicate_replies: self.duplicate_replies,
             backfill_receives: self.backfill_receives,
             drops: self.drops,
-            shed_appends: self.shed_appends,
-            fire_backpressure: self.fire_backpressure,
-            forced_drops: self.forced_drops,
-            relay_occupancy_mean: mean(self.relay_occupancy_samples.iter().map(|(m, _)| *m)),
-            relay_occupancy_max: self
+            shed_appends: driver.shed_appends,
+            fire_backpressure: driver.fire_backpressure,
+            forced_drops: driver.forced_drops,
+            relay_occupancy_mean: mean(driver.relay_occupancy_samples.iter().map(|(m, _)| *m)),
+            relay_occupancy_max: driver
                 .relay_occupancy_samples
                 .iter()
                 .map(|(_, x)| *x)
                 .max()
                 .unwrap_or(0),
-            inflight_mean: mean(self.inflight_samples.iter().map(|&x| x as f64)),
-            inflight_max: self.inflight_samples.iter().copied().max().unwrap_or(0),
+            inflight_mean: mean(driver.inflight_samples.iter().map(|&x| x as f64)),
+            inflight_max: driver.inflight_samples.iter().copied().max().unwrap_or(0),
             payload_evictions: self.payload_evictions,
             full_evictions: self.full_evictions,
             native_syncs: self.native_syncs,
