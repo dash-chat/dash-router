@@ -95,7 +95,10 @@ where
     };
     let flush =
         |msgs: &mut Vec<WireMessage<N, L>>, r: &mut LogRanges<L>, p: &mut BTreeSet<L::Channel>| {
-            if !r.is_empty() || !p.is_empty() {
+            // `len`, not `is_empty`: a known-but-empty marker is a named
+            // log the receiver must not answer wholesale, so a piece of
+            // only markers still goes out.
+            if r.len() > 0 || !p.is_empty() {
                 msgs.push(WireMessage::want(
                     sender,
                     origin,
@@ -256,5 +259,48 @@ mod tests {
             })
             .sum();
         assert_eq!(total, 60);
+    }
+
+    /// A known-but-empty marker is a named log ("don't send this one
+    /// wholesale"), so a piece holding only markers is still worth sending.
+    /// Before this test, a marker that could not share a piece with the next
+    /// real log was neither flushed nor cleared, and the real log was
+    /// dropped against a budget the marker was silently eating.
+    #[test]
+    fn want_marker_alone_is_flushed_not_stuck() {
+        let ranges = LogRanges::from_pairs([(0u8, Ranges::empty()), (1u8, Ranges::range(0, 1))]);
+        let one_marker = WireMessage::want(
+            1u32,
+            9u32,
+            LogRanges::from_pairs([(0u8, Ranges::empty())]),
+            BTreeSet::<u8>::new(),
+        )
+        .encode()
+        .len();
+        let one_real = WireMessage::want(
+            1u32,
+            9u32,
+            LogRanges::from_pairs([(1u8, Ranges::range(0, 1))]),
+            BTreeSet::<u8>::new(),
+        )
+        .encode()
+        .len();
+        // Each fits alone; both together do not.
+        let budget = one_marker.max(one_real);
+        let (msgs, dropped) = pack_want(1u32, 9u32, ranges, BTreeSet::new(), budget);
+        assert_eq!(dropped, 0, "the real log must not be dropped");
+        let logs: Vec<u8> = msgs
+            .iter()
+            .flat_map(|m| match &m.body {
+                WireBody::Want { ranges, .. } => ranges.iter().map(|(l, _)| l).collect::<Vec<_>>(),
+                WireBody::Have(_) => vec![],
+            })
+            .collect();
+        assert_eq!(
+            logs,
+            vec![0, 1],
+            "marker and real log both arrive, in order"
+        );
+        assert_eq!(msgs.len(), 2);
     }
 }

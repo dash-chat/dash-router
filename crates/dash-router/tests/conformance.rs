@@ -153,7 +153,7 @@ fn step_strategy<L: TestLog>(
         0u32..5,
         proptest::collection::vec((log.clone(), 0u32..8, 0u32..8), 0..4),
         proptest::collection::vec(channel.clone(), 0..3),
-        prop_oneof![Just(11usize), Just(3800usize)],
+        prop_oneof![Just(12usize), Just(3800usize)],
     )
         .prop_map(
             |(from, origin, ranges, channels, budget)| Step::RecvMixedWant {
@@ -502,8 +502,17 @@ impl<L: TestLog> Driver<L> {
                         .map(|(log, start, end)| (log, Ranges::range(start, end))),
                 );
                 let channels: BTreeSet<u8> = channels.into_iter().collect();
-                let (pieces, _) =
+                let (pieces, dropped) =
                     dash_router::pack::pack_want(from, origin, ranges, channels, budget);
+                // The small budget must split the Want, never hollow it: a
+                // dropped range would silently turn "named" into "unnamed"
+                // for both machines at once and hide a wholesale-vs-named
+                // divergence.
+                if dropped != 0 {
+                    return Err(TestCaseError::fail(format!(
+                        "budget {budget} dropped {dropped} named log(s)"
+                    )));
+                }
                 let (mut sut, mut refr) = (Vec::new(), Vec::new());
                 for msg in pieces {
                     let (s, r) = self.recv_want(idx, msg).await?;

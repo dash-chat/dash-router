@@ -214,12 +214,26 @@ impl Ranges {
 /// prunes). p2panda nests the other way round (author outer) because sync
 /// walks per peer; the router nests channel outer because subscriptions
 /// and the relay store are keyed by channel.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "L::Channel: Serialize, L::Author: Serialize",
-    deserialize = "L::Channel: Deserialize<'de>, L::Author: Deserialize<'de>"
-))]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(bound(serialize = "L::Channel: Serialize, L::Author: Serialize"))]
 pub struct LogRanges<L: Log>(BTreeMap<L::Channel, BTreeMap<L::Author, Ranges>>);
+
+/// Hand-written so the invariant survives the wire: a channel with no
+/// authors is a decode error, not a ghost entry that `channels()` reports
+/// and `union` carries.
+impl<'de, L: Log> Deserialize<'de> for LogRanges<L>
+where
+    L::Channel: Deserialize<'de>,
+    L::Author: Deserialize<'de>,
+{
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let map: BTreeMap<L::Channel, BTreeMap<L::Author, Ranges>> = Deserialize::deserialize(d)?;
+        if let Some((c, _)) = map.iter().find(|(_, authors)| authors.is_empty()) {
+            return Err(serde::de::Error::custom(format!("channel {c} has no logs")));
+        }
+        Ok(Self(map))
+    }
+}
 
 impl<L: Log> Default for LogRanges<L> {
     fn default() -> Self {
@@ -646,6 +660,24 @@ mod tests {
         let u: LogRanges<u8> = LogRanges::from_pairs([(4u8, r(&[0, 2]))]);
         let ub = postcard::to_stdvec(&u).unwrap();
         assert_eq!(postcard::from_bytes::<LogRanges<u8>>(&ub).unwrap(), u);
+    }
+
+    /// The "no empty inner map" invariant holds for bytes off the wire
+    /// too: a channel with no authors is rejected at decode, so a peer
+    /// cannot plant a ghost channel that `channels()` reports and
+    /// `union` carries but no log lives under.
+    #[test]
+    fn deserializing_an_empty_channel_is_rejected() {
+        let ghost: BTreeMap<u8, BTreeMap<u8, Ranges>> = BTreeMap::from([(7u8, BTreeMap::new())]);
+        let bytes = postcard::to_stdvec(&ghost).unwrap();
+        let err = postcard::from_bytes::<LogRanges<Pair>>(&bytes).unwrap_err();
+        assert!(err.to_string().contains("Serde"), "{err}");
+        // A well-formed neighbour still decodes.
+        let ok: BTreeMap<u8, BTreeMap<u8, Ranges>> =
+            BTreeMap::from([(7u8, BTreeMap::from([(1u8, Ranges::empty())]))]);
+        let bytes = postcard::to_stdvec(&ok).unwrap();
+        let m = postcard::from_bytes::<LogRanges<Pair>>(&bytes).unwrap();
+        assert_eq!(m.get(&Pair::new(7, 1)), Some(&Ranges::empty()));
     }
 
     // --- Nested set ops against a flat oracle -----------------------------
