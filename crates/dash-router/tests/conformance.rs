@@ -14,10 +14,10 @@
 //! IS our state machine, so the crate's Reference/SUT scaffolding would
 //! duplicate what `NodeMachine` already is.
 //!
-//! Two step universes (final review F2): `u8` logs, where every prefix
-//! holds at most one log, and [`Pair`] logs, where each prefix holds two
-//! — so prefix subscriptions migrate several logs at once and a Want
-//! mixing named ranges with prefixes (and split into pieces) actually
+//! Two step universes (final review F2): `u8` logs, where every channel
+//! holds at most one log, and [`Pair`] logs, where each channel holds two
+//! — so channel subscriptions migrate several logs at once and a Want
+//! mixing named ranges with channels (and split into pieces) actually
 //! discriminates named from wholesale. The harness is generic over the
 //! log type ([`TestLog`]) and instantiated once per universe.
 //!
@@ -76,8 +76,8 @@ impl IntervalSource for Scripted {
 // --- Log universes ----------------------------------------------------
 
 /// A log type the harness can be instantiated over. Both universes use
-/// `u8` prefixes.
-trait TestLog: WireLog + Log<Prefix = u8> + Default + Debug + Send + Sync + 'static {
+/// `u8` channels.
+trait TestLog: WireLog + Log<Channel = u8> + Default + Debug + Send + Sync + 'static {
     /// A byte identifying the log in op headers.
     fn tag(&self) -> u8;
 }
@@ -90,7 +90,7 @@ impl TestLog for u8 {
 
 impl TestLog for Pair {
     fn tag(&self) -> u8 {
-        self.prefix * 16 + self.author
+        self.channel * 16 + self.author
     }
 }
 
@@ -106,20 +106,20 @@ enum Step<L> {
         start: u32,
         end: u32,
     },
-    /// A Want naming no ranges, only a prefix: "every log under it".
-    RecvPrefixWant {
+    /// A Want naming no ranges, only a channel: "every log under it".
+    RecvChannelWant {
         from: u32,
         origin: u32,
-        prefix: u8,
+        channel: u8,
     },
-    /// A Want mixing named ranges with prefixes, packed by `pack_want`
+    /// A Want mixing named ranges with channels, packed by `pack_want`
     /// under `budget` bytes and delivered piece by piece (a small budget
     /// splits it), so both machines record a split Want.
     RecvMixedWant {
         from: u32,
         origin: u32,
         ranges: Vec<(L, u32, u32)>,
-        prefixes: Vec<u8>,
+        channels: Vec<u8>,
         budget: usize,
     },
     RecvHave {
@@ -130,7 +130,7 @@ enum Step<L> {
     Append {
         log: L,
     },
-    /// Subscribe to a prefix.
+    /// Subscribe to a channel.
     Subscribe(u8),
     Unsubscribe(u8),
     Advance(u64),
@@ -142,25 +142,25 @@ enum Step<L> {
     Maintain,
 }
 
-/// The step universe over logs drawn from `log` and prefixes from
-/// `prefix`.
+/// The step universe over logs drawn from `log` and channels from
+/// `channel`.
 fn step_strategy<L: TestLog>(
     log: impl Strategy<Value = L> + Clone + 'static,
-    prefix: impl Strategy<Value = u8> + Clone + 'static,
+    channel: impl Strategy<Value = u8> + Clone + 'static,
 ) -> impl Strategy<Value = Step<L>> {
     let mixed = (
         1u32..4,
         0u32..5,
         proptest::collection::vec((log.clone(), 0u32..8, 0u32..8), 0..4),
-        proptest::collection::vec(prefix.clone(), 0..3),
-        prop_oneof![Just(11usize), Just(3800usize)],
+        proptest::collection::vec(channel.clone(), 0..3),
+        prop_oneof![Just(12usize), Just(3800usize)],
     )
         .prop_map(
-            |(from, origin, ranges, prefixes, budget)| Step::RecvMixedWant {
+            |(from, origin, ranges, channels, budget)| Step::RecvMixedWant {
                 from,
                 origin,
                 ranges,
-                prefixes,
+                channels,
                 budget,
             },
         );
@@ -168,14 +168,14 @@ fn step_strategy<L: TestLog>(
         3 => (1u32..4, 0u32..5, log.clone(), 0u32..8, 0u32..8).prop_map(
             |(from, origin, log, start, end)| Step::RecvWant { from, origin, log, start, end }
         ),
-        1 => (1u32..4, 0u32..5, prefix.clone())
-            .prop_map(|(from, origin, prefix)| Step::RecvPrefixWant { from, origin, prefix }),
+        1 => (1u32..4, 0u32..5, channel.clone())
+            .prop_map(|(from, origin, channel)| Step::RecvChannelWant { from, origin, channel }),
         2 => mixed,
         3 => (1u32..4, log.clone(), proptest::collection::vec((0u32..8, any::<bool>()), 0..4))
             .prop_map(|(from, log, seqs)| Step::RecvHave { from, log, seqs }),
         2 => log.prop_map(|log| Step::Append { log }),
-        1 => prefix.clone().prop_map(Step::Subscribe),
-        1 => prefix.prop_map(Step::Unsubscribe),
+        1 => channel.clone().prop_map(Step::Subscribe),
+        1 => channel.prop_map(Step::Unsubscribe),
         2 => (10u64..600).prop_map(Step::Advance),
         1 => Just(Step::Maintain),
     ]
@@ -232,7 +232,7 @@ fn assert_router_matches<L: TestLog>(
     check!(idx, "wants", sut.wants, refr.wants);
     check!(idx, "haves", sut.haves, refr.haves);
     // Final review F2: the whole seen-sets, record by record — ranges,
-    // prefixes and TTLs — not just their range unions.
+    // channels and TTLs — not just their range unions.
     check!(idx, "relayed_wants", sut.relayed_wants, refr.relayed_wants);
     check!(idx, "relayed_haves", sut.relayed_haves, refr.relayed_haves);
     check!(idx, "want_timer", sut.want_timer, refr.want_timer);
@@ -480,20 +480,20 @@ impl<L: TestLog> Driver<L> {
                     WireMessage::want(from, origin, ranges, BTreeSet::new());
                 (sut_out, ref_fx) = self.recv_want(idx, msg).await?;
             }
-            Step::RecvPrefixWant {
+            Step::RecvChannelWant {
                 from,
                 origin,
-                prefix,
+                channel,
             } => {
                 let msg: WireMessage<u32, L> =
-                    WireMessage::want(from, origin, LogRanges::empty(), BTreeSet::from([prefix]));
+                    WireMessage::want(from, origin, LogRanges::empty(), BTreeSet::from([channel]));
                 (sut_out, ref_fx) = self.recv_want(idx, msg).await?;
             }
             Step::RecvMixedWant {
                 from,
                 origin,
                 ranges,
-                prefixes,
+                channels,
                 budget,
             } => {
                 let ranges = LogRanges::from_pairs(
@@ -501,9 +501,18 @@ impl<L: TestLog> Driver<L> {
                         .into_iter()
                         .map(|(log, start, end)| (log, Ranges::range(start, end))),
                 );
-                let prefixes: BTreeSet<u8> = prefixes.into_iter().collect();
-                let (pieces, _) =
-                    dash_router::pack::pack_want(from, origin, ranges, prefixes, budget);
+                let channels: BTreeSet<u8> = channels.into_iter().collect();
+                let (pieces, dropped) =
+                    dash_router::pack::pack_want(from, origin, ranges, channels, budget);
+                // The small budget must split the Want, never hollow it: a
+                // dropped range would silently turn "named" into "unnamed"
+                // for both machines at once and hide a wholesale-vs-named
+                // divergence.
+                if dropped != 0 {
+                    return Err(TestCaseError::fail(format!(
+                        "budget {budget} dropped {dropped} named log(s)"
+                    )));
+                }
                 let (mut sut, mut refr) = (Vec::new(), Vec::new());
                 for msg in pieces {
                     let (s, r) = self.recv_want(idx, msg).await?;
@@ -549,8 +558,8 @@ impl<L: TestLog> Driver<L> {
     /// Deliver a Want to both machines, mirroring the SUT's arm-on-recv.
     ///
     /// Finding 8(a) / review focus 6: the SUT only arms the have timer when
-    /// the RECEIVED Want names something — ranges or prefixes (an empty
-    /// Want must not arm a forever no-op fire/re-arm loop; a prefix-only
+    /// the RECEIVED Want names something — ranges or channels (an empty
+    /// Want must not arm a forever no-op fire/re-arm loop; a channel-only
     /// Want is a real request and must arm) and only when it is someone
     /// else's (an echo of this node's own Want is not recorded, so arming
     /// on it would be illegal). Mirror that exact gate here, not
@@ -565,12 +574,12 @@ impl<L: TestLog> Driver<L> {
         let WireBody::Want {
             origin,
             ranges,
-            prefixes,
+            channels,
         } = &msg.body
         else {
             unreachable!("recv_want is only called with a Want");
         };
-        let want_nonempty = !ranges.is_empty() || !prefixes.is_empty();
+        let want_nonempty = !ranges.is_empty() || !channels.is_empty();
         let foreign = *origin != self.ref_state.router.id;
         let sut_out = self
             .core
@@ -746,8 +755,8 @@ fn fixed_regression_sequence() {
 }
 
 /// Final review F2: the `Pair` universe's shape, pinned. Two logs under
-/// prefix 1 park in the relay, then a Subscribe migrates both; a peer's
-/// mixed Want (a named tail plus the prefix) arrives split into pieces, and
+/// channel 1 park in the relay, then a Subscribe migrates both; a peer's
+/// mixed Want (a named tail plus the channel) arrives split into pieces, and
 /// this node's own Want comes back echoed by a relay; the Have that answers
 /// must agree between the machines.
 #[test]
@@ -757,7 +766,7 @@ fn fixed_pair_regression_sequence() {
         from,
         origin,
         ranges: vec![(log, 1, 8)],
-        prefixes: vec![1],
+        channels: vec![1],
         budget,
     };
     let split = dash_router::pack::pack_want(
@@ -765,12 +774,12 @@ fn fixed_pair_regression_sequence() {
         4u32,
         LogRanges::from_pairs([(a, Ranges::range(1, 8))]),
         BTreeSet::from([1u8]),
-        11,
+        12,
     );
     assert_eq!(
-        split.0.len(),
-        2,
-        "an 11-byte budget splits prefixes from ranges"
+        (split.0.len(), split.1),
+        (2, 0),
+        "a 12-byte budget splits channels from ranges, dropping nothing"
     );
     let steps = vec![
         Step::RecvHave {
@@ -790,7 +799,7 @@ fn fixed_pair_regression_sequence() {
         },
         Step::Subscribe(1),   // migrates a and b, not `other`
         Step::Advance(600),   // past have_ttl: the Haves above expire
-        mixed(1, 4, a, 11),   // 4 names a's tail and wants prefix 1, split
+        mixed(1, 4, a, 12),   // 4 names a's tail and wants channel 1, split
         mixed(2, 0, b, 3800), // this node's own Want, echoed by 2
         Step::Advance(300),   // the have timer fires and answers 4
         Step::Unsubscribe(1),
@@ -803,7 +812,7 @@ fn fixed_pair_regression_sequence() {
 }
 
 fn pair_log() -> impl Strategy<Value = Pair> + Clone {
-    (0u8..2, 0u8..2).prop_map(|(prefix, author)| Pair::new(prefix, author))
+    (0u8..2, 0u8..2).prop_map(|(channel, author)| Pair::new(channel, author))
 }
 
 proptest! {
@@ -817,7 +826,7 @@ proptest! {
         run_lockstep(subs, intervals, steps)?;
     }
 
-    /// Final review F2: two logs per prefix (prefix 2 holds none).
+    /// Final review F2: two logs per channel (channel 2 holds none).
     #[test]
     fn shell_matches_the_node_machine_with_pair_logs(
         steps in proptest::collection::vec(step_strategy(pair_log(), 0u8..3), 1..40),

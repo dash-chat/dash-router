@@ -31,14 +31,14 @@ pub enum Command<L: Log> {
         op: Op,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
-    /// Subscribe to every log under `prefix`, now and in the future.
+    /// Subscribe to every log under `channel`, now and in the future.
     Subscribe {
-        prefix: L::Prefix,
+        channel: L::Channel,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
-    /// Stop caring about `prefix`; already-stored data is kept.
+    /// Stop caring about `channel`; already-stored data is kept.
     Unsubscribe {
-        prefix: L::Prefix,
+        channel: L::Channel,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
     /// Finding 3 (spec §3's degrade-and-report posture, made observable):
@@ -107,17 +107,17 @@ impl<L: Log + Send> RouterHandle<L> {
         .await
     }
 
-    /// Subscribe to every log under `prefix`: relay-held logs under it
+    /// Subscribe to every log under `channel`: relay-held logs under it
     /// migrate to the ext store, and new authors under it deliver.
-    pub async fn subscribe(&self, prefix: L::Prefix) -> anyhow::Result<()> {
-        self.call(|reply| Command::Subscribe { prefix, reply })
+    pub async fn subscribe(&self, channel: L::Channel) -> anyhow::Result<()> {
+        self.call(|reply| Command::Subscribe { channel, reply })
             .await
     }
 
-    /// Stop caring about `prefix`. Nothing is forgotten; later data under
+    /// Stop caring about `channel`. Nothing is forgotten; later data under
     /// it relays without delivering.
-    pub async fn unsubscribe(&self, prefix: L::Prefix) -> anyhow::Result<()> {
-        self.call(|reply| Command::Unsubscribe { prefix, reply })
+    pub async fn unsubscribe(&self, channel: L::Channel) -> anyhow::Result<()> {
+        self.call(|reply| Command::Unsubscribe { channel, reply })
             .await
     }
 

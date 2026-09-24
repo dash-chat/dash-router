@@ -144,7 +144,7 @@ pub trait GossipSubscription {
 /// reach. An embedder whose overlay is not LAN-scoped (e.g. one that also
 /// bootstraps or relays over the internet) is responsible for scoping it,
 /// for instance with a dedicated LAN-only topic. Otherwise Wants and Haves
-/// cross the internet too, and a Want — which lists the logs and prefixes
+/// cross the internet too, and a Want — which lists the logs and channels
 /// its node is interested in — becomes an interest signal visible to every
 /// overlay member, not just to peers on the local network.
 pub struct GossipTransport<P, S> {

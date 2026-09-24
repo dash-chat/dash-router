@@ -12,7 +12,8 @@ use crate::{
 };
 
 /// Bump together with [`GOSSIP_TOPIC`] on breaking change.
-/// v1: Want carries prefixes (spec 2026-09-22 §3.5) and its origin.
+/// v1: Want carries channels (spec 2026-09-22 §3.5) and its origin; its
+/// `LogRanges` is nested by channel then author (spec 2026-09-24).
 pub const WIRE_VERSION: u8 = 1;
 
 /// The well-known gossip topic name this wire protocol runs on. Every
@@ -37,8 +38,8 @@ const _: () = {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "N: Serialize, L: Serialize, L::Prefix: Serialize",
-    deserialize = "N: Deserialize<'de>, L: Deserialize<'de>, L::Prefix: Deserialize<'de>"
+    serialize = "N: Serialize, L: Serialize, L::Channel: Serialize, L::Author: Serialize",
+    deserialize = "N: Deserialize<'de>, L: Deserialize<'de>, L::Channel: Deserialize<'de>, L::Author: Deserialize<'de>"
 ))]
 pub struct WireMessage<N, L: Log> {
     pub version: u8,
@@ -50,19 +51,19 @@ pub struct WireMessage<N, L: Log> {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "N: Serialize, L: Serialize, L::Prefix: Serialize",
-    deserialize = "N: Deserialize<'de>, L: Deserialize<'de>, L::Prefix: Deserialize<'de>"
+    serialize = "N: Serialize, L: Serialize, L::Channel: Serialize, L::Author: Serialize",
+    deserialize = "N: Deserialize<'de>, L: Deserialize<'de>, L::Channel: Deserialize<'de>, L::Author: Deserialize<'de>"
 ))]
 pub enum WireBody<N, L: Log> {
     /// `origin`: the node that wants, preserved by every relayer (the
     /// message's `sender` is re-signed at each hop), so an answerer keys
     /// the Want by its wanter and ignores echoes of its own.
     /// `ranges`: gaps and open tails for logs the wanter already knows.
-    /// `prefixes`: "and every log under these that I did not name".
+    /// `channels`: "and every log under these that I did not name".
     Want {
         origin: N,
         ranges: LogRanges<L>,
-        prefixes: BTreeSet<L::Prefix>,
+        channels: BTreeSet<L::Channel>,
     },
     /// Hydrated ops grouped per log, in (log, seq) order; payloads may be
     /// None (GC'd). Grouping avoids repeating the log id per op.
@@ -72,14 +73,19 @@ pub enum WireBody<N, L: Log> {
 impl<N: Serialize + DeserializeOwned, L: WireLog> WireMessage<N, L> {
     /// A Want signed by `sender` on behalf of `origin` (`sender` itself
     /// for an own Want, the incoming Want's origin for a relay).
-    pub fn want(sender: N, origin: N, ranges: LogRanges<L>, prefixes: BTreeSet<L::Prefix>) -> Self {
+    pub fn want(
+        sender: N,
+        origin: N,
+        ranges: LogRanges<L>,
+        channels: BTreeSet<L::Channel>,
+    ) -> Self {
         Self {
             version: WIRE_VERSION,
             sender,
             body: WireBody::Want {
                 origin,
                 ranges,
-                prefixes,
+                channels,
             },
         }
     }
@@ -125,10 +131,10 @@ mod tests {
         );
         match &want.body {
             WireBody::Want {
-                origin, prefixes, ..
+                origin, channels, ..
             } => {
                 assert_eq!(*origin, 5, "the origin survives a relayer's re-signing");
-                assert_eq!(prefixes, &BTreeSet::from([2u8]));
+                assert_eq!(channels, &BTreeSet::from([2u8]));
             }
             WireBody::Have(_) => unreachable!(),
         }
@@ -154,5 +160,77 @@ mod tests {
             WireMessage::<u32, u8>::want(7, 7, LogRanges::empty(), BTreeSet::new()).encode();
         bad[0] = WIRE_VERSION + 1; // version is the first postcard field (u8)
         assert!(WireMessage::<u32, u8>::decode(&bad).is_err());
+    }
+
+    /// The point of nesting: one channel, many authors, encodes the channel once.
+    #[test]
+    fn want_encodes_a_shared_channel_once() {
+        #[derive(
+            Clone,
+            Copy,
+            Debug,
+            Default,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            Serialize,
+            Deserialize,
+        )]
+        struct Ch([u8; 8]);
+        impl std::fmt::Display for Ch {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{:?}", self.0)
+            }
+        }
+        #[derive(
+            Clone,
+            Copy,
+            Debug,
+            Default,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            Serialize,
+            Deserialize,
+        )]
+        struct Wide {
+            channel: Ch,
+            author: u8,
+        }
+        impl std::fmt::Display for Wide {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}/{}", self.channel, self.author)
+            }
+        }
+        impl Log for Wide {
+            type Channel = Ch;
+            type Author = u8;
+            fn channel(&self) -> Ch {
+                self.channel
+            }
+            fn author(&self) -> u8 {
+                self.author
+            }
+            fn new(channel: Ch, author: u8) -> Self {
+                Self { channel, author }
+            }
+        }
+
+        let channel = Ch([0xAB; 8]);
+        let ranges = LogRanges::from_pairs(
+            (0..10u8).map(|a| (Wide { channel, author: a }, Ranges::from(a as u32))),
+        );
+        let bytes = WireMessage::<u32, Wide>::want(1, 1, ranges, BTreeSet::new()).encode();
+        let hits = bytes.windows(8).filter(|w| *w == &channel.0[..]).count();
+        assert_eq!(
+            hits,
+            1,
+            "channel bytes appear once in {} bytes",
+            bytes.len()
+        );
     }
 }

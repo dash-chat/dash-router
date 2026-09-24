@@ -71,7 +71,7 @@ pub struct Timer<T> {
 pub struct Record<L: Log, T> {
     pub ranges: LogRanges<L>,
     /// Wholesale interests carried by a Want; always empty on Have records.
-    pub prefixes: BTreeSet<L::Prefix>,
+    pub channels: BTreeSet<L::Channel>,
     pub ttl_left: T,
 }
 
@@ -79,7 +79,7 @@ impl<L: Log, T> Record<L, T> {
     fn ranges_only(ranges: LogRanges<L>, ttl_left: T) -> Self {
         Self {
             ranges,
-            prefixes: BTreeSet::new(),
+            channels: BTreeSet::new(),
             ttl_left,
         }
     }
@@ -99,7 +99,7 @@ pub struct RouterState<N: Ord, L: Log, T> {
     /// key whichever path it took, and an echo of this node's own Want
     /// (relayed back to it) is never recorded at all: it would otherwise
     /// name this node's logs on a relayer's behalf and stop them going
-    /// wholesale to a prefix wanter behind that relayer. A Want may arrive
+    /// wholesale to a channel wanter behind that relayer. A Want may arrive
     /// split across several wire messages (the shell's `pack_want`), and a
     /// node's successive Wants overlap; each record dies `want_ttl` after
     /// its own arrival, so pieces union and stale ranges expire on their
@@ -127,9 +127,9 @@ pub struct RouterState<N: Ord, L: Log, T> {
     /// Want ranges this node has already flooded onward: the same seen-set
     /// mechanism, for the Want flood, on `want_ttl`.
     pub relayed_wants: Vec<Record<L, T>>,
-    /// This node's wholesale interests: every log under these prefixes,
+    /// This node's wholesale interests: every log under these channels,
     /// known or not. Set by `Open` from the node glue's subscriptions.
-    pub open: BTreeSet<L::Prefix>,
+    pub open: BTreeSet<L::Channel>,
     pub want_timer: Option<Timer<T>>,
     pub have_timer: Option<Timer<T>>,
 }
@@ -152,49 +152,47 @@ impl<N: Id, L: Log, T: TimeInterval> RouterState<N, L, T> {
     /// Everything not held, for every known log: the gaps plus the open
     /// tail. A known-but-empty log (empty range in `held`) wants everything.
     pub fn wanted(&self) -> LogRanges<L> {
-        LogRanges::from_pairs(self.held.iter().map(|(log, r)| (*log, r.complement())))
+        LogRanges::from_pairs(self.held.iter().map(|(log, r)| (log, r.complement())))
     }
 
-    /// Held logs with data whose prefix is in `prefixes` and that `named`
-    /// does not mention: the wholesale half of a Want's answer.
-    fn held_under(&self, prefixes: &BTreeSet<L::Prefix>, named: &LogRanges<L>) -> LogRanges<L> {
-        LogRanges::from_pairs(
+    /// Held logs with data under any of `channels` that `named` does not
+    /// mention: the wholesale half of a Want's answer.
+    fn held_under(&self, channels: &BTreeSet<L::Channel>, named: &LogRanges<L>) -> LogRanges<L> {
+        LogRanges::from_pairs(channels.iter().flat_map(|c| {
             self.held
-                .iter()
-                .filter(|(log, r)| {
-                    !r.is_empty() && prefixes.contains(&log.prefix()) && named.get(log).is_none()
-                })
-                .map(|(log, r)| (*log, r.clone())),
-        )
+                .channel(c)
+                .filter(|(log, r)| !r.is_empty() && named.get(log).is_none())
+                .map(|(log, r)| (log, r.clone()))
+        }))
     }
 
-    /// Union of recent Wants from other nodes, with each wanter's prefix
+    /// Union of recent Wants from other nodes, with each wanter's channel
     /// interests expanded over what this node holds (spec §3.5). A wanter's
-    /// live records (keyed by origin) are unioned *before* the prefix
+    /// live records (keyed by origin) are unioned *before* the channel
     /// expansion, so a log the wanter named in one piece of a split Want is
-    /// not sent wholesale because of a prefix carried in another piece.
+    /// not sent wholesale because of a channel carried in another piece.
     pub fn others_wants(&self) -> LogRanges<L> {
         self.wants
             .values()
             .fold(LogRanges::empty(), |acc, records| {
-                let (named, prefixes) = records.iter().fold(
+                let (named, channels) = records.iter().fold(
                     (LogRanges::empty(), BTreeSet::new()),
-                    |(named, mut prefixes), r| {
-                        prefixes.extend(r.prefixes.iter().copied());
-                        (named.union(&r.ranges), prefixes)
+                    |(named, mut channels), r| {
+                        channels.extend(r.channels.iter().copied());
+                        (named.union(&r.ranges), channels)
                     },
                 );
-                let wholesale = self.held_under(&prefixes, &named);
+                let wholesale = self.held_under(&channels, &named);
                 acc.union(&named).union(&wholesale)
             })
     }
 
-    /// Union of recent Want prefixes from other nodes.
-    pub fn others_prefixes(&self) -> BTreeSet<L::Prefix> {
+    /// Union of recent Want channels from other nodes.
+    pub fn others_channels(&self) -> BTreeSet<L::Channel> {
         self.wants
             .values()
             .flatten()
-            .flat_map(|r| r.prefixes.iter().copied())
+            .flat_map(|r| r.channels.iter().copied())
             .collect()
     }
 
@@ -205,20 +203,19 @@ impl<N: Id, L: Log, T: TimeInterval> RouterState<N, L, T> {
             .fold(LogRanges::empty(), |acc, r| acc.union(&r.ranges))
     }
 
-    /// DESIGN.md §1, plus this node's open prefixes. Prefixes are never
-    /// suppressed by others' prefixes: two nodes' explicit knowledge under
-    /// the same prefix differs, so one node's answer is not the other's.
-    /// Logs under this node's own open prefixes stay named even when another
+    /// DESIGN.md §1, plus this node's open channels. Channels are never
+    /// suppressed by others' channels: two nodes' explicit knowledge under
+    /// the same channel differs, so one node's answer is not the other's.
+    /// Logs under this node's own open channels stay named even when another
     /// peer already wants them, so an answerer never sends them wholesale
     /// (spec §3.5: a wanter that already knows a log names it explicitly).
-    pub fn next_want(&self) -> (LogRanges<L>, BTreeSet<L::Prefix>) {
+    pub fn next_want(&self) -> (LogRanges<L>, BTreeSet<L::Channel>) {
         let wanted = self.wanted();
         let suppressed = wanted.difference(&self.others_wants());
         let named_under_open = LogRanges::from_pairs(
-            wanted
+            self.open
                 .iter()
-                .filter(|(log, _)| self.open.contains(&log.prefix()))
-                .map(|(log, r)| (*log, r.clone())),
+                .flat_map(|c| wanted.channel(c).map(|(log, r)| (log, r.clone()))),
         );
         (suppressed.union(&named_under_open), self.open.clone())
     }
@@ -238,10 +235,10 @@ impl<N: Id, L: Log, T: TimeInterval> RouterState<N, L, T> {
         combined_ranges(&self.relayed_wants)
     }
 
-    pub fn relayed_want_prefixes(&self) -> BTreeSet<L::Prefix> {
+    pub fn relayed_want_channels(&self) -> BTreeSet<L::Channel> {
         self.relayed_wants
             .iter()
-            .flat_map(|r| r.prefixes.iter().copied())
+            .flat_map(|r| r.channels.iter().copied())
             .collect()
     }
 
@@ -249,10 +246,10 @@ impl<N: Id, L: Log, T: TimeInterval> RouterState<N, L, T> {
         self.relayed_haves.push(Record::ranges_only(ranges, ttl));
     }
 
-    fn note_relayed_wants(&mut self, ranges: LogRanges<L>, prefixes: BTreeSet<L::Prefix>, ttl: T) {
+    fn note_relayed_wants(&mut self, ranges: LogRanges<L>, channels: BTreeSet<L::Channel>, ttl: T) {
         self.relayed_wants.push(Record {
             ranges,
-            prefixes,
+            channels,
             ttl_left: ttl,
         });
     }
@@ -284,8 +281,8 @@ pub enum RouterAction<N, L: Log, T> {
     /// Only when the Have timer is due.
     FireHave,
     /// Replace this node's wholesale interests (the node glue's
-    /// subscriptions, by prefix).
-    Open(BTreeSet<L::Prefix>),
+    /// subscriptions, by channel).
+    Open(BTreeSet<L::Channel>),
     /// A Want message arrives from another node. `from` is the wire
     /// sender (the last relayer, or the wanter itself); `origin` is the
     /// node that wanted, carried unchanged through every relay.
@@ -293,7 +290,7 @@ pub enum RouterAction<N, L: Log, T> {
         from: N,
         origin: N,
         ranges: LogRanges<L>,
-        prefixes: BTreeSet<L::Prefix>,
+        channels: BTreeSet<L::Channel>,
     },
     /// A Have message arrives from another node.
     RecvHave { from: N, ranges: LogRanges<L> },
@@ -312,7 +309,7 @@ pub enum Effect<N, L: Log> {
     SendWant {
         origin: N,
         ranges: LogRanges<L>,
-        prefixes: BTreeSet<L::Prefix>,
+        channels: BTreeSet<L::Channel>,
     },
     /// Broadcast a Have for these ranges to the LAN; the shell hydrates them
     /// into wire ops.
@@ -382,15 +379,15 @@ impl<N: Id, L: Log, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                 };
                 ensure!(timer.remaining.is_zero(), "want timer not due");
                 s.want_timer = None;
-                let (ranges, prefixes) = s.next_want();
-                if !ranges.is_empty() || !prefixes.is_empty() {
+                let (ranges, channels) = s.next_want();
+                if !ranges.is_empty() || !channels.is_empty() {
                     // Own emissions count as relayed, or the flood's echo
                     // would be re-flooded by its own author.
-                    s.note_relayed_wants(ranges.clone(), prefixes.clone(), self.config.want_ttl);
+                    s.note_relayed_wants(ranges.clone(), channels.clone(), self.config.want_ttl);
                     fx.push(Effect::SendWant {
                         origin: s.id,
                         ranges,
-                        prefixes,
+                        channels,
                     });
                 }
             }
@@ -426,43 +423,43 @@ impl<N: Id, L: Log, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                 s.held = ranges;
             }
 
-            RouterAction::Open(prefixes) => {
-                s.open = prefixes;
+            RouterAction::Open(channels) => {
+                s.open = channels;
             }
 
             RouterAction::RecvWant {
                 from,
                 origin,
                 ranges,
-                prefixes,
+                channels,
             } => {
                 ensure!(from != s.id, "received own message");
                 // DESIGN.md: every received message is re-transmitted:
                 // simple flooding, terminated by the seen-set. Relay only
                 // the not-yet-relayed portion, re-signed.
-                let relay_prefixes: BTreeSet<L::Prefix> = prefixes
-                    .difference(&s.relayed_want_prefixes())
+                let relay_channels: BTreeSet<L::Channel> = channels
+                    .difference(&s.relayed_want_channels())
                     .copied()
                     .collect();
-                // Prefixes are relayed once per want_ttl, so carrying the
+                // Channels are relayed once per want_ttl, so carrying the
                 // full named ranges with them is bounded, and it keeps the
                 // naming that stops answerers from sending named logs
                 // wholesale.
-                let relay_ranges = if relay_prefixes.is_empty() {
+                let relay_ranges = if relay_channels.is_empty() {
                     ranges.difference(&s.relayed_want_ranges())
                 } else {
                     ranges.clone()
                 };
-                if !relay_ranges.is_empty() || !relay_prefixes.is_empty() {
+                if !relay_ranges.is_empty() || !relay_channels.is_empty() {
                     s.note_relayed_wants(
                         relay_ranges.clone(),
-                        relay_prefixes.clone(),
+                        relay_channels.clone(),
                         self.config.want_ttl,
                     );
                     fx.push(Effect::SendWant {
                         origin,
                         ranges: relay_ranges,
-                        prefixes: relay_prefixes,
+                        channels: relay_channels,
                     });
                 }
                 // Keyed by origin, never by `from`; an echo of this node's
@@ -471,7 +468,7 @@ impl<N: Id, L: Log, T: TimeInterval> Machine for RouterMachine<N, L, T> {
                 if origin != s.id {
                     s.wants.entry(origin).or_default().push(Record {
                         ranges,
-                        prefixes,
+                        channels,
                         ttl_left: self.config.want_ttl,
                     });
                 }

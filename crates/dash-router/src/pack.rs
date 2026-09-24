@@ -66,7 +66,7 @@ where
     (msgs, dropped)
 }
 
-/// Greedily pack a Want: prefixes first (they are tiny and are what an
+/// Greedily pack a Want: channels first (they are tiny and are what an
 /// unknown-author subscription rides on), then one log's ranges at a
 /// time. A single log whose ranges alone exceed the budget is dropped
 /// and counted; the next Want cycle retries with whatever changed.
@@ -77,7 +77,7 @@ pub fn pack_want<N, L>(
     sender: N,
     origin: N,
     ranges: LogRanges<L>,
-    prefixes: BTreeSet<L::Prefix>,
+    channels: BTreeSet<L::Channel>,
     budget: usize,
 ) -> (Vec<WireMessage<N, L>>, u64)
 where
@@ -87,15 +87,18 @@ where
     let mut msgs = Vec::new();
     let mut dropped = 0u64;
     let mut cur_ranges: LogRanges<L> = LogRanges::empty();
-    let mut cur_prefixes: BTreeSet<L::Prefix> = BTreeSet::new();
-    let len = |r: &LogRanges<L>, p: &BTreeSet<L::Prefix>| {
+    let mut cur_channels: BTreeSet<L::Channel> = BTreeSet::new();
+    let len = |r: &LogRanges<L>, p: &BTreeSet<L::Channel>| {
         WireMessage::want(sender, origin, r.clone(), p.clone())
             .encode()
             .len()
     };
     let flush =
-        |msgs: &mut Vec<WireMessage<N, L>>, r: &mut LogRanges<L>, p: &mut BTreeSet<L::Prefix>| {
-            if !r.is_empty() || !p.is_empty() {
+        |msgs: &mut Vec<WireMessage<N, L>>, r: &mut LogRanges<L>, p: &mut BTreeSet<L::Channel>| {
+            // `len`, not `is_empty`: a known-but-empty marker is a named
+            // log the receiver must not answer wholesale, so a piece of
+            // only markers still goes out.
+            if r.len() > 0 || !p.is_empty() {
                 msgs.push(WireMessage::want(
                     sender,
                     origin,
@@ -104,31 +107,31 @@ where
                 ));
             }
         };
-    for prefix in prefixes {
-        cur_prefixes.insert(prefix);
-        if len(&cur_ranges, &cur_prefixes) > budget {
-            cur_prefixes.remove(&prefix);
-            flush(&mut msgs, &mut cur_ranges, &mut cur_prefixes);
-            cur_prefixes.insert(prefix);
-            if len(&cur_ranges, &cur_prefixes) > budget {
-                cur_prefixes.remove(&prefix);
+    for channel in channels {
+        cur_channels.insert(channel);
+        if len(&cur_ranges, &cur_channels) > budget {
+            cur_channels.remove(&channel);
+            flush(&mut msgs, &mut cur_ranges, &mut cur_channels);
+            cur_channels.insert(channel);
+            if len(&cur_ranges, &cur_channels) > budget {
+                cur_channels.remove(&channel);
                 dropped += 1;
             }
         }
     }
     for (log, r) in ranges.iter() {
-        cur_ranges.insert(*log, r.clone());
-        if len(&cur_ranges, &cur_prefixes) > budget {
-            cur_ranges.remove(log);
-            flush(&mut msgs, &mut cur_ranges, &mut cur_prefixes);
-            cur_ranges.insert(*log, r.clone());
-            if len(&cur_ranges, &cur_prefixes) > budget {
-                cur_ranges.remove(log);
+        cur_ranges.insert(log, r.clone());
+        if len(&cur_ranges, &cur_channels) > budget {
+            cur_ranges.remove(&log);
+            flush(&mut msgs, &mut cur_ranges, &mut cur_channels);
+            cur_ranges.insert(log, r.clone());
+            if len(&cur_ranges, &cur_channels) > budget {
+                cur_ranges.remove(&log);
                 dropped += 1;
             }
         }
     }
-    flush(&mut msgs, &mut cur_ranges, &mut cur_prefixes);
+    flush(&mut msgs, &mut cur_ranges, &mut cur_channels);
     (msgs, dropped)
 }
 
@@ -205,28 +208,28 @@ mod tests {
     }
 
     #[test]
-    fn want_splits_ranges_and_carries_prefixes_first() {
+    fn want_splits_ranges_and_carries_channels_first() {
         let ranges = LogRanges::from_pairs((0..200u8).map(|l| (l, Ranges::from(3))));
-        let prefixes: BTreeSet<u8> = (0..50).collect();
-        let (msgs, dropped) = pack_want(1u32, 9u32, ranges, prefixes.clone(), 300);
+        let channels: BTreeSet<u8> = (0..50).collect();
+        let (msgs, dropped) = pack_want(1u32, 9u32, ranges, channels.clone(), 300);
         assert_eq!(dropped, 0);
         assert!(msgs.len() > 1);
         assert!(msgs.iter().all(|m| m.encode().len() <= 300));
-        let mut got_prefixes = BTreeSet::new();
+        let mut got_channels = BTreeSet::new();
         let mut got_logs = 0;
         for m in &msgs {
             if let WireBody::Want {
                 origin,
                 ranges,
-                prefixes,
+                channels,
             } = &m.body
             {
                 assert_eq!(*origin, 9, "every piece carries the origin");
-                got_prefixes.extend(prefixes.iter().copied());
+                got_channels.extend(channels.iter().copied());
                 got_logs += ranges.iter().count();
             }
         }
-        assert_eq!(got_prefixes, prefixes);
+        assert_eq!(got_channels, channels);
         assert_eq!(got_logs, 200);
     }
 
@@ -236,5 +239,68 @@ mod tests {
         assert!(msgs.is_empty());
         let (msgs, _) = pack_want(1u32, 1u32, LogRanges::<u8>::empty(), BTreeSet::new(), 1000);
         assert!(msgs.is_empty());
+    }
+
+    /// Review focus 5: pieces of a split Want each re-encode their own
+    /// channel key, so a channel spanning pieces never blows the budget.
+    #[test]
+    fn want_pieces_each_carry_their_channel() {
+        use dash_router_core::Pair;
+        let ranges = LogRanges::from_pairs((0..60u8).map(|a| (Pair::new(1, a), Ranges::from(3))));
+        let (msgs, dropped) = pack_want(1u32, 9u32, ranges, BTreeSet::new(), 64);
+        assert_eq!(dropped, 0);
+        assert!(msgs.len() > 1, "60 authors do not fit in 64 bytes");
+        assert!(msgs.iter().all(|m| m.encode().len() <= 64));
+        let total: usize = msgs
+            .iter()
+            .map(|m| match &m.body {
+                WireBody::Want { ranges, .. } => ranges.len(),
+                WireBody::Have(_) => 0,
+            })
+            .sum();
+        assert_eq!(total, 60);
+    }
+
+    /// A known-but-empty marker is a named log ("don't send this one
+    /// wholesale"), so a piece holding only markers is still worth sending.
+    /// Before this test, a marker that could not share a piece with the next
+    /// real log was neither flushed nor cleared, and the real log was
+    /// dropped against a budget the marker was silently eating.
+    #[test]
+    fn want_marker_alone_is_flushed_not_stuck() {
+        let ranges = LogRanges::from_pairs([(0u8, Ranges::empty()), (1u8, Ranges::range(0, 1))]);
+        let one_marker = WireMessage::want(
+            1u32,
+            9u32,
+            LogRanges::from_pairs([(0u8, Ranges::empty())]),
+            BTreeSet::<u8>::new(),
+        )
+        .encode()
+        .len();
+        let one_real = WireMessage::want(
+            1u32,
+            9u32,
+            LogRanges::from_pairs([(1u8, Ranges::range(0, 1))]),
+            BTreeSet::<u8>::new(),
+        )
+        .encode()
+        .len();
+        // Each fits alone; both together do not.
+        let budget = one_marker.max(one_real);
+        let (msgs, dropped) = pack_want(1u32, 9u32, ranges, BTreeSet::new(), budget);
+        assert_eq!(dropped, 0, "the real log must not be dropped");
+        let logs: Vec<u8> = msgs
+            .iter()
+            .flat_map(|m| match &m.body {
+                WireBody::Want { ranges, .. } => ranges.iter().map(|(l, _)| l).collect::<Vec<_>>(),
+                WireBody::Have(_) => vec![],
+            })
+            .collect();
+        assert_eq!(
+            logs,
+            vec![0, 1],
+            "marker and real log both arrive, in order"
+        );
+        assert_eq!(msgs.len(), 2);
     }
 }
