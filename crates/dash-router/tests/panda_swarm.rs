@@ -220,7 +220,7 @@ async fn fifty_nodes_form_a_sparse_overlay_and_fully_replicate() {
                 }
             }
             let held = Storage::held_all(&node.ext.snapshot());
-            if want.iter().all(|(l, s)| held.contains(l, *s)) {
+            if want.iter().all(|(l, s)| held.contains(&l, *s)) {
                 incomplete.remove(&i);
                 progressed = true;
             }
@@ -234,7 +234,7 @@ async fn fifty_nodes_form_a_sparse_overlay_and_fully_replicate() {
                 let held = Storage::held_all(&nodes[i].ext.snapshot());
                 let m: Vec<Log> = want
                     .iter()
-                    .filter(|(l, s)| !held.contains(l, *s))
+                    .filter(|(l, s)| !held.contains(&l, *s))
                     .map(|(l, _)| *l)
                     .collect();
                 missing.insert(i, m);

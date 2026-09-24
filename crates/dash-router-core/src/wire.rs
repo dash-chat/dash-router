@@ -37,8 +37,8 @@ const _: () = {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "N: Serialize, L: Serialize, L::Channel: Serialize",
-    deserialize = "N: Deserialize<'de>, L: Deserialize<'de>, L::Channel: Deserialize<'de>"
+    serialize = "N: Serialize, L: Serialize, L::Channel: Serialize, L::Author: Serialize",
+    deserialize = "N: Deserialize<'de>, L: Deserialize<'de>, L::Channel: Deserialize<'de>, L::Author: Deserialize<'de>"
 ))]
 pub struct WireMessage<N, L: Log> {
     pub version: u8,
@@ -50,8 +50,8 @@ pub struct WireMessage<N, L: Log> {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "N: Serialize, L: Serialize, L::Channel: Serialize",
-    deserialize = "N: Deserialize<'de>, L: Deserialize<'de>, L::Channel: Deserialize<'de>"
+    serialize = "N: Serialize, L: Serialize, L::Channel: Serialize, L::Author: Serialize",
+    deserialize = "N: Deserialize<'de>, L: Deserialize<'de>, L::Channel: Deserialize<'de>, L::Author: Deserialize<'de>"
 ))]
 pub enum WireBody<N, L: Log> {
     /// `origin`: the node that wants, preserved by every relayer (the

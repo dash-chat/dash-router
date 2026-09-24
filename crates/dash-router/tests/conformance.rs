@@ -765,12 +765,12 @@ fn fixed_pair_regression_sequence() {
         4u32,
         LogRanges::from_pairs([(a, Ranges::range(1, 8))]),
         BTreeSet::from([1u8]),
-        11,
+        12,
     );
     assert_eq!(
-        split.0.len(),
-        2,
-        "an 11-byte budget splits channels from ranges"
+        (split.0.len(), split.1),
+        (2, 0),
+        "a 12-byte budget splits channels from ranges, dropping nothing"
     );
     let steps = vec![
         Step::RecvHave {
@@ -790,7 +790,7 @@ fn fixed_pair_regression_sequence() {
         },
         Step::Subscribe(1),   // migrates a and b, not `other`
         Step::Advance(600),   // past have_ttl: the Haves above expire
-        mixed(1, 4, a, 11),   // 4 names a's tail and wants channel 1, split
+        mixed(1, 4, a, 12),   // 4 names a's tail and wants channel 1, split
         mixed(2, 0, b, 3800), // this node's own Want, echoed by 2
         Step::Advance(300),   // the have timer fires and answers 4
         Step::Unsubscribe(1),

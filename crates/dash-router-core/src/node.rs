@@ -91,7 +91,7 @@ impl<N: Id, L: Log, T: polestar::time::TimeInterval> NodeState<N, L, T> {
                 .held_all()
                 .iter()
                 .filter(|(log, _)| log.channel() == *channel)
-                .map(|(log, _)| (*log, Ranges::full())),
+                .map(|(log, _)| (log, Ranges::full())),
         )
     }
 
@@ -185,7 +185,7 @@ pub fn group_ops<L: PartialEq>(ops: Vec<(L, Seq, Op)>) -> Vec<(L, Vec<(Seq, Op)>
 ///
 /// `pub` so the tokio shell can share this exact parking-to-ranges
 /// computation with the model (see [`group_ops`]).
-pub fn ranges_of<L: Ord + Clone>(parked: &BTreeMap<(L, Seq), Op>) -> LogRanges<L> {
+pub fn ranges_of<L: Log>(parked: &BTreeMap<(L, Seq), Op>) -> LogRanges<L> {
     let mut by_log: BTreeMap<L, Vec<Seq>> = BTreeMap::new();
     for (log, seq) in parked.keys() {
         by_log.entry(log.clone()).or_default().push(*seq);
@@ -201,7 +201,7 @@ pub fn ranges_of<L: Ord + Clone>(parked: &BTreeMap<(L, Seq), Op>) -> LogRanges<L
 /// (DESIGN.md's payloads-first GC). Evicting a wanted payload would force
 /// the network to re-send it, so recent Wants are spared. Pure policy,
 /// shared verbatim by the model composition and the tokio shell.
-pub fn eviction_candidates<L: Id>(
+pub fn eviction_candidates<L: Log>(
     relay_held_payloads: &LogRanges<L>,
     others_wants: &LogRanges<L>,
 ) -> LogRanges<L> {
@@ -377,14 +377,14 @@ where
             match e {
                 Effect::Accept(novel) => {
                     for (log, r) in novel.iter() {
-                        if !s.is_subscribed(log) {
+                        if !s.is_subscribed(&log) {
                             continue;
                         }
                         // Never iterate `Ranges` directly — it may be open;
                         // walk the parked keys instead.
                         for (pl, seq) in parked.keys() {
-                            if pl == log && r.contains(*seq) {
-                                out.push(NodeEffect::Deliver(*log, *seq));
+                            if *pl == log && r.contains(*seq) {
+                                out.push(NodeEffect::Deliver(log, *seq));
                             }
                         }
                     }

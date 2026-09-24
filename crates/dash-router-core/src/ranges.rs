@@ -16,6 +16,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::log::Log;
+
 /// Sequence number within a log.
 pub type Seq = u32;
 
@@ -195,27 +197,37 @@ impl Ranges {
     }
 }
 
-/// Ranges across several logs. A log absent from the map is *unknown*; a log
-/// present with an empty [`Ranges`] value is *known but empty* — a marker
-/// meaning "this log exists and nothing is held/wanted/relayed for it,"
-/// distinct from not knowing about the log at all (e.g. a freshly-created
-/// log with no data yet still wants everything). Key presence therefore
-/// carries meaning independent of the value's emptiness: construction
-/// ([`Self::from_pairs`], [`Self::insert`]) and [`Self::union`] preserve
-/// marker keys, while the derived, wire-bound results of
-/// [`Self::intersection`] and [`Self::difference`] drop empty entries, since
-/// those represent "nothing to say about this log" rather than a knowledge
-/// marker.
+/// Ranges across several logs, nested by channel then author. A log absent
+/// from the map is *unknown*; a log present with an empty [`Ranges`] value
+/// is *known but empty* — a marker meaning "this log exists and nothing is
+/// held/wanted/relayed for it," distinct from not knowing about the log at
+/// all (e.g. a freshly-created log with no data yet still wants
+/// everything). Key presence therefore carries meaning independent of the
+/// value's emptiness: construction ([`Self::from_pairs`], [`Self::insert`])
+/// and [`Self::union`] preserve marker keys, while the derived, wire-bound
+/// results of [`Self::intersection`] and [`Self::difference`] drop empty
+/// entries, since those represent "nothing to say about this log" rather
+/// than a knowledge marker.
+///
+/// The nesting stores and sends each channel once for all its authors.
+/// Invariant: no channel entry has an empty author map ([`Self::remove`]
+/// prunes). p2panda nests the other way round (author outer) because sync
+/// walks per peer; the router nests channel outer because subscriptions
+/// and the relay store are keyed by channel.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct LogRanges<L: Ord>(BTreeMap<L, Ranges>);
+#[serde(bound(
+    serialize = "L::Channel: Serialize, L::Author: Serialize",
+    deserialize = "L::Channel: Deserialize<'de>, L::Author: Deserialize<'de>"
+))]
+pub struct LogRanges<L: Log>(BTreeMap<L::Channel, BTreeMap<L::Author, Ranges>>);
 
-impl<L: Ord> Default for LogRanges<L> {
+impl<L: Log> Default for LogRanges<L> {
     fn default() -> Self {
         Self(BTreeMap::new())
     }
 }
 
-impl<L: Ord + Clone> LogRanges<L> {
+impl<L: Log> LogRanges<L> {
     pub fn empty() -> Self {
         Self::default()
     }
@@ -223,15 +235,43 @@ impl<L: Ord + Clone> LogRanges<L> {
     /// Build from pairs. A pair with an empty `Ranges` is kept as a
     /// known-but-empty marker, not dropped.
     pub fn from_pairs(iter: impl IntoIterator<Item = (L, Ranges)>) -> Self {
-        Self(iter.into_iter().collect())
+        let mut out = Self::empty();
+        for (log, r) in iter {
+            out.insert(log, r);
+        }
+        out
     }
 
     pub fn get(&self, log: &L) -> Option<&Ranges> {
-        self.0.get(log)
+        self.0.get(&log.channel())?.get(&log.author())
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&L, &Ranges)> {
-        self.0.iter()
+    /// Every log, channel-major then author order, with its id rebuilt
+    /// through [`Log::new`].
+    pub fn iter(&self) -> impl Iterator<Item = (L, &Ranges)> {
+        self.0.iter().flat_map(|(c, authors)| {
+            let c = *c;
+            authors.iter().map(move |(a, r)| (L::new(c, *a), r))
+        })
+    }
+
+    /// Number of logs (markers included).
+    pub fn len(&self) -> usize {
+        self.0.values().map(BTreeMap::len).sum()
+    }
+
+    /// Every log under one channel; nothing if the channel is unknown.
+    pub fn channel(&self, c: &L::Channel) -> impl Iterator<Item = (L, &Ranges)> {
+        let c = *c;
+        self.0
+            .get(&c)
+            .into_iter()
+            .flat_map(move |authors| authors.iter().map(move |(a, r)| (L::new(c, *a), r)))
+    }
+
+    /// Every channel with at least one log.
+    pub fn channels(&self) -> impl Iterator<Item = &L::Channel> {
+        self.0.keys()
     }
 
     /// True when every known log maps to an empty range (vacuously true
@@ -239,23 +279,36 @@ impl<L: Ord + Clone> LogRanges<L> {
     /// known-but-empty markers is still "empty" in this sense: there is
     /// nothing to fetch, send or accept, even though logs are known.
     pub fn is_empty(&self) -> bool {
-        self.0.values().all(|r| r.is_empty())
+        self.0
+            .values()
+            .flat_map(BTreeMap::values)
+            .all(Ranges::is_empty)
     }
 
     pub fn contains(&self, log: &L, seq: Seq) -> bool {
-        self.0.get(log).is_some_and(|r| r.contains(seq))
+        self.get(log).is_some_and(|r| r.contains(seq))
     }
 
     /// Set `log`'s ranges, including an empty one: presence of the key is
     /// itself meaningful (see the type doc), so an empty `ranges` is kept
     /// as a known-but-empty marker rather than removing the key.
     pub fn insert(&mut self, log: L, ranges: Ranges) {
-        self.0.insert(log, ranges);
+        self.0
+            .entry(log.channel())
+            .or_default()
+            .insert(log.author(), ranges);
     }
 
-    /// Forget a log entirely (its "known" marker included).
+    /// Forget a log entirely (its "known" marker included). A channel
+    /// whose last log is removed is forgotten too.
     pub fn remove(&mut self, log: &L) -> Option<Ranges> {
-        self.0.remove(log)
+        let c = log.channel();
+        let authors = self.0.get_mut(&c)?;
+        let removed = authors.remove(&log.author());
+        if authors.is_empty() {
+            self.0.remove(&c);
+        }
+        removed
     }
 
     /// Keeps every key present in either operand, even where the merged
@@ -263,12 +316,15 @@ impl<L: Ord + Clone> LogRanges<L> {
     /// (e.g. `held.union(&novel)` never loses a log's "known" status).
     pub fn union(&self, other: &Self) -> Self {
         let mut out = self.clone();
-        for (log, r) in &other.0 {
-            let merged = match out.0.get(log) {
-                Some(mine) => mine.union(r),
-                None => r.clone(),
-            };
-            out.insert(log.clone(), merged);
+        for (c, theirs) in &other.0 {
+            let mine = out.0.entry(*c).or_default();
+            for (a, r) in theirs {
+                let merged = match mine.get(a) {
+                    Some(m) => m.union(r),
+                    None => r.clone(),
+                };
+                mine.insert(*a, merged);
+            }
         }
         out
     }
@@ -277,32 +333,41 @@ impl<L: Ord + Clone> LogRanges<L> {
     /// dropped: this produces wire-bound content (what to send/accept),
     /// where "nothing in common" must not be represented as a key.
     pub fn intersection(&self, other: &Self) -> Self {
-        Self(
-            self.0
-                .iter()
-                .filter_map(|(log, r)| other.0.get(log).map(|o| (log.clone(), r.intersection(o))))
-                .filter(|(_, r)| !r.is_empty())
-                .collect(),
-        )
+        let mut out = Self::empty();
+        for (c, mine) in &self.0 {
+            let Some(theirs) = other.0.get(c) else {
+                continue;
+            };
+            for (a, r) in mine {
+                if let Some(o) = theirs.get(a) {
+                    let x = r.intersection(o);
+                    if !x.is_empty() {
+                        out.0.entry(*c).or_default().insert(*a, x);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Everything in `self` not in `other`, with each empty result dropped
     /// (see [`Self::intersection`] on why: this is derived, wire-bound
     /// content, not a knowledge marker).
     pub fn difference(&self, other: &Self) -> Self {
-        Self(
-            self.0
-                .iter()
-                .map(|(log, r)| {
-                    let d = match other.0.get(log) {
-                        Some(o) => r.difference(o),
-                        None => r.clone(),
-                    };
-                    (log.clone(), d)
-                })
-                .filter(|(_, r)| !r.is_empty())
-                .collect(),
-        )
+        let mut out = Self::empty();
+        for (c, mine) in &self.0 {
+            let theirs = other.0.get(c);
+            for (a, r) in mine {
+                let d = match theirs.and_then(|t| t.get(a)) {
+                    Some(o) => r.difference(o),
+                    None => r.clone(),
+                };
+                if !d.is_empty() {
+                    out.0.entry(*c).or_default().insert(*a, d);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -465,6 +530,210 @@ mod tests {
             let ranges = Ranges::from_seqs(seqs.iter().copied());
             prop_assert_eq!(ranges.iter().collect::<Vec<_>>(), seqs.into_iter().collect::<Vec<_>>());
             prop_assert!(!ranges.is_open());
+        }
+    }
+
+    // --- Nested LogRanges ----------------------------------------------------
+
+    use crate::log::{Log, Pair};
+
+    fn lr(pairs: &[(Pair, &[Seq])]) -> LogRanges<Pair> {
+        LogRanges::from_pairs(pairs.iter().map(|(l, b)| (*l, r(b))))
+    }
+
+    #[test]
+    fn channel_groups_every_author_under_it() {
+        let m = lr(&[
+            (Pair::new(1, 1), &[0, 3]),
+            (Pair::new(1, 2), &[5]),
+            (Pair::new(2, 1), &[0, 1]),
+        ]);
+        let under_1: Vec<(Pair, Ranges)> = m.channel(&1).map(|(l, r)| (l, r.clone())).collect();
+        assert_eq!(
+            under_1,
+            vec![(Pair::new(1, 1), r(&[0, 3])), (Pair::new(1, 2), r(&[5]))]
+        );
+        assert_eq!(m.channels().copied().collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(m.len(), 3);
+    }
+
+    #[test]
+    fn channel_of_unknown_channel_is_empty() {
+        let m = lr(&[(Pair::new(1, 1), &[0, 3])]);
+        assert_eq!(m.channel(&9).count(), 0);
+    }
+
+    #[test]
+    fn channel_matches_filtered_iter() {
+        let m = lr(&[
+            (Pair::new(1, 1), &[0, 3]),
+            (Pair::new(1, 2), &[]),
+            (Pair::new(3, 0), &[7]),
+        ]);
+        for c in [0u8, 1, 2, 3] {
+            let via_channel: Vec<Pair> = m.channel(&c).map(|(l, _)| l).collect();
+            let via_iter: Vec<Pair> = m
+                .iter()
+                .filter(|(l, _)| l.channel() == c)
+                .map(|(l, _)| l)
+                .collect();
+            assert_eq!(via_channel, via_iter, "channel {c}");
+        }
+    }
+
+    #[test]
+    fn remove_prunes_an_emptied_channel() {
+        let mut m = lr(&[(Pair::new(1, 1), &[0, 3]), (Pair::new(1, 2), &[5])]);
+        assert_eq!(m.remove(&Pair::new(1, 1)), Some(r(&[0, 3])));
+        assert_eq!(m.channels().count(), 1, "channel 1 still has author 2");
+        assert_eq!(m.remove(&Pair::new(1, 2)), Some(r(&[5])));
+        assert_eq!(
+            m.channels().count(),
+            0,
+            "channel 1 is gone with its last author"
+        );
+        assert_eq!(m.channel(&1).count(), 0);
+        assert_eq!(m.remove(&Pair::new(1, 2)), None);
+        assert_eq!(m, LogRanges::empty());
+    }
+
+    #[test]
+    fn marker_under_a_populated_channel() {
+        // author 2 is a known-but-empty marker next to a real sibling.
+        let a = lr(&[(Pair::new(1, 1), &[0, 3]), (Pair::new(1, 2), &[])]);
+        let b = lr(&[(Pair::new(1, 1), &[3, 5])]);
+        let u = a.union(&b);
+        assert_eq!(
+            u.get(&Pair::new(1, 2)),
+            Some(&Ranges::empty()),
+            "marker survives union"
+        );
+        assert_eq!(u.get(&Pair::new(1, 1)), Some(&r(&[0, 5])));
+        assert!(a.intersection(&b).get(&Pair::new(1, 2)).is_none());
+        assert!(a.difference(&b).get(&Pair::new(1, 2)).is_none());
+        assert_eq!(a.difference(&b).get(&Pair::new(1, 1)), Some(&r(&[0, 3])));
+    }
+
+    #[test]
+    fn iter_rebuilds_full_ids_in_channel_then_author_order() {
+        let m = lr(&[
+            (Pair::new(2, 0), &[1]),
+            (Pair::new(1, 9), &[1]),
+            (Pair::new(1, 3), &[1]),
+        ]);
+        let ids: Vec<Pair> = m.iter().map(|(l, _)| l).collect();
+        assert_eq!(ids, vec![Pair::new(1, 3), Pair::new(1, 9), Pair::new(2, 0)]);
+    }
+
+    #[test]
+    fn nested_serde_roundtrips_and_is_shorter_than_flat() {
+        let m = lr(&[
+            (Pair::new(1, 1), &[0, 3]),
+            (Pair::new(1, 2), &[5]),
+            (Pair::new(1, 3), &[0, 1]),
+        ]);
+        let bytes = postcard::to_stdvec(&m).unwrap();
+        let back: LogRanges<Pair> = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, m);
+        let flat: BTreeMap<Pair, Ranges> = m.iter().map(|(l, r)| (l, r.clone())).collect();
+        let flat_bytes = postcard::to_stdvec(&flat).unwrap();
+        assert!(
+            bytes.len() < flat_bytes.len(),
+            "{} vs {}",
+            bytes.len(),
+            flat_bytes.len()
+        );
+        let u: LogRanges<u8> = LogRanges::from_pairs([(4u8, r(&[0, 2]))]);
+        let ub = postcard::to_stdvec(&u).unwrap();
+        assert_eq!(postcard::from_bytes::<LogRanges<u8>>(&ub).unwrap(), u);
+    }
+
+    // --- Nested set ops against a flat oracle -----------------------------
+
+    fn arb_pair() -> impl Strategy<Value = Pair> {
+        (0u8..3, 0u8..3).prop_map(|(c, a)| Pair::new(c, a))
+    }
+
+    fn arb_log_ranges() -> impl Strategy<Value = LogRanges<Pair>> {
+        proptest::collection::btree_map(arb_pair(), arb_ranges(), 0..6)
+            .prop_map(LogRanges::from_pairs)
+    }
+
+    fn flat(m: &LogRanges<Pair>) -> BTreeMap<Pair, Ranges> {
+        m.iter().map(|(l, r)| (l, r.clone())).collect()
+    }
+
+    /// The per-log rules from the type doc, applied to flat maps.
+    fn flat_union(
+        a: &BTreeMap<Pair, Ranges>,
+        b: &BTreeMap<Pair, Ranges>,
+    ) -> BTreeMap<Pair, Ranges> {
+        let mut out = a.clone();
+        for (l, r) in b {
+            let merged = out.get(l).map(|m| m.union(r)).unwrap_or_else(|| r.clone());
+            out.insert(*l, merged);
+        }
+        out
+    }
+
+    fn flat_intersection(
+        a: &BTreeMap<Pair, Ranges>,
+        b: &BTreeMap<Pair, Ranges>,
+    ) -> BTreeMap<Pair, Ranges> {
+        a.iter()
+            .filter_map(|(l, r)| b.get(l).map(|o| (*l, r.intersection(o))))
+            .filter(|(_, r)| !r.is_empty())
+            .collect()
+    }
+
+    fn flat_difference(
+        a: &BTreeMap<Pair, Ranges>,
+        b: &BTreeMap<Pair, Ranges>,
+    ) -> BTreeMap<Pair, Ranges> {
+        a.iter()
+            .map(|(l, r)| {
+                (
+                    *l,
+                    b.get(l)
+                        .map(|o| r.difference(o))
+                        .unwrap_or_else(|| r.clone()),
+                )
+            })
+            .filter(|(_, r)| !r.is_empty())
+            .collect()
+    }
+
+    proptest! {
+        #[test]
+        fn nested_union_matches_flat_oracle(a in arb_log_ranges(), b in arb_log_ranges()) {
+            prop_assert_eq!(flat(&a.union(&b)), flat_union(&flat(&a), &flat(&b)));
+        }
+
+        #[test]
+        fn nested_intersection_matches_flat_oracle(a in arb_log_ranges(), b in arb_log_ranges()) {
+            prop_assert_eq!(flat(&a.intersection(&b)), flat_intersection(&flat(&a), &flat(&b)));
+        }
+
+        #[test]
+        fn nested_difference_matches_flat_oracle(a in arb_log_ranges(), b in arb_log_ranges()) {
+            prop_assert_eq!(flat(&a.difference(&b)), flat_difference(&flat(&a), &flat(&b)));
+        }
+
+        #[test]
+        fn no_channel_is_ever_left_empty(a in arb_log_ranges(), b in arb_log_ranges(), victim in arb_pair()) {
+            let mut m = a.union(&b);
+            m.remove(&victim);
+            for out in [m.clone(), a.intersection(&b), a.difference(&b)] {
+                for c in out.channels() {
+                    prop_assert!(out.channel(c).count() > 0, "channel {} has no authors", c);
+                }
+            }
+        }
+
+        #[test]
+        fn from_pairs_then_iter_roundtrips(a in arb_log_ranges()) {
+            let again = LogRanges::from_pairs(a.iter().map(|(l, r)| (l, r.clone())));
+            prop_assert_eq!(again, a);
         }
     }
 }

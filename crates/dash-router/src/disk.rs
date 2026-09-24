@@ -20,7 +20,7 @@ use std::{
 };
 
 use anyhow::Result;
-use dash_router_core::{EvictableStorage, LogRanges, Op, Ranges, Seq, Storage, Units};
+use dash_router_core::{EvictableStorage, Log, LogRanges, Op, Ranges, Seq, Storage, Units};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ops");
@@ -125,7 +125,7 @@ fn log_bounds<L: LogKey>(log: &L) -> (Vec<u8>, Vec<u8>) {
 /// Replace `log`'s entry in `map` with `ranges`, dropping the key entirely
 /// when `ranges` is empty (mirroring `OpsMap::held_all`/`held_payloads`,
 /// which omit logs with nothing held rather than keep an empty marker).
-fn set_log_entry<L: LogKey>(map: &mut LogRanges<L>, log: &L, ranges: Ranges) {
+fn set_log_entry<L: LogKey + Log>(map: &mut LogRanges<L>, log: &L, ranges: Ranges) {
     if ranges.is_empty() {
         map.remove(log);
     } else {
@@ -155,7 +155,7 @@ fn set_log_entry<L: LogKey>(map: &mut LogRanges<L>, log: &L, ranges: Ranges) {
 /// `Self::rebuild_log` after a *committed* evict drops that log from the
 /// cache entirely (see `Self::drop_log_from_cache`) rather than leaving
 /// the pre-eviction entries in place.
-pub struct DiskRelayStore<L: LogKey> {
+pub struct DiskRelayStore<L: LogKey + Log> {
     db: Database,
     /// Maintained incrementally (single writer: this store); rebuilt by a
     /// full scan in [`Self::open`]. A redb error during an update leaves
@@ -170,7 +170,7 @@ pub struct DiskRelayStore<L: LogKey> {
     io_errors: AtomicU64,
 }
 
-impl<L: LogKey> DiskRelayStore<L> {
+impl<L: LogKey + Log> DiskRelayStore<L> {
     pub fn open(path: &Path) -> Result<Self> {
         let db = Database::create(path)?;
         {
@@ -321,7 +321,7 @@ impl<L: LogKey> DiskRelayStore<L> {
 // untouched) on any failure, and `fetch` returns whatever was readable
 // before the failure. `open`'s `Result` is still the fallible surface for
 // construction. Every swallowed error bumps `io_errors`.
-impl<L: LogKey> Storage<L> for DiskRelayStore<L> {
+impl<L: LogKey + Log> Storage<L> for DiskRelayStore<L> {
     fn held_of(&self, logs: &BTreeSet<L>) -> LogRanges<L> {
         LogRanges::from_pairs(logs.iter().map(|log| {
             (
@@ -355,7 +355,7 @@ impl<L: LogKey> Storage<L> for DiskRelayStore<L> {
             if r.is_empty() {
                 continue;
             }
-            let (lo, hi) = log_bounds(log);
+            let (lo, hi) = log_bounds(&log);
             let rows = match table.range(lo.as_slice()..=hi.as_slice()) {
                 Ok(rows) => rows,
                 Err(_) => {
@@ -454,7 +454,7 @@ impl<L: LogKey> Storage<L> for DiskRelayStore<L> {
     }
 }
 
-impl<L: LogKey> EvictableStorage<L> for DiskRelayStore<L> {
+impl<L: LogKey + Log> EvictableStorage<L> for DiskRelayStore<L> {
     /// Derived, not maintained (fix round 3, finding 2): 1 unit per held op
     /// plus 1 more per payload-bearing op — exactly `OpsMap::usage`'s
     /// arithmetic — summed fresh from `held`/`payloads` every call. An
@@ -511,7 +511,7 @@ impl<L: LogKey> EvictableStorage<L> for DiskRelayStore<L> {
             if r.is_empty() {
                 continue;
             }
-            let (lo, hi) = log_bounds(log);
+            let (lo, hi) = log_bounds(&log);
             // As in `ingest`: every fallible call is inside this closure,
             // and `self.usage`/the cache are only touched on full success.
             // A malformed key (see `row_seq`) is skipped-and-counted rather
@@ -573,9 +573,9 @@ impl<L: LogKey> EvictableStorage<L> for DiskRelayStore<L> {
                     // way `usage()` self-corrects by construction, since it
                     // is derived from `held`/`payloads`, not tracked
                     // independently.
-                    if self.rebuild_log(log).is_err() {
+                    if self.rebuild_log(&log).is_err() {
                         self.note_io_error();
-                        self.drop_log_from_cache(log);
+                        self.drop_log_from_cache(&log);
                     }
                 }
                 Err(_) => self.note_io_error(),
@@ -588,7 +588,7 @@ impl<L: LogKey> EvictableStorage<L> for DiskRelayStore<L> {
             if r.is_empty() {
                 continue;
             }
-            let (lo, hi) = log_bounds(log);
+            let (lo, hi) = log_bounds(&log);
             let outcome: anyhow::Result<(Units, u64)> = (|| {
                 let write_txn = self.db.begin_write()?;
                 let mut units_removed: Units = 0;
@@ -622,9 +622,9 @@ impl<L: LogKey> EvictableStorage<L> for DiskRelayStore<L> {
                     for _ in 0..malformed {
                         self.note_io_error();
                     }
-                    if self.rebuild_log(log).is_err() {
+                    if self.rebuild_log(&log).is_err() {
                         self.note_io_error();
-                        self.drop_log_from_cache(log);
+                        self.drop_log_from_cache(&log);
                     }
                 }
                 Err(_) => self.note_io_error(),

@@ -181,7 +181,7 @@ where
             sent = self.sent_msgs,
             peers = self.peers_heard.len(),
             subscriptions = self.subscriptions.len(),
-            held_logs = self.held_cache.iter().count(),
+            held_logs = self.held_cache.len(),
             wanters = self.router.wants.len(),
             dropped_total = self.dropped_msgs,
             relay_errors_total = self.relay_errors,
@@ -335,7 +335,7 @@ where
                 tracing::trace!(
                     from = %msg.sender,
                     %origin,
-                    logs = ranges.iter().count(),
+                    logs = ranges.len(),
                     channels = channels.len(),
                     "dash-router received want"
                 );
@@ -434,7 +434,7 @@ where
             Ok(all) => LogRanges::from_pairs(
                 all.iter()
                     .filter(|(log, _)| log.channel() == channel)
-                    .map(|(log, _)| (*log, Ranges::full())),
+                    .map(|(log, _)| (log, Ranges::full())),
             ),
             Err(e) => {
                 self.relay_error("on_subscribe: relay.held_all", e);
@@ -481,8 +481,8 @@ where
         }
         self.router
             .step(RouterAction::Open(self.subscriptions.clone()))?;
-        tracing::debug!(%channel, relay_logs_migrated = under.iter().count(), "dash-router subscribed");
-        let touched: BTreeSet<L> = under.iter().map(|(l, _)| *l).collect();
+        tracing::debug!(%channel, relay_logs_migrated = under.len(), "dash-router subscribed");
+        let touched: BTreeSet<L> = under.iter().map(|(l, _)| l).collect();
         self.reconcile_held(Some(&touched), &mut out).await?;
         Ok(out)
     }
@@ -568,7 +568,7 @@ where
                     if let Err(e) = self.relay.evict(&full).await {
                         self.relay_error("on_maintain: relay.evict", e);
                     } else {
-                        let touched: BTreeSet<L> = full.iter().map(|(l, _)| *l).collect();
+                        let touched: BTreeSet<L> = full.iter().map(|(l, _)| l).collect();
                         self.reconcile_held(Some(&touched), &mut out).await?;
                     }
                 }
@@ -602,7 +602,7 @@ where
             match e {
                 Effect::Accept(novel) => {
                     for (log, r) in novel.iter() {
-                        if !self.is_subscribed(log) {
+                        if !self.is_subscribed(&log) {
                             continue;
                         }
                         // Never iterate `Ranges` directly — it may be open;
@@ -611,8 +611,8 @@ where
                             // Finding 1: a key whose ext.ingest failed did
                             // NOT land in ext, so it must not be reported as
                             // Delivered — Delivered must not lie.
-                            if pl == log && r.contains(*seq) && !failed.contains(&(*pl, *seq)) {
-                                out.push(Out::Event(RouterEvent::Delivered(*log, *seq)));
+                            if *pl == log && r.contains(*seq) && !failed.contains(&(*pl, *seq)) {
+                                out.push(Out::Event(RouterEvent::Delivered(log, *seq)));
                             }
                         }
                     }
@@ -624,7 +624,7 @@ where
                 } => {
                     tracing::trace!(
                         %origin,
-                        logs = ranges.iter().count(),
+                        logs = ranges.len(),
                         channels = channels.len(),
                         "dash-router sending want"
                     );
@@ -1696,7 +1696,7 @@ mod tests {
     /// and the sync `Storage` impl would fight the blanket sync→async bridge
     /// in `storage.rs` for coherence (E0119), so this must NOT implement
     /// `Storage`.
-    struct FailingExt<L: Ord> {
+    struct FailingExt<L: Log> {
         inner: OpsMap<L>,
         fail: BTreeSet<(L, Seq)>,
     }
@@ -1730,7 +1730,7 @@ mod tests {
     /// A test-local relay whose `fetch` fails while `fail_fetch` is set;
     /// everything else delegates to an `OpsMap`. Async-only for the same
     /// coherence reason as [`FailingExt`].
-    struct FailingRelay<L: Ord> {
+    struct FailingRelay<L: Log> {
         inner: OpsMap<L>,
         fail_fetch: bool,
     }

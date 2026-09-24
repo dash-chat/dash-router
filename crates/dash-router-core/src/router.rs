@@ -152,7 +152,7 @@ impl<N: Id, L: Log, T: TimeInterval> RouterState<N, L, T> {
     /// Everything not held, for every known log: the gaps plus the open
     /// tail. A known-but-empty log (empty range in `held`) wants everything.
     pub fn wanted(&self) -> LogRanges<L> {
-        LogRanges::from_pairs(self.held.iter().map(|(log, r)| (*log, r.complement())))
+        LogRanges::from_pairs(self.held.iter().map(|(log, r)| (log, r.complement())))
     }
 
     /// Held logs with data whose channel is in `channels` and that `named`
@@ -162,9 +162,9 @@ impl<N: Id, L: Log, T: TimeInterval> RouterState<N, L, T> {
             self.held
                 .iter()
                 .filter(|(log, r)| {
-                    !r.is_empty() && channels.contains(&log.channel()) && named.get(log).is_none()
+                    !r.is_empty() && channels.contains(&log.channel()) && named.get(&log).is_none()
                 })
-                .map(|(log, r)| (*log, r.clone())),
+                .map(|(log, r)| (log, r.clone())),
         )
     }
 
@@ -218,7 +218,7 @@ impl<N: Id, L: Log, T: TimeInterval> RouterState<N, L, T> {
             wanted
                 .iter()
                 .filter(|(log, _)| self.open.contains(&log.channel()))
-                .map(|(log, r)| (*log, r.clone())),
+                .map(|(log, r)| (log, r.clone())),
         );
         (suppressed.union(&named_under_open), self.open.clone())
     }

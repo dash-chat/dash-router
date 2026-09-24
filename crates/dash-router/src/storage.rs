@@ -5,14 +5,14 @@
 use std::collections::BTreeSet;
 
 use anyhow::Result;
-use dash_router_core::{EvictableStorage, LogRanges, Op, Seq, Storage, Units};
+use dash_router_core::{EvictableStorage, Log, LogRanges, Op, Seq, Storage, Units};
 use tokio::sync::broadcast;
 
 // trait_variant desugars each `async fn` to `-> impl Future + Send`, so
 // Task 10's `tokio::spawn` can prove the node task's future is Send while
 // impls still get written with plain `async fn` syntax.
 #[trait_variant::make(Send)]
-pub trait AsyncStorage<L: Ord> {
+pub trait AsyncStorage<L: Log> {
     /// Ranges held for exactly the requested logs; a requested-but-unknown
     /// log appears with an empty range, mirroring the request.
     async fn held_of(&self, logs: &BTreeSet<L>) -> Result<LogRanges<L>>;
@@ -22,7 +22,7 @@ pub trait AsyncStorage<L: Ord> {
 }
 
 #[trait_variant::make(Send)]
-pub trait AsyncEvictableStorage<L: Ord>: AsyncStorage<L> {
+pub trait AsyncEvictableStorage<L: Log>: AsyncStorage<L> {
     async fn usage(&self) -> Result<Units>;
     /// The unit delta `ingest` would add: the shed-at-cap check must use
     /// the same arithmetic as the store (`OpsMap::ingest_delta`).
@@ -48,14 +48,14 @@ pub trait AsyncEvictableStorage<L: Ord>: AsyncStorage<L> {
 }
 
 /// Lossy change hints from a store with writers of its own (spec §2).
-pub trait WatchableStorage<L: Ord>: AsyncStorage<L> {
+pub trait WatchableStorage<L: Log>: AsyncStorage<L> {
     /// Logs whose held ranges may have changed; the empty set means
     /// "anything" (re-read `held_all`). Lossy by design — a missed hint
     /// is repaired by the next Want/Have cycle.
     fn changed(&self) -> broadcast::Receiver<BTreeSet<L>>;
 }
 
-impl<L: Ord + Clone + Send + Sync, S: Storage<L> + Send + Sync> AsyncStorage<L> for S {
+impl<L: Log, S: Storage<L> + Send + Sync> AsyncStorage<L> for S {
     async fn held_of(&self, logs: &BTreeSet<L>) -> Result<LogRanges<L>> {
         Ok(Storage::held_of(self, logs))
     }
@@ -71,9 +71,7 @@ impl<L: Ord + Clone + Send + Sync, S: Storage<L> + Send + Sync> AsyncStorage<L> 
     }
 }
 
-impl<L: Ord + Clone + Send + Sync, S: EvictableStorage<L> + Send + Sync> AsyncEvictableStorage<L>
-    for S
-{
+impl<L: Log, S: EvictableStorage<L> + Send + Sync> AsyncEvictableStorage<L> for S {
     async fn usage(&self) -> Result<Units> {
         Ok(EvictableStorage::usage(self))
     }

@@ -117,13 +117,13 @@ where
         }
     }
     for (log, r) in ranges.iter() {
-        cur_ranges.insert(*log, r.clone());
+        cur_ranges.insert(log, r.clone());
         if len(&cur_ranges, &cur_channels) > budget {
-            cur_ranges.remove(log);
+            cur_ranges.remove(&log);
             flush(&mut msgs, &mut cur_ranges, &mut cur_channels);
-            cur_ranges.insert(*log, r.clone());
+            cur_ranges.insert(log, r.clone());
             if len(&cur_ranges, &cur_channels) > budget {
-                cur_ranges.remove(log);
+                cur_ranges.remove(&log);
                 dropped += 1;
             }
         }

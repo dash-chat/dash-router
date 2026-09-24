@@ -14,7 +14,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use dash_router_core::{LogRanges, Op, OpsMap, Seq, Storage};
+use dash_router_core::{Log, LogRanges, Op, OpsMap, Seq, Storage};
 use tokio::sync::broadcast;
 
 use crate::storage::WatchableStorage;
@@ -23,12 +23,12 @@ use crate::storage::WatchableStorage;
 /// a store the shell owns. The mutex is held only for synchronous map
 /// operations — never across an await.
 #[derive(Clone, Debug)]
-pub struct MemStore<L: Ord> {
+pub struct MemStore<L: Log> {
     inner: Arc<Mutex<OpsMap<L>>>,
     tx: broadcast::Sender<BTreeSet<L>>,
 }
 
-impl<L: Ord + Clone + Default> MemStore<L> {
+impl<L: Log + Default> MemStore<L> {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(OpsMap::default())),
@@ -37,7 +37,7 @@ impl<L: Ord + Clone + Default> MemStore<L> {
     }
 }
 
-impl<L: Ord + Clone> MemStore<L> {
+impl<L: Log> MemStore<L> {
     pub fn snapshot(&self) -> OpsMap<L> {
         self.inner.lock().expect("mem store poisoned").clone()
     }
@@ -55,13 +55,13 @@ impl<L: Ord + Clone> MemStore<L> {
     }
 }
 
-impl<L: Ord + Clone + Default> Default for MemStore<L> {
+impl<L: Log + Default> Default for MemStore<L> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<L: Ord + Clone> Storage<L> for MemStore<L> {
+impl<L: Log> Storage<L> for MemStore<L> {
     fn held_of(&self, logs: &BTreeSet<L>) -> LogRanges<L> {
         Storage::held_of(&*self.inner.lock().expect("mem store poisoned"), logs)
     }
@@ -82,7 +82,7 @@ impl<L: Ord + Clone> Storage<L> for MemStore<L> {
     }
 }
 
-impl<L: Ord + Clone + Send + Sync> WatchableStorage<L> for MemStore<L> {
+impl<L: Log> WatchableStorage<L> for MemStore<L> {
     fn changed(&self) -> broadcast::Receiver<BTreeSet<L>> {
         self.tx.subscribe()
     }

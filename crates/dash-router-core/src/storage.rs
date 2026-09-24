@@ -15,13 +15,13 @@ use std::{
 use anyhow::ensure;
 use polestar::prelude::*;
 
-use crate::{LogRanges, Op, Ranges, Seq};
+use crate::{Log, LogRanges, Op, Ranges, Seq};
 
 /// Abstract unit of storage usage: 2 per op with a payload, 1 per header-only op.
 pub type Units = u64;
 
 /// A synchronous store of ops, keyed by log and sequence number.
-pub trait Storage<L: Ord> {
+pub trait Storage<L: Log> {
     /// Ranges held for exactly the requested logs; a requested-but-unknown
     /// log appears with an empty range, mirroring the request.
     fn held_of(&self, logs: &BTreeSet<L>) -> LogRanges<L>;
@@ -35,7 +35,7 @@ pub trait Storage<L: Ord> {
 }
 
 /// A [`Storage`] that can also report and shed its resource usage.
-pub trait EvictableStorage<L: Ord>: Storage<L> {
+pub trait EvictableStorage<L: Log>: Storage<L> {
     fn usage(&self) -> Units;
     /// Ranges of ops still held that also have a payload.
     fn held_payloads(&self) -> LogRanges<L>;
@@ -64,9 +64,9 @@ pub trait EvictableStorage<L: Ord>: Storage<L> {
 /// A simple in-memory reference [`Storage`]/[`EvictableStorage`]: a
 /// `BTreeMap` of logs, each a `BTreeMap` of sequence number to op.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct OpsMap<L: Ord>(BTreeMap<L, BTreeMap<Seq, Op>>);
+pub struct OpsMap<L: Log>(BTreeMap<L, BTreeMap<Seq, Op>>);
 
-impl<L: Ord + Clone> Storage<L> for OpsMap<L> {
+impl<L: Log> Storage<L> for OpsMap<L> {
     fn held_of(&self, logs: &BTreeSet<L>) -> LogRanges<L> {
         LogRanges::from_pairs(logs.iter().map(|log| {
             let ranges = self
@@ -91,12 +91,12 @@ impl<L: Ord + Clone> Storage<L> for OpsMap<L> {
     fn fetch(&self, ranges: &LogRanges<L>) -> Vec<(L, Seq, Op)> {
         let mut out = vec![];
         for (log, r) in ranges.iter() {
-            let Some(ops) = self.0.get(log) else {
+            let Some(ops) = self.0.get(&log) else {
                 continue;
             };
             for (&seq, op) in ops {
                 if r.contains(seq) {
-                    out.push((log.clone(), seq, op.clone()));
+                    out.push((log, seq, op.clone()));
                 }
             }
         }
@@ -117,7 +117,7 @@ impl<L: Ord + Clone> Storage<L> for OpsMap<L> {
     }
 }
 
-impl<L: Ord> OpsMap<L> {
+impl<L: Log> OpsMap<L> {
     /// The unit delta that `ingest(log, seq, op)` would add: 0 for a
     /// duplicate (op already held at least as good), 1 for a payload
     /// upgrade over a held header-only op, 2/1 for a genuinely new
@@ -139,7 +139,7 @@ impl<L: Ord> OpsMap<L> {
     }
 }
 
-impl<L: Ord + Clone> EvictableStorage<L> for OpsMap<L> {
+impl<L: Log> EvictableStorage<L> for OpsMap<L> {
     fn usage(&self) -> Units {
         self.0
             .values()
@@ -165,7 +165,7 @@ impl<L: Ord + Clone> EvictableStorage<L> for OpsMap<L> {
 
     fn evict_payloads(&mut self, ranges: &LogRanges<L>) {
         for (log, r) in ranges.iter() {
-            if let Some(ops) = self.0.get_mut(log) {
+            if let Some(ops) = self.0.get_mut(&log) {
                 for (&seq, op) in ops.iter_mut() {
                     if r.contains(seq) {
                         op.payload = None;
@@ -177,10 +177,10 @@ impl<L: Ord + Clone> EvictableStorage<L> for OpsMap<L> {
 
     fn evict(&mut self, ranges: &LogRanges<L>) {
         for (log, r) in ranges.iter() {
-            if let Some(ops) = self.0.get_mut(log) {
+            if let Some(ops) = self.0.get_mut(&log) {
                 ops.retain(|&seq, _| !r.contains(seq));
                 if ops.is_empty() {
-                    self.0.remove(log);
+                    self.0.remove(&log);
                 }
             }
         }
@@ -193,7 +193,7 @@ impl<L: Ord + Clone> EvictableStorage<L> for OpsMap<L> {
 
 /// Reports snapshots of what a store machine holds.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum StoreEffect<L: Ord> {
+pub enum StoreEffect<L: Log> {
     HeldChanged(LogRanges<L>),
 }
 
@@ -214,16 +214,16 @@ impl<L> RelayStoreMachine<L> {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct RelayStoreState<L: Ord>(pub OpsMap<L>);
+pub struct RelayStoreState<L: Log>(pub OpsMap<L>);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum RelayStoreAction<L: Ord> {
+pub enum RelayStoreAction<L: Log> {
     Ingest(L, Seq, Op),
     EvictPayloads(LogRanges<L>),
     Evict(LogRanges<L>),
 }
 
-impl<L: Id> Machine for RelayStoreMachine<L> {
+impl<L: Log> Machine for RelayStoreMachine<L> {
     type State = RelayStoreState<L>;
     type Action = RelayStoreAction<L>;
     type Fx = Vec<StoreEffect<L>>;
@@ -270,16 +270,16 @@ pub struct ExtStoreMachine<L> {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct ExtStoreState<L: Ord>(pub OpsMap<L>);
+pub struct ExtStoreState<L: Log>(pub OpsMap<L>);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ExtStoreAction<L: Ord> {
+pub enum ExtStoreAction<L: Log> {
     Ingest(L, Seq, Op),
     NativeSync(L, Seq, Op),
     AppGc(LogRanges<L>),
 }
 
-impl<L: Id> Machine for ExtStoreMachine<L> {
+impl<L: Log> Machine for ExtStoreMachine<L> {
     type State = ExtStoreState<L>;
     type Action = ExtStoreAction<L>;
     type Fx = Vec<StoreEffect<L>>;
