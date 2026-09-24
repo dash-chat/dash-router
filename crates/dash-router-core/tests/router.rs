@@ -273,13 +273,19 @@ fn want_timer_follows_the_fetch_timed_idiom() {
 
     disabled(&m, &a, A::FireWant); // nothing armed
     disabled(&m, &a, A::Tick(t(0))); // zero tick is not a transition
+    assert_eq!(a.next_due(), None); // any tick is legal
     a.step(A::ArmWantTimer(t(2))).unwrap();
     disabled(&m, &a, A::ArmWantTimer(t(1))); // already armed
     disabled(&m, &a, A::FireWant); // not due
+    assert!(!a.want_due());
+    assert_eq!(a.next_due(), Some(t(2))); // the tick bound
     disabled(&m, &a, A::Tick(t(3))); // would skip past due
     a.step(A::Tick(t(1))).unwrap();
     disabled(&m, &a, A::FireWant);
+    assert_eq!(a.next_due(), Some(t(1)));
     a.step(A::Tick(t(1))).unwrap();
+    assert!(a.want_due());
+    assert_eq!(a.next_due(), Some(t(0))); // no tick at all
     disabled(&m, &a, A::Tick(t(1))); // due: must fire before time moves on
 
     let fx = a.step(A::FireWant).unwrap();

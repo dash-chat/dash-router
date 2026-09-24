@@ -212,19 +212,11 @@ where
     /// The next instant at which this node has something to do on its own
     /// (a timer fire or a debounced push flush), absolute in shell time.
     pub fn next_deadline(&self) -> Option<Duration> {
-        let mut d: Option<Duration> = None;
-        for t in [&self.router.want_timer, &self.router.have_timer]
-            .into_iter()
-            .flatten()
-        {
-            let due = self.now + *t.remaining;
-            d = Some(d.map_or(due, |x| x.min(due)));
-        }
-        if let Some(oldest) = self.pending_since {
-            let due = self.debounce.deadline(oldest, self.latest_append);
-            d = Some(d.map_or(due, |x| x.min(due)));
-        }
-        d
+        let timer = self.router.next_due().map(|r| self.now + *r);
+        let push = self
+            .pending_since
+            .map(|oldest| self.debounce.deadline(oldest, self.latest_append));
+        timer.into_iter().chain(push).min()
     }
 
     /// The tick/fire engine (binding semantics #1). The conformance driver
@@ -242,12 +234,7 @@ where
                     .await?;
                 continue;
             }
-            if self
-                .router
-                .want_timer
-                .as_ref()
-                .is_some_and(|t| t.remaining.is_zero())
-            {
+            if self.router.want_due() {
                 let fx = self.router.step(RouterAction::FireWant)?;
                 self.route_fx(fx, &BTreeMap::new(), &BTreeSet::new(), &mut out)
                     .await?;
@@ -255,12 +242,7 @@ where
                 self.router.step(RouterAction::ArmWantTimer(next.into()))?;
                 continue;
             }
-            if self
-                .router
-                .have_timer
-                .as_ref()
-                .is_some_and(|t| t.remaining.is_zero())
-            {
+            if self.router.have_due() {
                 let fx = self.router.step(RouterAction::FireHave)?;
                 self.route_fx(fx, &BTreeMap::new(), &BTreeSet::new(), &mut out)
                     .await?;
@@ -277,11 +259,8 @@ where
             // 3. Tick to the nearest of: target, armed timers, push deadline.
             //    (All are strictly ahead of self.now after step 1.)
             let mut step = now - self.now;
-            for t in [&self.router.want_timer, &self.router.have_timer]
-                .into_iter()
-                .flatten()
-            {
-                step = step.min(*t.remaining);
+            if let Some(due) = self.router.next_due() {
+                step = step.min(*due);
             }
             if let Some(oldest) = self.pending_since {
                 step = step.min(self.debounce.deadline(oldest, self.latest_append) - self.now);

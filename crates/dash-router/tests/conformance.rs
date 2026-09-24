@@ -348,13 +348,7 @@ impl<L: TestLog> Driver<L> {
             // 1. Flush: vacuous at zero debounce — the driver always forces
             // the flush within the same Append step (see `apply`), so no
             // pending push ever survives to a later step.
-            if self
-                .ref_state
-                .router
-                .want_timer
-                .as_ref()
-                .is_some_and(|t| t.remaining.is_zero())
-            {
+            if self.ref_state.router.want_due() {
                 let fx = self.ref_step(idx, NodeAction::Router(RouterAction::FireWant))?;
                 out.extend(fx);
                 let next = self.ref_script.next_want();
@@ -365,13 +359,7 @@ impl<L: TestLog> Driver<L> {
                 out.extend(fx2);
                 continue;
             }
-            if self
-                .ref_state
-                .router
-                .have_timer
-                .as_ref()
-                .is_some_and(|t| t.remaining.is_zero())
-            {
+            if self.ref_state.router.have_due() {
                 let fx = self.ref_step(idx, NodeAction::Router(RouterAction::FireHave))?;
                 out.extend(fx);
                 if !self.ref_state.router.wants.is_empty() {
@@ -388,14 +376,8 @@ impl<L: TestLog> Driver<L> {
                 break;
             }
             let mut step = target - now;
-            for t in [
-                &self.ref_state.router.want_timer,
-                &self.ref_state.router.have_timer,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                step = step.min(*t.remaining);
+            if let Some(due) = self.ref_state.router.next_due() {
+                step = step.min(*due);
             }
             let fx = self.ref_step(idx, NodeAction::Router(RouterAction::Tick(step.into())))?;
             debug_assert!(fx.is_empty(), "Tick never produces effects");

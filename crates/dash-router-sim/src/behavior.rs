@@ -205,13 +205,13 @@ impl SimBehavior {
         n: NodeId,
         actions: &mut Vec<SimNetAction>,
     ) -> (Duration, Option<Duration>, Option<Duration>) {
-        let node = state.node(&n);
-        let want_rem = node.router.want_timer.as_ref().map(|t| *t.remaining);
-        let have_rem = node.router.have_timer.as_ref().map(|t| *t.remaining);
+        let router = &state.node(&n).router;
+        let want_rem = router.want_timer.as_ref().map(|t| *t.remaining);
+        let have_rem = router.have_timer.as_ref().map(|t| *t.remaining);
         let clock = self.clocks.entry(n).or_default();
         let mut dt = self.now.saturating_sub(*clock);
-        for rem in [want_rem, have_rem].into_iter().flatten() {
-            dt = dt.min(rem);
+        if let Some(due) = router.next_due() {
+            dt = dt.min(*due);
         }
         if !dt.is_zero() {
             *clock += dt;

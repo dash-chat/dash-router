@@ -149,6 +149,32 @@ impl<N: Id, L: Log, T: TimeInterval> RouterState<N, L, T> {
         }
     }
 
+    /// The furthest a single `Tick` may go: the smallest remaining time
+    /// across armed timers, or `None` when nothing is armed. A harness
+    /// advancing its clock toward a target clamps the step to this, so
+    /// that every due point is visited and a `Fire*` can run there.
+    pub fn next_due(&self) -> Option<T> {
+        [&self.want_timer, &self.have_timer]
+            .into_iter()
+            .flatten()
+            .map(|t| t.remaining)
+            .min()
+    }
+
+    /// Whether the Want timer is armed and due (`FireWant` is enabled).
+    pub fn want_due(&self) -> bool {
+        self.want_timer
+            .as_ref()
+            .is_some_and(|t| t.remaining.is_zero())
+    }
+
+    /// Whether the Have timer is armed and due (`FireHave` is enabled).
+    pub fn have_due(&self) -> bool {
+        self.have_timer
+            .as_ref()
+            .is_some_and(|t| t.remaining.is_zero())
+    }
+
     /// Everything not held, for every known log: the gaps plus the open
     /// tail. A known-but-empty log (empty range in `held`) wants everything.
     pub fn wanted(&self) -> LogRanges<L> {
@@ -329,8 +355,11 @@ impl<N: Id, L: Log, T: TimeInterval> Machine for RouterMachine<N, L, T> {
         match action {
             RouterAction::Tick(dur) => {
                 ensure!(!dur.is_zero(), "zero tick");
+                ensure!(
+                    s.next_due().is_none_or(|due| dur <= due),
+                    "tick would carry a timer past due"
+                );
                 for timer in [&mut s.want_timer, &mut s.have_timer].into_iter().flatten() {
-                    ensure!(dur <= timer.remaining, "tick would carry a timer past due");
                     timer.remaining = timer.remaining - dur;
                 }
                 s.haves.retain(|_, r| dur < r.ttl_left);
