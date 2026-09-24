@@ -155,17 +155,15 @@ impl<N: Id, L: Log, T: TimeInterval> RouterState<N, L, T> {
         LogRanges::from_pairs(self.held.iter().map(|(log, r)| (log, r.complement())))
     }
 
-    /// Held logs with data whose channel is in `channels` and that `named`
-    /// does not mention: the wholesale half of a Want's answer.
+    /// Held logs with data under any of `channels` that `named` does not
+    /// mention: the wholesale half of a Want's answer.
     fn held_under(&self, channels: &BTreeSet<L::Channel>, named: &LogRanges<L>) -> LogRanges<L> {
-        LogRanges::from_pairs(
+        LogRanges::from_pairs(channels.iter().flat_map(|c| {
             self.held
-                .iter()
-                .filter(|(log, r)| {
-                    !r.is_empty() && channels.contains(&log.channel()) && named.get(&log).is_none()
-                })
-                .map(|(log, r)| (log, r.clone())),
-        )
+                .channel(c)
+                .filter(|(log, r)| !r.is_empty() && named.get(log).is_none())
+                .map(|(log, r)| (log, r.clone()))
+        }))
     }
 
     /// Union of recent Wants from other nodes, with each wanter's channel
@@ -215,10 +213,9 @@ impl<N: Id, L: Log, T: TimeInterval> RouterState<N, L, T> {
         let wanted = self.wanted();
         let suppressed = wanted.difference(&self.others_wants());
         let named_under_open = LogRanges::from_pairs(
-            wanted
+            self.open
                 .iter()
-                .filter(|(log, _)| self.open.contains(&log.channel()))
-                .map(|(log, r)| (log, r.clone())),
+                .flat_map(|c| wanted.channel(c).map(|(log, r)| (log, r.clone()))),
         );
         (suppressed.union(&named_under_open), self.open.clone())
     }

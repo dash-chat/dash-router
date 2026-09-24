@@ -428,6 +428,43 @@ mod channel {
         assert_eq!(s.others_wants().get(&a1), Some(&Ranges::range(0, 10)));
     }
 
+    /// `held_under` is a channel lookup, not a scan: a wanter naming
+    /// channel 1 gets both of channel 1's logs and nothing from channel 2.
+    #[test]
+    fn channel_want_answers_every_author_under_the_channel_only() {
+        let m = machine();
+        let a1 = Pair::new(1, 1);
+        let a9 = Pair::new(1, 9);
+        let b5 = Pair::new(2, 5);
+        let s = RouterState::new(
+            0u32,
+            held(&[
+                (a1, Ranges::from(0)),
+                (a9, Ranges::range(0, 4)),
+                (b5, Ranges::from(0)),
+            ]),
+        );
+        let (s, _) = m
+            .transition(
+                s,
+                A::RecvWant {
+                    from: 7,
+                    origin: 7,
+                    ranges: LogRanges::empty(),
+                    channels: BTreeSet::from([1u8]),
+                },
+            )
+            .unwrap();
+        let (s, _) = m
+            .transition(s, A::ArmHaveTimer(Duration::ZERO.into()))
+            .unwrap();
+        let (_, fx) = m.transition(s, A::FireHave).unwrap();
+        let have = sent_have(&fx).expect("a Have is sent");
+        assert_eq!(have.get(&a1), Some(&Ranges::from(0)));
+        assert_eq!(have.get(&a9), Some(&Ranges::range(0, 4)));
+        assert_eq!(have.get(&b5), None, "other channel: untouched");
+    }
+
     /// Spec §3.5: a log this node knows under its own open channel stays
     /// named in its Want even when a peer already wants the same ranges,
     /// or answerers would treat it as unnamed and send it wholesale. Logs

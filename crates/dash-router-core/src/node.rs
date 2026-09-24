@@ -89,8 +89,7 @@ impl<N: Id, L: Log, T: polestar::time::TimeInterval> NodeState<N, L, T> {
             self.relay
                 .0
                 .held_all()
-                .iter()
-                .filter(|(log, _)| log.channel() == *channel)
+                .channel(channel)
                 .map(|(log, _)| (log, Ranges::full())),
         )
     }

@@ -431,11 +431,9 @@ where
         // `NodeState::relay_logs_under`: every relay-held log under the
         // channel, as full ranges.
         let under: LogRanges<L> = match self.relay.held_all().await {
-            Ok(all) => LogRanges::from_pairs(
-                all.iter()
-                    .filter(|(log, _)| log.channel() == channel)
-                    .map(|(log, _)| (log, Ranges::full())),
-            ),
+            Ok(all) => {
+                LogRanges::from_pairs(all.channel(&channel).map(|(log, _)| (log, Ranges::full())))
+            }
             Err(e) => {
                 self.relay_error("on_subscribe: relay.held_all", e);
                 LogRanges::empty()
