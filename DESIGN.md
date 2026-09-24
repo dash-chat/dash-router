@@ -71,12 +71,16 @@ impl HaveOps {
     }
 }
 
+/// A log is `(Channel, Author)`; `Channel` is Dash Chat's LogId, shared by
+/// every author writing under one topic. Nested channel-first so a
+/// channel is stored and sent once for all its authors.
+///
 /// A key absent means "unknown"; a key present with an empty Ranges means
 /// "known but empty" (e.g. a fresh subscription that wants everything).
 /// Construction/union preserve that empty-valued marker; intersection/
 /// difference (wire-bound results) prune it — "nothing in common" is not a
 /// key. is_empty() means every known key maps to an empty range.
-struct LogRanges(HashMap<LogId, Ranges>);
+struct LogRanges(BTreeMap<Channel, BTreeMap<Author, Ranges>>);
 
 /// Two payloads, both opaque to relays in general.
 struct Op {
