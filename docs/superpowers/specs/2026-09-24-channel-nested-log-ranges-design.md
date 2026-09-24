@@ -66,17 +66,11 @@ for every `l`; a unit test on `Pair` and a doc requirement on the trait
 state this.
 
 **Single-author ids.** The integer ids and polestar's `UpTo` keep
-`Channel = Self` with `channel = identity`, and get `Author = Solo`:
-
-```rust
-/// The one author of a log whose id is its own channel.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct Solo;
-```
-
-`Solo` implements polestar's `Id` (`Display` prints `·`; `TryFrom<usize>`
-accepts `0`; `choices()` is `Small(1)`). polestar's own `IdUnit` would do
-but has no serde impl, and the wire needs one. `Solo` lives in `log.rs`.
+`Channel = Self` with `channel = identity`, and get `Author = IdUnit`,
+polestar's one-valued id type. polestar gains a serde derive on `IdUnit`
+under its `serde` feature (commit `72fb422` on polestar-rs main, which
+dash-router already builds against through the `[patch]` in `Cargo.toml`)
+so the wire can carry it.
 
 **`Pair`** becomes `Pair { channel: u8, author: u8 }` with
 `Channel = u8`, `Author = u8`, and `Display` unchanged (`"{channel}/{author}"`).
@@ -142,7 +136,7 @@ untouched.
 ### Serde
 
 Derived, on the nested map. On the wire a channel therefore appears once,
-followed by its authors and their boundary lists. For `Solo` authors the
+followed by its authors and their boundary lists. For `IdUnit` authors the
 inner map is one entry whose key encodes as zero bytes in postcard, so the
 model world pays one extra length varint per log.
 
@@ -157,7 +151,7 @@ All mechanical, listed so the plan can check them off.
 
 **dash-router-core**
 
-- `log.rs`: trait, `Solo`, `Pair`, `WireLog`, macro, tests.
+- `log.rs`: trait, `Pair`, `WireLog`, macro, tests.
 - `ranges.rs`: as §4.
 - `wire.rs`: field rename, serde bounds on `Channel`/`Author`, version
   and topic bump, tests.
