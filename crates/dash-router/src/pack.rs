@@ -66,7 +66,7 @@ where
     (msgs, dropped)
 }
 
-/// Greedily pack a Want: prefixes first (they are tiny and are what an
+/// Greedily pack a Want: channels first (they are tiny and are what an
 /// unknown-author subscription rides on), then one log's ranges at a
 /// time. A single log whose ranges alone exceed the budget is dropped
 /// and counted; the next Want cycle retries with whatever changed.
@@ -77,7 +77,7 @@ pub fn pack_want<N, L>(
     sender: N,
     origin: N,
     ranges: LogRanges<L>,
-    prefixes: BTreeSet<L::Prefix>,
+    channels: BTreeSet<L::Channel>,
     budget: usize,
 ) -> (Vec<WireMessage<N, L>>, u64)
 where
@@ -87,14 +87,14 @@ where
     let mut msgs = Vec::new();
     let mut dropped = 0u64;
     let mut cur_ranges: LogRanges<L> = LogRanges::empty();
-    let mut cur_prefixes: BTreeSet<L::Prefix> = BTreeSet::new();
-    let len = |r: &LogRanges<L>, p: &BTreeSet<L::Prefix>| {
+    let mut cur_channels: BTreeSet<L::Channel> = BTreeSet::new();
+    let len = |r: &LogRanges<L>, p: &BTreeSet<L::Channel>| {
         WireMessage::want(sender, origin, r.clone(), p.clone())
             .encode()
             .len()
     };
     let flush =
-        |msgs: &mut Vec<WireMessage<N, L>>, r: &mut LogRanges<L>, p: &mut BTreeSet<L::Prefix>| {
+        |msgs: &mut Vec<WireMessage<N, L>>, r: &mut LogRanges<L>, p: &mut BTreeSet<L::Channel>| {
             if !r.is_empty() || !p.is_empty() {
                 msgs.push(WireMessage::want(
                     sender,
@@ -104,31 +104,31 @@ where
                 ));
             }
         };
-    for prefix in prefixes {
-        cur_prefixes.insert(prefix);
-        if len(&cur_ranges, &cur_prefixes) > budget {
-            cur_prefixes.remove(&prefix);
-            flush(&mut msgs, &mut cur_ranges, &mut cur_prefixes);
-            cur_prefixes.insert(prefix);
-            if len(&cur_ranges, &cur_prefixes) > budget {
-                cur_prefixes.remove(&prefix);
+    for channel in channels {
+        cur_channels.insert(channel);
+        if len(&cur_ranges, &cur_channels) > budget {
+            cur_channels.remove(&channel);
+            flush(&mut msgs, &mut cur_ranges, &mut cur_channels);
+            cur_channels.insert(channel);
+            if len(&cur_ranges, &cur_channels) > budget {
+                cur_channels.remove(&channel);
                 dropped += 1;
             }
         }
     }
     for (log, r) in ranges.iter() {
         cur_ranges.insert(*log, r.clone());
-        if len(&cur_ranges, &cur_prefixes) > budget {
+        if len(&cur_ranges, &cur_channels) > budget {
             cur_ranges.remove(log);
-            flush(&mut msgs, &mut cur_ranges, &mut cur_prefixes);
+            flush(&mut msgs, &mut cur_ranges, &mut cur_channels);
             cur_ranges.insert(*log, r.clone());
-            if len(&cur_ranges, &cur_prefixes) > budget {
+            if len(&cur_ranges, &cur_channels) > budget {
                 cur_ranges.remove(log);
                 dropped += 1;
             }
         }
     }
-    flush(&mut msgs, &mut cur_ranges, &mut cur_prefixes);
+    flush(&mut msgs, &mut cur_ranges, &mut cur_channels);
     (msgs, dropped)
 }
 
@@ -205,28 +205,28 @@ mod tests {
     }
 
     #[test]
-    fn want_splits_ranges_and_carries_prefixes_first() {
+    fn want_splits_ranges_and_carries_channels_first() {
         let ranges = LogRanges::from_pairs((0..200u8).map(|l| (l, Ranges::from(3))));
-        let prefixes: BTreeSet<u8> = (0..50).collect();
-        let (msgs, dropped) = pack_want(1u32, 9u32, ranges, prefixes.clone(), 300);
+        let channels: BTreeSet<u8> = (0..50).collect();
+        let (msgs, dropped) = pack_want(1u32, 9u32, ranges, channels.clone(), 300);
         assert_eq!(dropped, 0);
         assert!(msgs.len() > 1);
         assert!(msgs.iter().all(|m| m.encode().len() <= 300));
-        let mut got_prefixes = BTreeSet::new();
+        let mut got_channels = BTreeSet::new();
         let mut got_logs = 0;
         for m in &msgs {
             if let WireBody::Want {
                 origin,
                 ranges,
-                prefixes,
+                channels,
             } = &m.body
             {
                 assert_eq!(*origin, 9, "every piece carries the origin");
-                got_prefixes.extend(prefixes.iter().copied());
+                got_channels.extend(channels.iter().copied());
                 got_logs += ranges.iter().count();
             }
         }
-        assert_eq!(got_prefixes, prefixes);
+        assert_eq!(got_channels, channels);
         assert_eq!(got_logs, 200);
     }
 

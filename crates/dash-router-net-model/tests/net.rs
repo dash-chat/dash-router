@@ -234,7 +234,7 @@ fn absent_messages_and_smuggled_recvs_are_disabled() {
                 from: n(0),
                 origin: n(0),
                 ranges: LogRanges::empty(),
-                prefixes: BTreeSet::new(),
+                channels: BTreeSet::new(),
             }),
         ),
     );
@@ -306,9 +306,9 @@ fn the_inflight_cap_disables_overflowing_actions() {
     );
 }
 
-/// Final review F1, end to end: prefix subscribers behind a relay, with
-/// two-level logs so one prefix holds several logs.
-mod prefix_behind_relay {
+/// Final review F1, end to end: channel subscribers behind a relay, with
+/// two-level logs so one channel holds several logs.
+mod channel_behind_relay {
     use std::{sync::Arc, time::Duration};
 
     use dash_router_core::{
@@ -373,10 +373,10 @@ mod prefix_behind_relay {
         }
     }
 
-    /// Path SUB — RELAY — HOLDER. SUB subscribes to prefix 1; RELAY is a
+    /// Path SUB — RELAY — HOLDER. SUB subscribes to channel 1; RELAY is a
     /// pure relay; HOLDER authored `1/1` seqs 0..4 and `1/2` seqs 0..3 with
     /// the flood lost. HOLDER's own Want comes back to it relayed by RELAY,
-    /// which must not stop it answering SUB's prefix with the logs SUB did
+    /// which must not stop it answering SUB's channel with the logs SUB did
     /// not name. `sub_holds` is what SUB already holds of `1/1`.
     fn run(sub_holds: u32) {
         let nm = NodeMachine::new(

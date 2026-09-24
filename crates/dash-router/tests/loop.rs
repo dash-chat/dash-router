@@ -7,7 +7,9 @@ use std::time::Duration;
 use dash_router_core::{Op, OpsMap, Pair, RouterConfig, Storage, Units, WireMessage};
 // The relay store is a plain OpsMap through the blanket sync bridge:
 // MemStore is the *watchable ext* store and implements no eviction.
-use dash_router::{CoreConfig, LoopbackHub, MemStore, PolicyIntervals, RouterEvent, Transport, spawn};
+use dash_router::{
+    CoreConfig, LoopbackHub, MemStore, PolicyIntervals, RouterEvent, Transport, spawn,
+};
 use dash_router_policy::{IntervalPolicy, PushDebouncePolicy};
 use rand::SeedableRng;
 
@@ -171,13 +173,13 @@ async fn stats_reports_a_zeroed_snapshot_for_a_fresh_node() {
     assert_eq!(snapshot.relay_store_errors, 0);
 }
 
-/// Final review F1 in the real shell: a late joiner subscribing to a prefix
+/// Final review F1 in the real shell: a late joiner subscribing to a channel
 /// under which it knows no author is served every log under it within one
 /// Want/Have cycle, not only after `want_ttl`. The holder's own Want is
 /// relayed back to it by the joiner; that echo must not count as the
 /// joiner naming the holder's logs.
 #[tokio::test(start_paused = true)]
-async fn late_joiner_under_prefix_is_served_before_want_ttl() {
+async fn late_joiner_under_channel_is_served_before_want_ttl() {
     use dash_router_core::Pair;
 
     let want_ttl = Duration::from_secs(6);
@@ -310,5 +312,8 @@ async fn relay_held_errors_after_shutdown() {
     handle.clone().shutdown().await.unwrap();
     task.await.unwrap().unwrap();
     let result = tokio::time::timeout(Duration::from_secs(2), handle.relay_held()).await;
-    assert!(matches!(result, Ok(Err(_))), "errors, does not hang: {result:?}");
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "errors, does not hang: {result:?}"
+    );
 }

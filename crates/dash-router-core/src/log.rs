@@ -1,36 +1,40 @@
-//! A log identity with a *prefix*: the part a subscription names (spec
-//! 2026-09-22 §3.5). Subscribing to a prefix means every log under it, now
-//! and in the future. For the integer ids used by tests, models and the
-//! sim the prefix is the id itself, so a prefix subscription to `7` is
-//! exactly a subscription to log `7`.
+//! A log identity with a *channel*: the half shared across authors, which
+//! is what a subscription names. Subscribing to a channel means every
+//! author's log under it, now and in the future. For the integer ids used
+//! by tests, models and the sim the channel is the id itself, so a
+//! subscription to `7` is exactly a subscription to log `7`.
+//!
+//! Vocabulary follows p2panda: a log is single-author, and the thing one
+//! log id names across authors is a channel. At the Dash Chat boundary
+//! `Channel` is p2panda's `LogId`.
 
 use polestar::prelude::Id;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub trait Log: Id {
-    type Prefix: Id;
-    fn prefix(&self) -> Self::Prefix;
+    type Channel: Id;
+    fn channel(&self) -> Self::Channel;
 }
 
-macro_rules! self_prefixed {
+macro_rules! self_channeled {
     ($($t:ty),* $(,)?) => {
         $(impl Log for $t {
-            type Prefix = Self;
-            fn prefix(&self) -> Self { *self }
+            type Channel = Self;
+            fn channel(&self) -> Self { *self }
         })*
     };
 }
-self_prefixed!(u8, u16, u32, u64, usize);
+self_channeled!(u8, u16, u32, u64, usize);
 
 /// The bounded ids polestar models and the core's own model tests use for
-/// `L`: self-prefixed like the integers, so model-checked scenarios keep
-/// their pre-prefix meaning.
+/// `L`: self-channeled like the integers, so model-checked scenarios keep
+/// their single-author meaning.
 impl<const N: usize, const WRAP: bool> Log for polestar::id::UpTo<N, WRAP>
 where
     Self: Id,
 {
-    type Prefix = Self;
-    fn prefix(&self) -> Self {
+    type Channel = Self;
+    fn channel(&self) -> Self {
         *self
     }
 }
@@ -38,41 +42,41 @@ where
 /// `Log` plus the serde bounds the wire needs on both halves. Blanket:
 /// nothing implements this by hand.
 pub trait WireLog:
-    Log<Prefix: Serialize + DeserializeOwned> + Serialize + DeserializeOwned
+    Log<Channel: Serialize + DeserializeOwned> + Serialize + DeserializeOwned
 {
 }
 impl<T> WireLog for T where
-    T: Log<Prefix: Serialize + DeserializeOwned> + Serialize + DeserializeOwned
+    T: Log<Channel: Serialize + DeserializeOwned> + Serialize + DeserializeOwned
 {
 }
 
-/// A two-level log id for tests and examples: `(prefix, author)`, the
-/// shape Dash Chat's `(LogId, author)` has. Orders prefix-first so a
-/// prefix's logs are contiguous, exactly as the relay store keys them.
+/// A two-level log id for tests and examples: `(channel, author)`, the
+/// shape Dash Chat's `(LogId, author)` has. Orders channel-first so a
+/// channel's logs are contiguous, exactly as the relay store keys them.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 pub struct Pair {
-    pub prefix: u8,
+    pub channel: u8,
     pub author: u8,
 }
 
 impl Pair {
-    pub const fn new(prefix: u8, author: u8) -> Self {
-        Self { prefix, author }
+    pub const fn new(channel: u8, author: u8) -> Self {
+        Self { channel, author }
     }
 }
 
 impl std::fmt::Display for Pair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.prefix, self.author)
+        write!(f, "{}/{}", self.channel, self.author)
     }
 }
 
 impl Log for Pair {
-    type Prefix = u8;
-    fn prefix(&self) -> u8 {
-        self.prefix
+    type Channel = u8;
+    fn channel(&self) -> u8 {
+        self.channel
     }
 }
 
@@ -81,29 +85,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn integer_ids_are_their_own_prefix() {
-        assert_eq!(7u8.prefix(), 7u8);
-        assert_eq!(9u32.prefix(), 9u32);
+    fn integer_ids_are_their_own_channel() {
+        assert_eq!(7u8.channel(), 7u8);
+        assert_eq!(9u32.channel(), 9u32);
     }
 
     #[test]
-    fn pair_prefix_is_the_first_half() {
+    fn pair_channel_is_the_first_half() {
         let l = Pair {
-            prefix: 3,
+            channel: 3,
             author: 9,
         };
-        assert_eq!(l.prefix(), 3);
+        assert_eq!(l.channel(), 3);
         assert_eq!(l.to_string(), "3/9");
     }
 
     #[test]
-    fn pair_orders_by_prefix_then_author() {
+    fn pair_orders_by_channel_then_author() {
         let a = Pair {
-            prefix: 1,
+            channel: 1,
             author: 9,
         };
         let b = Pair {
-            prefix: 2,
+            channel: 2,
             author: 0,
         };
         assert!(a < b);

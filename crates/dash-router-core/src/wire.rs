@@ -12,7 +12,7 @@ use crate::{
 };
 
 /// Bump together with [`GOSSIP_TOPIC`] on breaking change.
-/// v1: Want carries prefixes (spec 2026-09-22 §3.5) and its origin.
+/// v1: Want carries channels (spec 2026-09-22 §3.5) and its origin.
 pub const WIRE_VERSION: u8 = 1;
 
 /// The well-known gossip topic name this wire protocol runs on. Every
@@ -37,8 +37,8 @@ const _: () = {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "N: Serialize, L: Serialize, L::Prefix: Serialize",
-    deserialize = "N: Deserialize<'de>, L: Deserialize<'de>, L::Prefix: Deserialize<'de>"
+    serialize = "N: Serialize, L: Serialize, L::Channel: Serialize",
+    deserialize = "N: Deserialize<'de>, L: Deserialize<'de>, L::Channel: Deserialize<'de>"
 ))]
 pub struct WireMessage<N, L: Log> {
     pub version: u8,
@@ -50,19 +50,19 @@ pub struct WireMessage<N, L: Log> {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "N: Serialize, L: Serialize, L::Prefix: Serialize",
-    deserialize = "N: Deserialize<'de>, L: Deserialize<'de>, L::Prefix: Deserialize<'de>"
+    serialize = "N: Serialize, L: Serialize, L::Channel: Serialize",
+    deserialize = "N: Deserialize<'de>, L: Deserialize<'de>, L::Channel: Deserialize<'de>"
 ))]
 pub enum WireBody<N, L: Log> {
     /// `origin`: the node that wants, preserved by every relayer (the
     /// message's `sender` is re-signed at each hop), so an answerer keys
     /// the Want by its wanter and ignores echoes of its own.
     /// `ranges`: gaps and open tails for logs the wanter already knows.
-    /// `prefixes`: "and every log under these that I did not name".
+    /// `channels`: "and every log under these that I did not name".
     Want {
         origin: N,
         ranges: LogRanges<L>,
-        prefixes: BTreeSet<L::Prefix>,
+        channels: BTreeSet<L::Channel>,
     },
     /// Hydrated ops grouped per log, in (log, seq) order; payloads may be
     /// None (GC'd). Grouping avoids repeating the log id per op.
@@ -72,14 +72,19 @@ pub enum WireBody<N, L: Log> {
 impl<N: Serialize + DeserializeOwned, L: WireLog> WireMessage<N, L> {
     /// A Want signed by `sender` on behalf of `origin` (`sender` itself
     /// for an own Want, the incoming Want's origin for a relay).
-    pub fn want(sender: N, origin: N, ranges: LogRanges<L>, prefixes: BTreeSet<L::Prefix>) -> Self {
+    pub fn want(
+        sender: N,
+        origin: N,
+        ranges: LogRanges<L>,
+        channels: BTreeSet<L::Channel>,
+    ) -> Self {
         Self {
             version: WIRE_VERSION,
             sender,
             body: WireBody::Want {
                 origin,
                 ranges,
-                prefixes,
+                channels,
             },
         }
     }
@@ -125,10 +130,10 @@ mod tests {
         );
         match &want.body {
             WireBody::Want {
-                origin, prefixes, ..
+                origin, channels, ..
             } => {
                 assert_eq!(*origin, 5, "the origin survives a relayer's re-signing");
-                assert_eq!(prefixes, &BTreeSet::from([2u8]));
+                assert_eq!(channels, &BTreeSet::from([2u8]));
             }
             WireBody::Have(_) => unreachable!(),
         }

@@ -87,11 +87,11 @@ pub struct NodeCore<N: Id, L: Log, E, R, I> {
     pub router: RouterStateMachine<N, L, RealTime>,
     pub ext: E,
     pub relay: R,
-    /// Subscriptions by prefix (spec 2026-09-22 §3.5): a log is subscribed
-    /// iff its prefix is. Mirrors `NodeState::subscriptions`.
-    pub subscriptions: BTreeSet<L::Prefix>,
+    /// Subscriptions by channel (spec 2026-09-22 §3.5): a log is subscribed
+    /// iff its channel is. Mirrors `NodeState::subscriptions`.
+    pub subscriptions: BTreeSet<L::Channel>,
     /// Derived: last known ext ∪ relay. No empty markers: a subscribed
-    /// prefix with nothing stored is advertised by the Want's `prefixes`
+    /// channel with nothing stored is advertised by the Want's `channels`
     /// (the router's `open` set), not by a per-log marker.
     held_cache: LogRanges<L>,
     intervals: I,
@@ -106,7 +106,7 @@ pub struct NodeCore<N: Id, L: Log, E, R, I> {
     now: Duration,
     pub dropped_msgs: u64,
     pub relay_errors: u64,
-    /// Items (ops, prefixes, per-log ranges) that could not fit
+    /// Items (ops, channels, per-log ranges) that could not fit
     /// `max_wire_bytes` even alone and were left out of a broadcast.
     pub oversize_drops: u64,
     /// Wire traffic since the last [`Self::log_summary`].
@@ -127,13 +127,13 @@ where
     pub fn new(
         id: N,
         config: CoreConfig,
-        subscriptions: BTreeSet<L::Prefix>,
+        subscriptions: BTreeSet<L::Channel>,
         ext: E,
         relay: R,
         intervals: I,
     ) -> Self {
         // Mirrors `NodeState::new`: the router starts with the subscribed
-        // prefixes open.
+        // channels open.
         let mut state = RouterState::new(id, LogRanges::empty());
         state.open = subscriptions.clone();
         let machine = RouterMachine::new(config.router);
@@ -193,9 +193,9 @@ where
         self.peers_heard.clear();
     }
 
-    /// A log is subscribed iff its prefix is (`NodeState::is_subscribed`).
+    /// A log is subscribed iff its channel is (`NodeState::is_subscribed`).
     pub fn is_subscribed(&self, log: &L) -> bool {
-        self.subscriptions.contains(&log.prefix())
+        self.subscriptions.contains(&log.channel())
     }
 
     /// Read the initial held snapshot from storage and arm the first Want
@@ -330,31 +330,31 @@ where
             WireBody::Want {
                 origin,
                 ranges,
-                prefixes,
+                channels,
             } => {
                 tracing::trace!(
                     from = %msg.sender,
                     %origin,
                     logs = ranges.iter().count(),
-                    prefixes = prefixes.len(),
+                    channels = channels.len(),
                     "dash-router received want"
                 );
                 // Finding 8(a): an EMPTY Want must not arm the have timer —
                 // otherwise it arms a forever no-op fire/re-arm loop (fire
                 // finds nothing to reply to, re-arms, repeats). Gate on the
-                // received Want naming something — ranges or prefixes (a
-                // prefix-only Want is a real request: it asks for every log
-                // under the prefix) — and on it being someone else's: an
+                // received Want naming something — ranges or channels (a
+                // channel-only Want is a real request: it asks for every log
+                // under the channel) — and on it being someone else's: an
                 // echo of this node's own Want is not recorded, so it
                 // witnesses nothing to answer. Mirrored exactly by the
                 // conformance driver (see tests/conformance.rs).
-                let want_nonempty = !ranges.is_empty() || !prefixes.is_empty();
+                let want_nonempty = !ranges.is_empty() || !channels.is_empty();
                 let foreign = origin != self.router.id;
                 let fx = self.router.step(RouterAction::RecvWant {
                     from: msg.sender,
                     origin,
                     ranges,
-                    prefixes,
+                    channels,
                 })?;
                 self.route_fx(fx, &BTreeMap::new(), &BTreeSet::new(), &mut out)
                     .await?;
@@ -418,22 +418,22 @@ where
         Ok(out)
     }
 
-    /// Start caring about every log under a prefix (`NodeAction::Subscribe`'s
+    /// Start caring about every log under a channel (`NodeAction::Subscribe`'s
     /// glue): migrate every relay-held log under it to `ext`, evict those
-    /// logs from the relay, then open the prefix on the router.
+    /// logs from the relay, then open the channel on the router.
     pub async fn on_subscribe(
         &mut self,
         now: Duration,
-        prefix: L::Prefix,
+        channel: L::Channel,
     ) -> Result<Vec<Out<N, L>>> {
         let mut out = self.advance_to(now).await?;
-        self.subscriptions.insert(prefix);
+        self.subscriptions.insert(channel);
         // `NodeState::relay_logs_under`: every relay-held log under the
-        // prefix, as full ranges.
+        // channel, as full ranges.
         let under: LogRanges<L> = match self.relay.held_all().await {
             Ok(all) => LogRanges::from_pairs(
                 all.iter()
-                    .filter(|(log, _)| log.prefix() == prefix)
+                    .filter(|(log, _)| log.channel() == channel)
                     .map(|(log, _)| (*log, Ranges::full())),
             ),
             Err(e) => {
@@ -446,8 +446,8 @@ where
         // unaffected): evict from the relay only what provably landed in
         // ext. A failed relay fetch evicts nothing; an op whose ext ingest
         // failed stays parked in the relay. Either way the bytes survive in
-        // one store instead of vanishing from both — which a prefix-wide
-        // migration would otherwise do to every log under the prefix.
+        // one store instead of vanishing from both — which a channel-wide
+        // migration would otherwise do to every log under the channel.
         if !under.is_empty() {
             match self.relay.fetch(&under).await {
                 Ok(ops) => {
@@ -481,29 +481,29 @@ where
         }
         self.router
             .step(RouterAction::Open(self.subscriptions.clone()))?;
-        tracing::debug!(%prefix, relay_logs_migrated = under.iter().count(), "dash-router subscribed");
+        tracing::debug!(%channel, relay_logs_migrated = under.iter().count(), "dash-router subscribed");
         let touched: BTreeSet<L> = under.iter().map(|(l, _)| *l).collect();
         self.reconcile_held(Some(&touched), &mut out).await?;
         Ok(out)
     }
 
     /// Kept-as-is ruling (binding semantics #7): remove the subscription,
-    /// close the prefix on the router, and reconcile. Nothing is migrated
+    /// close the channel on the router, and reconcile. Nothing is migrated
     /// or forgotten: still-held data keeps advertising until it is
-    /// otherwise evicted, and later Haves under the prefix park in the
+    /// otherwise evicted, and later Haves under the channel park in the
     /// relay. The `Held` re-step is a full rebuild (there is no per-log
     /// marker to drop any more) so the router sees the same snapshot the
     /// reference's `reconcile_held` gives it.
     pub async fn on_unsubscribe(
         &mut self,
         now: Duration,
-        prefix: L::Prefix,
+        channel: L::Channel,
     ) -> Result<Vec<Out<N, L>>> {
         let mut out = self.advance_to(now).await?;
-        self.subscriptions.remove(&prefix);
+        self.subscriptions.remove(&channel);
         self.router
             .step(RouterAction::Open(self.subscriptions.clone()))?;
-        tracing::debug!(%prefix, "dash-router unsubscribed");
+        tracing::debug!(%channel, "dash-router unsubscribed");
         self.reconcile_held(None, &mut out).await?;
         Ok(out)
     }
@@ -620,19 +620,19 @@ where
                 Effect::SendWant {
                     origin,
                     ranges,
-                    prefixes,
+                    channels,
                 } => {
                     tracing::trace!(
                         %origin,
                         logs = ranges.iter().count(),
-                        prefixes = prefixes.len(),
+                        channels = channels.len(),
                         "dash-router sending want"
                     );
                     let (msgs, dropped) = pack_want(
                         self.router.id,
                         origin,
                         ranges,
-                        prefixes,
+                        channels,
                         self.max_wire_bytes,
                     );
                     self.oversize_drops += dropped;
@@ -838,11 +838,11 @@ where
 /// The thin rind (spec §2, §5): one tokio task running [`NodeCore`] behind
 /// a [`RouterHandle`] and an event stream, wired to a real [`Transport`].
 ///
-/// `subscriptions` are the prefixes subscribed from the start. Unlike
+/// `subscriptions` are the channels subscribed from the start. Unlike
 /// [`RouterHandle::subscribe`], they do not migrate: relay logs already on
-/// disk under those prefixes (parked while the node was not subscribed)
+/// disk under those channels (parked while the node was not subscribed)
 /// stay in the relay store and are not delivered or moved to `ext`. Only
-/// `RouterHandle::subscribe` migrates relay-held logs under its prefix; an
+/// `RouterHandle::subscribe` migrates relay-held logs under its channel; an
 /// embedder that wants them migrated subscribes through the handle after
 /// spawning.
 ///
@@ -854,7 +854,7 @@ pub fn spawn<N, L, E, R, T, I>(
     id: N,
     config: CoreConfig,
     maintain_interval: Duration,
-    subscriptions: BTreeSet<L::Prefix>,
+    subscriptions: BTreeSet<L::Channel>,
     ext: E,
     relay: R,
     transport: T,
@@ -928,17 +928,17 @@ where
                                 }
                             }
                         }
-                        Some(Command::Subscribe { prefix, reply }) => {
+                        Some(Command::Subscribe { channel, reply }) => {
                             let now = epoch.elapsed();
-                            let out = core.on_subscribe(now, prefix).await?;
+                            let out = core.on_subscribe(now, channel).await?;
                             let _ = reply.send(Ok(()));
                             if !route_outs(out, &mut transport, &event_tx).await? {
                                 break;
                             }
                         }
-                        Some(Command::Unsubscribe { prefix, reply }) => {
+                        Some(Command::Unsubscribe { channel, reply }) => {
                             let now = epoch.elapsed();
-                            let out = core.on_unsubscribe(now, prefix).await?;
+                            let out = core.on_unsubscribe(now, channel).await?;
                             let _ = reply.send(Ok(()));
                             if !route_outs(out, &mut transport, &event_tx).await? {
                                 break;
@@ -1208,10 +1208,10 @@ mod tests {
         assert_eq!(groups[0].1.len(), 1, "hydration only finds the stored op");
     }
 
-    /// Mirror of core `prefix::subscribe_prefix_migrates_all_relay_logs_under_it`
+    /// Mirror of core `channel::subscribe_channel_migrates_all_relay_logs_under_it`
     /// and review focus 1, over the async core with `Pair` logs.
     #[tokio::test]
-    async fn subscribe_prefix_migrates_relay_logs_and_delivers_new_authors() {
+    async fn subscribe_channel_migrates_relay_logs_and_delivers_new_authors() {
         use dash_router_core::Pair;
         // The module's `wire` helper is typed for `u8` logs; this test's
         // logs are `Pair`, so encode the same LAN-sourced `Incoming` here.
@@ -1273,21 +1273,21 @@ mod tests {
         );
     }
 
-    /// Review focus 6: a Want naming no ranges and no prefixes must not arm
-    /// the have timer; a prefix-only Want must.
+    /// Review focus 6: a Want naming no ranges and no channels must not arm
+    /// the have timer; a channel-only Want must.
     #[tokio::test]
-    async fn prefix_only_want_arms_have_timer_but_empty_want_does_not() {
+    async fn channel_only_want_arms_have_timer_but_empty_want_does_not() {
         let mut c = core(100, &[]).await;
         let empty = WireMessage::want(7, 7, LogRanges::<u8>::empty(), BTreeSet::new());
         c.on_wire(Duration::from_millis(1), wire(empty))
             .await
             .unwrap();
         assert!(c.router.have_timer.is_none(), "empty Want must not arm");
-        let prefix_only = WireMessage::want(7, 7, LogRanges::<u8>::empty(), BTreeSet::from([0u8]));
-        c.on_wire(Duration::from_millis(2), wire(prefix_only))
+        let channel_only = WireMessage::want(7, 7, LogRanges::<u8>::empty(), BTreeSet::from([0u8]));
+        c.on_wire(Duration::from_millis(2), wire(channel_only))
             .await
             .unwrap();
-        assert!(c.router.have_timer.is_some(), "prefix-only Want arms");
+        assert!(c.router.have_timer.is_some(), "channel-only Want arms");
     }
 
     /// Push debounce: appends accumulate; the flush pushes one hydrated Have
@@ -1353,16 +1353,16 @@ mod tests {
 
         let out = c.advance_to(Duration::from_millis(100)).await.unwrap();
         let bs = broadcasts(&out);
-        // No empty per-log marker any more: a subscribed prefix with nothing
-        // stored is wanted through the Want's `prefixes`, not a `(0, full)`
+        // No empty per-log marker any more: a subscribed channel with nothing
+        // stored is wanted through the Want's `channels`, not a `(0, full)`
         // range.
         assert!(
             matches!(
                 &bs[0].body,
-                WireBody::Want { origin: 0, ranges, prefixes }
-                    if prefixes.contains(&0) && ranges.get(&0).is_none()
+                WireBody::Want { origin: 0, ranges, channels }
+                    if channels.contains(&0) && ranges.get(&0).is_none()
             ),
-            "fresh subscription wants the whole prefix"
+            "fresh subscription wants the whole channel"
         );
 
         // Seed storage: `held` updates immediately (before any debounced
@@ -1487,11 +1487,11 @@ mod tests {
     }
 
     /// Spec 2026-09-22 §3.3 end to end: a Want that `pack_want` splits into
-    /// several wire messages is recorded whole by the receiver — prefixes
+    /// several wire messages is recorded whole by the receiver — channels
     /// (first piece) and every piece's ranges — not just the last piece.
     ///
     /// Final review F1: the receiver holds two logs under the wanted
-    /// prefix, `a` (named by the split Want) and `b` (not named). The split
+    /// channel, `a` (named by the split Want) and `b` (not named). The split
     /// Want arrives relayed by 7, as does the receiver's own Want, echoed
     /// back. The echo names both logs; it must not count as the wanter
     /// naming them, so `a` goes as its named tail and `b` wholesale.
@@ -1532,9 +1532,9 @@ mod tests {
             std::iter::once((a, Ranges::from(5)))
                 .chain((0..200u8).map(|l| (Pair::new(2, l), Ranges::from(3)))),
         );
-        let prefixes: BTreeSet<u8> = std::iter::once(1).chain(100..110).collect();
+        let channels: BTreeSet<u8> = std::iter::once(1).chain(100..110).collect();
         let (msgs, dropped) =
-            crate::pack::pack_want(8u32, 8u32, ranges.clone(), prefixes.clone(), 200);
+            crate::pack::pack_want(8u32, 8u32, ranges.clone(), channels.clone(), 200);
         assert_eq!(dropped, 0);
         assert!(msgs.len() >= 3, "the Want must actually split");
         // Relayer 7 re-signs; the origin rides through unchanged.
@@ -1548,7 +1548,7 @@ mod tests {
         assert_eq!(
             c.router.next_have(),
             LogRanges::from_pairs([(a, Ranges::range(5, 10)), (b, Ranges::range(0, 5))]),
-            "named log: its tail only; unnamed log under the prefix: wholesale"
+            "named log: its tail only; unnamed log under the channel: wholesale"
         );
         assert_eq!(
             c.router.wants.keys().copied().collect::<Vec<_>>(),
@@ -1559,7 +1559,11 @@ mod tests {
             .iter()
             .fold(LogRanges::empty(), |acc, r| acc.union(&r.ranges));
         assert_eq!(recorded, ranges, "every piece's ranges");
-        assert_eq!(c.router.others_prefixes(), prefixes, "the prefix piece too");
+        assert_eq!(
+            c.router.others_channels(),
+            channels,
+            "the channel piece too"
+        );
     }
 
     /// Maintenance evicts payloads nobody wants once usage crosses the line.
@@ -1795,7 +1799,7 @@ mod tests {
 
     /// Finding (controller ruling): a failed relay fetch during Subscribe
     /// must evict nothing — the ops stay parked in the relay rather than
-    /// vanishing from both stores — while the prefix still opens.
+    /// vanishing from both stores — while the channel still opens.
     #[tokio::test]
     async fn subscribe_keeps_relay_ops_when_fetch_fails() {
         use dash_router_core::Pair;
@@ -1839,7 +1843,7 @@ mod tests {
             errors_before + 1,
             "the fetch error is counted"
         );
-        assert!(c.router.open.contains(&1u8), "the prefix still opens");
+        assert!(c.router.open.contains(&1u8), "the channel still opens");
         assert_eq!(
             c.router.held.get(&a1),
             Some(&Ranges::range(0, 2)),
@@ -1848,7 +1852,7 @@ mod tests {
     }
 
     /// Finding (controller ruling): an op whose ext ingest fails during
-    /// Subscribe stays in the relay; its siblings under the same prefix
+    /// Subscribe stays in the relay; its siblings under the same channel
     /// migrate.
     #[tokio::test]
     async fn subscribe_keeps_relay_ops_whose_ingest_fails() {

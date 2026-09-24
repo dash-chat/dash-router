@@ -59,13 +59,13 @@ pub struct NodeState<N: Id, L: Log, T: TimeInterval> {
     pub router: SM<RouterMachine<N, L, T>>,
     pub relay: SM<RelayStoreMachine<L>>,
     pub ext: SM<ExtStoreMachine<L>>,
-    /// Subscriptions by prefix (spec 2026-09-22 §3.5): a log is subscribed
-    /// iff its prefix is.
-    pub subscriptions: BTreeSet<L::Prefix>,
+    /// Subscriptions by channel (spec 2026-09-22 §3.5): a log is subscribed
+    /// iff its channel is.
+    pub subscriptions: BTreeSet<L::Channel>,
 }
 
-/// held snapshot = relay ∪ ext. No empty markers: a subscribed prefix
-/// with nothing stored is advertised by the Want's `prefixes`, not by a
+/// held snapshot = relay ∪ ext. No empty markers: a subscribed channel
+/// with nothing stored is advertised by the Want's `channels`, not by a
 /// per-log marker (there is no log to name before its author is known).
 fn held_union<L: Log>(relay: &RelayStoreState<L>, ext: &ExtStoreState<L>) -> LogRanges<L> {
     relay.0.held_all().union(&ext.0.held_all())
@@ -78,19 +78,19 @@ impl<N: Id, L: Log, T: polestar::time::TimeInterval> NodeState<N, L, T> {
         held_union(&self.relay, &self.ext)
     }
 
-    /// A log is subscribed iff its prefix is.
+    /// A log is subscribed iff its channel is.
     pub fn is_subscribed(&self, log: &L) -> bool {
-        self.subscriptions.contains(&log.prefix())
+        self.subscriptions.contains(&log.channel())
     }
 
-    /// Every relay-held log under `prefix`, as full ranges: what Subscribe migrates.
-    fn relay_logs_under(&self, prefix: &L::Prefix) -> LogRanges<L> {
+    /// Every relay-held log under `channel`, as full ranges: what Subscribe migrates.
+    fn relay_logs_under(&self, channel: &L::Channel) -> LogRanges<L> {
         LogRanges::from_pairs(
             self.relay
                 .0
                 .held_all()
                 .iter()
-                .filter(|(log, _)| log.prefix() == *prefix)
+                .filter(|(log, _)| log.channel() == *channel)
                 .map(|(log, _)| (*log, Ranges::full())),
         )
     }
@@ -107,17 +107,17 @@ impl<N: Id, L: Log, T: polestar::time::TimeInterval> NodeState<N, L, T> {
 }
 
 impl<N: Id, L: Log + Default, T: polestar::time::TimeInterval> NodeState<N, L, T> {
-    /// A fresh node with empty stores, subscribed to the prefixes in
+    /// A fresh node with empty stores, subscribed to the channels in
     /// `subscriptions`; the router starts with the (empty) held snapshot
-    /// and those prefixes open.
+    /// and those channels open.
     pub fn new(
         id: N,
         machine: NodeMachine<N, L, T>,
-        subscriptions: impl IntoIterator<Item = L::Prefix>,
+        subscriptions: impl IntoIterator<Item = L::Channel>,
     ) -> Self {
         let relay = RelayStoreState::default();
         let ext = ExtStoreState::default();
-        let subscriptions: BTreeSet<L::Prefix> = subscriptions.into_iter().collect();
+        let subscriptions: BTreeSet<L::Channel> = subscriptions.into_iter().collect();
         let held = held_union(&relay, &ext);
         let mut router = RouterState::new(id, held);
         router.open = subscriptions.clone();
@@ -140,12 +140,12 @@ pub enum NodeAction<N, L: Log, T> {
     Recv(WireMessage<N, L>),
     /// Locally authored data: ingest to `ext`, then `Push` to the router.
     Authored(L, Seq, Op),
-    /// Start caring about every log under a prefix: migrate relay-side
-    /// bytes for them to ext and open the prefix on the router.
-    Subscribe(L::Prefix),
-    /// Stop caring about a prefix: close it on the router. Nothing is
+    /// Start caring about every log under a channel: migrate relay-side
+    /// bytes for them to ext and open the channel on the router.
+    Subscribe(L::Channel),
+    /// Stop caring about a channel: close it on the router. Nothing is
     /// migrated or forgotten; later Haves under it park in the relay.
-    Unsubscribe(L::Prefix),
+    Unsubscribe(L::Channel),
     /// The application synced natively (out of band) into `ext`.
     NativeSync(L, Seq, Op),
     /// The application GC'd its own store.
@@ -245,13 +245,13 @@ where
                 WireBody::Want {
                     origin,
                     ranges,
-                    prefixes,
+                    channels,
                 } => {
                     let fx = s.router.step(RouterAction::RecvWant {
                         from: wire.sender,
                         origin,
                         ranges,
-                        prefixes,
+                        channels,
                     })?;
                     self.route_router_fx(&mut s, fx, &BTreeMap::new(), &mut out)?;
                 }
@@ -280,9 +280,9 @@ where
                 let fx = s.router.step(RouterAction::Push(ranges))?;
                 self.route_router_fx(&mut s, fx, &BTreeMap::new(), &mut out)?;
             }
-            NodeAction::Subscribe(prefix) => {
-                s.subscriptions.insert(prefix);
-                let under = s.relay_logs_under(&prefix);
+            NodeAction::Subscribe(channel) => {
+                s.subscriptions.insert(channel);
+                let under = s.relay_logs_under(&channel);
                 if !under.is_empty() {
                     for (log, seq, op) in s.relay.0.fetch(&under) {
                         s.ext.step(ExtStoreAction::Ingest(log, seq, op))?;
@@ -292,8 +292,8 @@ where
                 s.router.step(RouterAction::Open(s.subscriptions.clone()))?;
                 self.reconcile_held(&mut s)?;
             }
-            NodeAction::Unsubscribe(prefix) => {
-                s.subscriptions.remove(&prefix);
+            NodeAction::Unsubscribe(channel) => {
+                s.subscriptions.remove(&channel);
                 s.router.step(RouterAction::Open(s.subscriptions.clone()))?;
                 self.reconcile_held(&mut s)?;
             }
@@ -392,13 +392,13 @@ where
                 Effect::SendWant {
                     origin,
                     ranges,
-                    prefixes,
+                    channels,
                 } => {
                     out.push(NodeEffect::Broadcast(WireMessage::want(
                         s.router.id,
                         origin,
                         ranges,
-                        prefixes,
+                        channels,
                     )));
                 }
                 Effect::SendHave(r) => {

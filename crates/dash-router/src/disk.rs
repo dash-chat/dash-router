@@ -1,6 +1,6 @@
 //! Redb-backed disk relay store (spec §6.2): a single `ops` table keyed
 //! `log bytes ++ seq BE`, so both `held_all` and `fetch` are ordered
-//! prefix scans per log. `held`/`payloads` are the same summaries `OpsMap`
+//! key-range scans per log. `held`/`payloads` are the same summaries `OpsMap`
 //! computes on the fly, but here they are scanned once at `open` and then
 //! maintained incrementally, since this store is always the sole writer to
 //! its file. `usage` (fix round 3, finding 2) is NOT an independently
@@ -52,8 +52,8 @@ impl LogKey for [u8; 32] {
     }
 }
 
-/// Two 32-byte halves (Dash Chat: `LogId ++ author`), prefix first so a
-/// prefix's logs are one contiguous key range.
+/// Two 32-byte halves (Dash Chat: `LogId ++ author`), channel first so a
+/// channel's logs are one contiguous key range.
 impl LogKey for [u8; 64] {
     const WIDTH: usize = 64;
 
@@ -267,7 +267,7 @@ impl<L: LogKey> DiskRelayStore<L> {
     }
 
     /// Recompute `held`/`payloads` for exactly this log from a fresh
-    /// prefix scan: eviction is rare, so recompute-per-touched-log keeps
+    /// key-range scan: eviction is rare, so recompute-per-touched-log keeps
     /// the incremental cache trivially correct rather than requiring a
     /// delta-tracking eviction path.
     ///
@@ -796,7 +796,7 @@ mod tests {
     /// `L::WIDTH + 4` used to panic (`row_seq`'s `.expect(...)`, `u32`'s
     /// `read_key`'s `.expect(...)`); it must instead be skipped and
     /// counted. Faked cheaply by hand-inserting a too-short raw key
-    /// directly through redb. `fetch`'s per-log prefix scan never even
+    /// directly through redb. `fetch`'s per-log channel scan never even
     /// visits a key this malformed (it falls outside every `u32` log's
     /// 8-byte bounds), so this specifically exercises `open`'s unscoped
     /// full-table scan, which does visit it.

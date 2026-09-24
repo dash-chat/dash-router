@@ -312,7 +312,7 @@ fn ext_spontaneity_reconciles_and_smuggled_recvs_are_disabled() {
                 from: n(1),
                 origin: n(1),
                 ranges: lr([(0, Ranges::full())]),
-                prefixes: BTreeSet::new(),
+                channels: BTreeSet::new(),
             })
         )
         .is_err()
@@ -456,7 +456,7 @@ fn eviction_candidates_cover_everything_when_nothing_is_wanted() {
     assert_eq!(s.eviction_candidates(), s.relay.0.held_payloads());
 }
 
-mod prefix {
+mod channel {
     use std::collections::BTreeSet;
     use std::time::Duration;
 
@@ -494,9 +494,9 @@ mod prefix {
         )
     }
 
-    /// Review focus 1: a never-seen author under a subscribed prefix is ext data.
+    /// Review focus 1: a never-seen author under a subscribed channel is ext data.
     #[test]
-    fn have_for_new_author_under_subscribed_prefix_is_delivered() {
+    fn have_for_new_author_under_subscribed_channel_is_delivered() {
         let m = machine();
         let s = NodeState::new(0u32, m.clone(), [1u8]);
         let new_author = Pair::new(1, 42);
@@ -512,9 +512,9 @@ mod prefix {
         assert!(s.relay.0.held_all().get(&new_author).is_none());
     }
 
-    /// Subscribe(prefix) migrates every author's relay log under it to ext.
+    /// Subscribe(channel) migrates every author's relay log under it to ext.
     #[test]
-    fn subscribe_prefix_migrates_all_relay_logs_under_it() {
+    fn subscribe_channel_migrates_all_relay_logs_under_it() {
         let m = machine();
         let s = NodeState::new(0u32, m.clone(), []); // pure relay
         let a1 = Pair::new(1, 1);
@@ -541,7 +541,7 @@ mod prefix {
 
     /// Review focus 3.
     #[test]
-    fn unsubscribe_prefix_parks_later_haves_in_relay() {
+    fn unsubscribe_channel_parks_later_haves_in_relay() {
         let m = machine();
         let s = NodeState::new(0u32, m.clone(), [1u8]);
         let (s, _) = m.transition(s, NodeAction::Unsubscribe(1u8)).unwrap();
@@ -554,10 +554,10 @@ mod prefix {
         assert_eq!(s.relay.0.held_all().get(&a1), Some(&Ranges::range(0, 1)));
     }
 
-    /// The prefix Want replaces the known-but-empty marker: a subscription
-    /// with nothing stored sends `prefixes`, not a full range for a log.
+    /// The channel Want replaces the known-but-empty marker: a subscription
+    /// with nothing stored sends `channels`, not a full range for a log.
     #[test]
-    fn empty_subscription_wants_by_prefix_not_marker() {
+    fn empty_subscription_wants_by_channel_not_marker() {
         let m = machine();
         let s = NodeState::new(0u32, m.clone(), [1u8]);
         assert!(s.held_union().is_empty(), "no marker");
@@ -576,10 +576,10 @@ mod prefix {
                     WireBody::Want {
                         origin,
                         ranges,
-                        prefixes,
+                        channels,
                     },
                 ..
-            }) => Some((*origin, ranges.clone(), prefixes.clone())),
+            }) => Some((*origin, ranges.clone(), channels.clone())),
             _ => None,
         });
         assert_eq!(

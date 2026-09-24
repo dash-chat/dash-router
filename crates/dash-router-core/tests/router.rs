@@ -77,7 +77,7 @@ fn a_want_floods_once_per_hop_and_never_echoes() {
             from: n(0),
             origin: n(0),
             ranges: full.clone(),
-            prefixes: BTreeSet::new(),
+            channels: BTreeSet::new(),
         })
         .unwrap();
     assert_eq!(sends_want(&fx), vec![&full]);
@@ -88,7 +88,7 @@ fn a_want_floods_once_per_hop_and_never_echoes() {
             from: n(0),
             origin: n(0),
             ranges: full.clone(),
-            prefixes: BTreeSet::new(),
+            channels: BTreeSet::new(),
         })
         .unwrap();
     assert!(
@@ -103,7 +103,7 @@ fn a_want_floods_once_per_hop_and_never_echoes() {
             from: n(0),
             origin: n(0),
             ranges: full.clone(),
-            prefixes: BTreeSet::new(),
+            channels: BTreeSet::new(),
         })
         .unwrap();
     assert_eq!(sends_want(&fx), vec![&full], "relays again after expiry");
@@ -255,7 +255,7 @@ fn want_then_have_backfills_a_late_subscriber() {
         from: n(1),
         origin: n(1),
         ranges: lr([(0, Ranges::full())]),
-        prefixes: BTreeSet::new(),
+        channels: BTreeSet::new(),
     })
     .unwrap();
     a.step(A::ArmHaveTimer(t(0))).unwrap();
@@ -287,7 +287,7 @@ fn want_timer_follows_the_fetch_timed_idiom() {
     assert!(a.want_timer.is_none(), "must re-arm explicitly");
 }
 
-mod prefix {
+mod channel {
     use std::collections::BTreeSet;
     use std::time::Duration;
 
@@ -321,17 +321,17 @@ mod prefix {
     fn sent_want(fx: &[Effect<u32, Pair>]) -> Option<(LogRanges<Pair>, BTreeSet<u8>)> {
         fx.iter().find_map(|e| match e {
             Effect::SendWant {
-                ranges, prefixes, ..
-            } => Some((ranges.clone(), prefixes.clone())),
+                ranges, channels, ..
+            } => Some((ranges.clone(), channels.clone())),
             _ => None,
         })
     }
 
-    /// Spec §3.5: a prefix Want is answered with every held log under the
-    /// prefix that the wanter did not name explicitly; a log it named gets
+    /// Spec §3.5: a channel Want is answered with every held log under the
+    /// channel that the wanter did not name explicitly; a log it named gets
     /// only its named ranges.
     #[test]
-    fn prefix_want_excludes_logs_the_wanter_named() {
+    fn channel_want_excludes_logs_the_wanter_named() {
         let m = machine();
         let a1 = Pair::new(1, 1);
         let a2 = Pair::new(1, 2);
@@ -344,7 +344,7 @@ mod prefix {
                 (other, Ranges::range(0, 3)),
             ]),
         );
-        // Peer 7 holds a1 up to 4 and wants its tail; knows nothing else under prefix 1.
+        // Peer 7 holds a1 up to 4 and wants its tail; knows nothing else under channel 1.
         let (s, _) = m
             .transition(
                 s,
@@ -352,7 +352,7 @@ mod prefix {
                     from: 7,
                     origin: 7,
                     ranges: held(&[(a1, Ranges::from(4))]),
-                    prefixes: BTreeSet::from([1u8]),
+                    channels: BTreeSet::from([1u8]),
                 },
             )
             .unwrap();
@@ -369,14 +369,14 @@ mod prefix {
         assert_eq!(
             have.get(&a2),
             Some(&Ranges::range(0, 5)),
-            "unnamed log under prefix: wholesale"
+            "unnamed log under channel: wholesale"
         );
-        assert_eq!(have.get(&other), None, "other prefix: untouched");
+        assert_eq!(have.get(&other), None, "other channel: untouched");
     }
 
-    /// `Open` prefixes ride on every own Want even when no ranges are wanted.
+    /// `Open` channels ride on every own Want even when no ranges are wanted.
     #[test]
-    fn open_prefixes_are_sent_with_fire_want() {
+    fn open_channels_are_sent_with_fire_want() {
         let m = machine();
         let s = RouterState::new(0u32, LogRanges::empty());
         let (s, _) = m
@@ -386,21 +386,21 @@ mod prefix {
             .transition(s, A::ArmWantTimer(Duration::ZERO.into()))
             .unwrap();
         let (_, fx) = m.transition(s, A::FireWant).unwrap();
-        let (ranges, prefixes) = sent_want(&fx).expect("a Want is sent");
+        let (ranges, channels) = sent_want(&fx).expect("a Want is sent");
         assert!(ranges.is_empty());
-        assert_eq!(prefixes, BTreeSet::from([4u8, 5u8]));
+        assert_eq!(channels, BTreeSet::from([4u8, 5u8]));
     }
 
-    /// A received Want's prefixes are relayed once (seen-set), like ranges.
+    /// A received Want's channels are relayed once (seen-set), like ranges.
     #[test]
-    fn received_prefixes_are_relayed_once() {
+    fn received_channels_are_relayed_once() {
         let m = machine();
         let s = RouterState::new(0u32, LogRanges::empty());
         let want = |from| A::RecvWant {
             from,
             origin: from,
             ranges: LogRanges::empty(),
-            prefixes: BTreeSet::from([9u8]),
+            channels: BTreeSet::from([9u8]),
         };
         let (s, fx1) = m.transition(s, want(1)).unwrap();
         assert_eq!(sent_want(&fx1).map(|(_, p)| p), Some(BTreeSet::from([9u8])));
@@ -408,9 +408,9 @@ mod prefix {
         assert!(sent_want(&fx2).is_none(), "already relayed within want_ttl");
     }
 
-    /// Eviction policy input: logs under a peer's wanted prefix count as wanted.
+    /// Eviction policy input: logs under a peer's wanted channel count as wanted.
     #[test]
-    fn others_wants_includes_held_logs_under_wanted_prefixes() {
+    fn others_wants_includes_held_logs_under_wanted_channels() {
         let m = machine();
         let a1 = Pair::new(1, 1);
         let s = RouterState::new(0u32, held(&[(a1, Ranges::range(0, 10))]));
@@ -421,19 +421,19 @@ mod prefix {
                     from: 7,
                     origin: 7,
                     ranges: LogRanges::empty(),
-                    prefixes: BTreeSet::from([1u8]),
+                    channels: BTreeSet::from([1u8]),
                 },
             )
             .unwrap();
         assert_eq!(s.others_wants().get(&a1), Some(&Ranges::range(0, 10)));
     }
 
-    /// Spec §3.5: a log this node knows under its own open prefix stays
+    /// Spec §3.5: a log this node knows under its own open channel stays
     /// named in its Want even when a peer already wants the same ranges,
     /// or answerers would treat it as unnamed and send it wholesale. Logs
-    /// under other prefixes are still suppressed as before.
+    /// under other channels are still suppressed as before.
     #[test]
-    fn logs_under_own_open_prefix_stay_named_when_suppressed() {
+    fn logs_under_own_open_channel_stay_named_when_suppressed() {
         let m = machine();
         let a1 = Pair::new(1, 1);
         let b1 = Pair::new(2, 1);
@@ -442,7 +442,7 @@ mod prefix {
             held(&[(a1, Ranges::range(0, 4)), (b1, Ranges::range(0, 4))]),
         );
         let (s, _) = m.transition(s, A::Open(BTreeSet::from([1u8]))).unwrap();
-        // Peer Y already wants both open tails, with no prefixes.
+        // Peer Y already wants both open tails, with no channels.
         let (s, _) = m
             .transition(
                 s,
@@ -450,7 +450,7 @@ mod prefix {
                     from: 7,
                     origin: 7,
                     ranges: held(&[(a1, Ranges::from(4)), (b1, Ranges::from(4))]),
-                    prefixes: BTreeSet::new(),
+                    channels: BTreeSet::new(),
                 },
             )
             .unwrap();
@@ -458,25 +458,25 @@ mod prefix {
             .transition(s, A::ArmWantTimer(Duration::ZERO.into()))
             .unwrap();
         let (_, fx) = m.transition(s, A::FireWant).unwrap();
-        let (ranges, prefixes) = sent_want(&fx).expect("a Want is sent");
-        assert_eq!(prefixes, BTreeSet::from([1u8]));
+        let (ranges, channels) = sent_want(&fx).expect("a Want is sent");
+        assert_eq!(channels, BTreeSet::from([1u8]));
         assert_eq!(
             ranges.get(&a1),
             Some(&Ranges::from(4)),
-            "log under own open prefix stays named"
+            "log under own open channel stays named"
         );
         assert_eq!(
             ranges.get(&b1),
             None,
-            "log under another prefix is suppressed"
+            "log under another channel is suppressed"
         );
     }
 
-    /// A relayed prefix Want keeps the wanter's named ranges, even ranges
+    /// A relayed channel Want keeps the wanter's named ranges, even ranges
     /// this relayer already relayed for someone else, so a two-hop
     /// answerer never sends a named log wholesale.
     #[test]
-    fn relayed_prefixes_carry_the_wanters_named_ranges() {
+    fn relayed_channels_carry_the_wanters_named_ranges() {
         let m = machine();
         let a1 = Pair::new(1, 1);
         let s = RouterState::new(0u32, LogRanges::empty());
@@ -489,12 +489,12 @@ mod prefix {
                     from: 1,
                     origin: 1,
                     ranges: tail(),
-                    prefixes: BTreeSet::new(),
+                    channels: BTreeSet::new(),
                 },
             )
             .unwrap();
         assert!(sent_want(&fx).is_some(), "Y's Want is relayed");
-        // X names the same tail and adds prefix 1.
+        // X names the same tail and adds channel 1.
         let (s, fx) = m
             .transition(
                 s,
@@ -502,16 +502,16 @@ mod prefix {
                     from: 2,
                     origin: 2,
                     ranges: tail(),
-                    prefixes: BTreeSet::from([1u8]),
+                    channels: BTreeSet::from([1u8]),
                 },
             )
             .unwrap();
-        let (ranges, prefixes) = sent_want(&fx).expect("X's Want is relayed");
-        assert_eq!(prefixes, BTreeSet::from([1u8]));
+        let (ranges, channels) = sent_want(&fx).expect("X's Want is relayed");
+        assert_eq!(channels, BTreeSet::from([1u8]));
         assert_eq!(
             ranges.get(&a1),
             Some(&Ranges::from(4)),
-            "named ranges travel with the prefixes"
+            "named ranges travel with the channels"
         );
         // Z repeats X's Want: both halves already relayed.
         let (_, fx) = m
@@ -521,7 +521,7 @@ mod prefix {
                     from: 3,
                     origin: 3,
                     ranges: tail(),
-                    prefixes: BTreeSet::from([1u8]),
+                    channels: BTreeSet::from([1u8]),
                 },
             )
             .unwrap();
@@ -533,9 +533,9 @@ mod prefix {
     }
 
     /// A Want split across wire messages (the shell's `pack_want` puts
-    /// prefixes and ranges in different pieces) is recorded whole: the
+    /// channels and ranges in different pieces) is recorded whole: the
     /// pieces union, and a log named in one piece is still answered by name,
-    /// not wholesale, even though another piece carries its prefix.
+    /// not wholesale, even though another piece carries its channel.
     #[test]
     fn split_wants_from_one_peer_accumulate() {
         let m = machine();
@@ -552,7 +552,7 @@ mod prefix {
                     from: 7,
                     origin: 7,
                     ranges: held(&[(a1, Ranges::from(5))]),
-                    prefixes: BTreeSet::new(),
+                    channels: BTreeSet::new(),
                 },
             )
             .unwrap();
@@ -563,7 +563,7 @@ mod prefix {
                     from: 7,
                     origin: 7,
                     ranges: LogRanges::empty(),
-                    prefixes: BTreeSet::from([1u8]),
+                    channels: BTreeSet::from([1u8]),
                 },
             )
             .unwrap();
@@ -576,7 +576,7 @@ mod prefix {
         assert_eq!(
             have.get(&b1),
             Some(&Ranges::range(0, 10)),
-            "unnamed under the other piece's prefix: wholesale"
+            "unnamed under the other piece's channel: wholesale"
         );
         let (s, _) = m.transition(s, A::Tick(ms(501))).unwrap();
         assert!(s.wants.is_empty(), "every piece expires after want_ttl");
@@ -584,7 +584,7 @@ mod prefix {
 
     /// Final review F1: an answerer's own Want, echoed back by a relay,
     /// must not name logs on anyone else's behalf. C (id 2) holds two logs
-    /// under prefix 1; A (id 0) wants the prefix knowing nothing, via relay
+    /// under channel 1; A (id 0) wants the channel knowing nothing, via relay
     /// B (id 1). B also relays C's own Want back to C. The echo carries
     /// C's named tails; were it filed with A's interest, C would treat
     /// both logs as named and answer only the (unheld) tails, never the
@@ -607,7 +607,7 @@ mod prefix {
                     from: b,
                     origin: a,
                     ranges: LogRanges::empty(),
-                    prefixes: BTreeSet::from([1u8]),
+                    channels: BTreeSet::from([1u8]),
                 },
             )
             .unwrap();
@@ -619,14 +619,14 @@ mod prefix {
                     from: b,
                     origin: c,
                     ranges: held(&[(x, Ranges::from(4)), (y, Ranges::from(3))]),
-                    prefixes: BTreeSet::from([1u8]),
+                    channels: BTreeSet::from([1u8]),
                 },
             )
             .unwrap();
         assert_eq!(
             s.next_have(),
             held(&[(x, Ranges::range(0, 4)), (y, Ranges::range(0, 3))]),
-            "both logs go wholesale to the prefix wanter"
+            "both logs go wholesale to the channel wanter"
         );
         assert!(
             !s.wants.contains_key(&c),
@@ -650,7 +650,7 @@ mod prefix {
                     from: 7,
                     origin: 7,
                     ranges: held(&[(a1, Ranges::from(5))]),
-                    prefixes: BTreeSet::new(),
+                    channels: BTreeSet::new(),
                 },
             )
             .unwrap();
@@ -662,7 +662,7 @@ mod prefix {
                     from: 7,
                     origin: 7,
                     ranges: held(&[(a1, Ranges::from(8))]),
-                    prefixes: BTreeSet::new(),
+                    channels: BTreeSet::new(),
                 },
             )
             .unwrap();
