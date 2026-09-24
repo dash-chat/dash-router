@@ -8,19 +8,30 @@
 //! log id names across authors is a channel. At the Dash Chat boundary
 //! `Channel` is p2panda's `LogId`.
 
-use polestar::prelude::Id;
+use polestar::{id::IdUnit, prelude::Id};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub trait Log: Id {
+    /// The half shared across authors; what a subscription names.
     type Channel: Id;
+    /// The per-author half.
+    type Author: Id;
     fn channel(&self) -> Self::Channel;
+    fn author(&self) -> Self::Author;
+    /// Inverse of `(channel(), author())`: for every `l`,
+    /// `Self::new(l.channel(), l.author()) == l`. A nested `LogRanges`
+    /// rebuilds ids through this when iterated.
+    fn new(channel: Self::Channel, author: Self::Author) -> Self;
 }
 
 macro_rules! self_channeled {
     ($($t:ty),* $(,)?) => {
         $(impl Log for $t {
             type Channel = Self;
+            type Author = IdUnit;
             fn channel(&self) -> Self { *self }
+            fn author(&self) -> IdUnit { IdUnit }
+            fn new(channel: Self, _: IdUnit) -> Self { channel }
         })*
     };
 }
@@ -34,19 +45,30 @@ where
     Self: Id,
 {
     type Channel = Self;
+    type Author = IdUnit;
     fn channel(&self) -> Self {
         *self
+    }
+    fn author(&self) -> IdUnit {
+        IdUnit
+    }
+    fn new(channel: Self, _: IdUnit) -> Self {
+        channel
     }
 }
 
 /// `Log` plus the serde bounds the wire needs on both halves. Blanket:
 /// nothing implements this by hand.
 pub trait WireLog:
-    Log<Channel: Serialize + DeserializeOwned> + Serialize + DeserializeOwned
+    Log<Channel: Serialize + DeserializeOwned, Author: Serialize + DeserializeOwned>
+    + Serialize
+    + DeserializeOwned
 {
 }
 impl<T> WireLog for T where
-    T: Log<Channel: Serialize + DeserializeOwned> + Serialize + DeserializeOwned
+    T: Log<Channel: Serialize + DeserializeOwned, Author: Serialize + DeserializeOwned>
+        + Serialize
+        + DeserializeOwned
 {
 }
 
@@ -75,8 +97,15 @@ impl std::fmt::Display for Pair {
 
 impl Log for Pair {
     type Channel = u8;
+    type Author = u8;
     fn channel(&self) -> u8 {
         self.channel
+    }
+    fn author(&self) -> u8 {
+        self.author
+    }
+    fn new(channel: u8, author: u8) -> Self {
+        Self { channel, author }
     }
 }
 
@@ -119,5 +148,22 @@ mod tests {
         wire::<u8>();
         wire::<u32>();
         wire::<Pair>();
+    }
+
+    #[test]
+    fn new_is_the_inverse_of_channel_and_author() {
+        let p = Pair::new(3, 9);
+        assert_eq!(Pair::new(p.channel(), p.author()), p);
+        assert_eq!(<u8 as Log>::new(7u8.channel(), 7u8.author()), 7u8);
+        assert_eq!(<u32 as Log>::new(9u32.channel(), 9u32.author()), 9u32);
+    }
+
+    #[test]
+    fn single_author_ids_have_the_unit_author() {
+        assert_eq!(5u8.author(), polestar::id::IdUnit);
+        assert_eq!(
+            polestar::id::UpTo::<4>::new(2).author(),
+            polestar::id::IdUnit
+        );
     }
 }
