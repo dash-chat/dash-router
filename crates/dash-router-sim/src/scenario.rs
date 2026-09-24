@@ -20,7 +20,7 @@ use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    LogId, NodeId, SimNet, SimNetState,
+    LogId, Metrics, NodeId, SimNet, SimNetState,
     behavior::{SimBehavior, SimParams},
     policy::IntervalPolicy,
     sim::Simulation,
@@ -266,6 +266,7 @@ impl ScenarioSpec {
                 .collect();
             NodeState::new(id, node_machine.clone(), subs)
         }));
+        let expected = self.expected_coverage();
         let params = SimParams {
             n: self.nodes as usize,
             loss: self.loss,
@@ -277,7 +278,7 @@ impl ScenarioSpec {
             payload_bytes: self.workload.payload_bytes,
             duration,
             sample_interval: ms(defaults.sample_interval_ms),
-            expected: self.expected_coverage(),
+            expected: expected.clone(),
             relay_cap: self.storage.relay_cap,
             evict_at: self.storage.evict_at,
             maintain_interval: self.storage.maintain_interval_ms.map(ms),
@@ -290,7 +291,13 @@ impl ScenarioSpec {
         );
         let behavior = SimBehavior::new(topology.clone(), params, seed);
         let net = SimNet::new(topology, node_machine);
-        Ok(Simulation::new(net, state, behavior, duration))
+        Ok(Simulation::new(
+            net,
+            state,
+            behavior,
+            Metrics::new(expected),
+            duration,
+        ))
     }
 
     pub fn seeds(&self, defaults: &Defaults) -> u64 {

@@ -4,27 +4,33 @@ use std::{sync::Arc, time::Duration};
 
 use polestar::{StateMachine, prelude::*};
 
-use crate::{RunRecord, SimBehavior, SimNet, SimNetState};
+use crate::{Meter, Metered, Metrics, RunRecord, SimBehavior, SimNet, SimNetState};
 
 type Model = BehaviorModel<SimBehavior>;
 
 /// A single seeded simulation run.
 ///
 /// The whole run is one deterministic machine — behavior state (queue,
-/// RNG, collectors) rides inside the model state — so [`Self::jump_to`]
-/// works by replay from the initial state, exactly.
+/// RNG) and the meter's collectors both ride inside the model state — so
+/// [`Self::jump_to`] works by replay from the initial state, exactly.
 pub struct Simulation {
     machine: Arc<Model>,
     sm: StateMachine<Model>,
-    initial: (SimBehavior, SimNetState),
+    initial: StateOf<Model>,
     steps: usize,
     duration: Duration,
 }
 
 impl Simulation {
-    pub fn new(net: SimNet, state: SimNetState, behavior: SimBehavior, duration: Duration) -> Self {
-        let machine = Arc::new(BehaviorModel::new(net));
-        let initial = (behavior, state);
+    pub fn new(
+        net: SimNet,
+        state: SimNetState,
+        behavior: SimBehavior,
+        metrics: Metrics,
+        duration: Duration,
+    ) -> Self {
+        let machine = Arc::new(BehaviorModel::new(Metered::new(net)));
+        let initial = (behavior, (state, Meter::new(metrics)));
         let sm = machine.state_machine(initial.clone());
         Self {
             machine,
@@ -40,7 +46,11 @@ impl Simulation {
     }
 
     pub fn net_state(&self) -> &SimNetState {
-        &self.sm.state().1
+        &self.sm.state().1.0
+    }
+
+    pub fn metrics(&self) -> &Metrics {
+        &self.sm.state().1.1.metrics
     }
 
     pub fn steps(&self) -> usize {
@@ -68,7 +78,7 @@ impl Simulation {
         if at > self.duration
             && !b.has_pending_traffic()
             && self.net_state().inflight.is_empty()
-            && b.metrics.all_covered()
+            && self.metrics().all_covered()
         {
             return Ok(false);
         }
@@ -80,7 +90,7 @@ impl Simulation {
     /// Run to completion and freeze the metrics.
     pub fn run(&mut self, seed: u64) -> anyhow::Result<RunRecord> {
         while self.step()? {}
-        Ok(self.behavior().metrics.finish(seed))
+        Ok(self.metrics().finish(&self.behavior().driver, seed))
     }
 
     /// Rewind to just after step `step` by replay from the initial state.
