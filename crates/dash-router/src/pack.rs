@@ -8,9 +8,21 @@ use dash_router_core::{LogRanges, Op, Seq, WireLog, WireMessage, group_ops};
 use polestar::prelude::Id;
 use serde::{Serialize, de::DeserializeOwned};
 
-/// p2panda-net's default `max_message_size` (4096) minus room for Dash
-/// Chat's signed CBOR envelope (~150 bytes) and slack.
-pub const DEFAULT_MAX_WIRE_BYTES: usize = 3800;
+/// Bytes kept free under the gossip layer's `max_message_size`: Dash
+/// Chat's signed CBOR envelope (~150 bytes), iroh-gossip's per-message
+/// framing (p2panda-net checks only the payload against the limit), and
+/// slack.
+pub const WIRE_HEADROOM_BYTES: usize = 296;
+
+/// [`wire_budget`] of p2panda-net's default `max_message_size` (4096);
+/// the budget for a transport that reports no limit.
+pub const DEFAULT_MAX_WIRE_BYTES: usize = wire_budget(4096);
+
+/// The packing budget for an overlay whose messages are capped at
+/// `max_message_size` bytes.
+pub const fn wire_budget(max_message_size: usize) -> usize {
+    max_message_size.saturating_sub(WIRE_HEADROOM_BYTES)
+}
 
 fn have_len<N, L>(sender: N, batch: &[(L, Seq, Op)]) -> usize
 where

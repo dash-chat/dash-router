@@ -47,8 +47,16 @@ pub struct Incoming {
 #[trait_variant::make(Send)]
 pub trait Transport {
     async fn broadcast(&mut self, bytes: Vec<u8>) -> Result<()>;
+
     /// `None` = the transport has shut down.
     async fn recv(&mut self) -> Option<Incoming>;
+
+    /// The largest message the underlying overlay accepts, when it has a
+    /// limit; the shell sizes its broadcasts from it (see
+    /// [`CoreConfig::max_wire_bytes`](crate::CoreConfig::max_wire_bytes)).
+    fn max_message_size(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// An in-process broadcast domain: every joined transport hears every
@@ -127,6 +135,12 @@ pub trait GossipPublisher {
     /// is unusable, not for a transient hiccup (gossip is lossy anyway;
     /// swallowing a dropped message is always safe).
     async fn publish(&mut self, bytes: Vec<u8>) -> Result<()>;
+    /// The overlay's message size limit, as [`Transport::max_message_size`].
+    /// For p2panda's ephemeral stream this is
+    /// `EphemeralStreamPublisher::max_message_size`.
+    fn max_message_size(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[trait_variant::make(Send)]
@@ -173,6 +187,10 @@ impl<P: GossipPublisher, S: GossipSubscription> Transport for GossipTransport<P,
             author: Some(author),
             bytes,
         })
+    }
+
+    fn max_message_size(&self) -> Option<usize> {
+        self.publisher.max_message_size()
     }
 }
 
@@ -222,6 +240,27 @@ mod gossip_tests {
             None,
             "closed subscription = transport shut down"
         );
+    }
+
+    struct LimitedPub(usize);
+    impl GossipPublisher for LimitedPub {
+        async fn publish(&mut self, _bytes: Vec<u8>) -> Result<()> {
+            Ok(())
+        }
+        fn max_message_size(&self) -> Option<usize> {
+            Some(self.0)
+        }
+    }
+
+    #[test]
+    fn gossip_transport_reports_the_publishers_limit() {
+        let (_sub_tx, sub_rx) = mpsc::channel(1);
+        let t = GossipTransport::new(LimitedPub(9000), ChanSub(sub_rx));
+        assert_eq!(t.max_message_size(), Some(9000));
+        let (_sub_tx, sub_rx) = mpsc::channel(1);
+        let (pub_tx, _pub_rx) = mpsc::channel(1);
+        let t = GossipTransport::new(ChanPub(pub_tx), ChanSub(sub_rx));
+        assert_eq!(t.max_message_size(), None, "no limit unless reported");
     }
 }
 

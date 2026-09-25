@@ -54,6 +54,10 @@ use tokio::sync::{broadcast, watch};
 
 use crate::transport::{Incoming, PeerIdentity, PeerKey, Transport};
 
+/// Re-exported so a standalone embedder can configure [`spawn_panda`]
+/// without depending on p2panda-net itself.
+pub use p2panda_net::gossip::GossipConfig;
+
 impl From<VerifyingKey> for PeerKey {
     fn from(k: VerifyingKey) -> Self {
         PeerKey(*k.as_bytes())
@@ -104,7 +108,15 @@ pub struct PandaTransport {
 /// Spawn a p2panda-net node identified by `private_key` and join the
 /// well-known gossip topic. Returns the transport and the node's public
 /// key, which is the wire identity `N`.
-pub async fn spawn_panda(private_key: SigningKey) -> Result<(PandaTransport, VerifyingKey)> {
+///
+/// The transport reports `gossip.max_message_size` as its
+/// [`Transport::max_message_size`], so the shell sizes its broadcasts to
+/// it. Every node on the overlay must use the same value, since gossip
+/// drops frames over the receiver's limit.
+pub async fn spawn_panda(
+    private_key: SigningKey,
+    gossip: GossipConfig,
+) -> Result<(PandaTransport, VerifyingKey)> {
     let address_book = AddressBook::builder()
         .spawn()
         .await
@@ -135,6 +147,7 @@ pub async fn spawn_panda(private_key: SigningKey) -> Result<(PandaTransport, Ver
         .context("spawning p2panda discovery")?;
 
     let gossip = Gossip::builder(address_book.clone(), endpoint.clone())
+        .config(gossip)
         .spawn()
         .await
         .context("spawning gossip")?;
@@ -226,6 +239,10 @@ impl Transport for PandaTransport {
             .map_err(|err| anyhow::anyhow!("gossip publish failed: {err}"))
     }
 
+    fn max_message_size(&self) -> Option<usize> {
+        Some(self.handle.max_message_size())
+    }
+
     async fn recv(&mut self) -> Option<Incoming> {
         loop {
             match self.subscription.next().await {
@@ -255,34 +272,60 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "binds real sockets and mDNS; run manually: cargo test -p dash-router --features p2panda -- --ignored"]
-    async fn two_panda_nodes_gossip_on_localhost() {
-        let (mut a, _a_key) = spawn_panda(SigningKey::generate())
+    /// Serializes the tests below: they share the one well-known topic, and
+    /// nodes with different `max_message_size` must not share an overlay.
+    static OVERLAY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Spawn two nodes with `gossip` and check B receives A's `probe` over
+    /// the real overlay.
+    async fn gossip_probe(gossip: GossipConfig, probe: Vec<u8>) {
+        let _serial = OVERLAY.lock().await;
+        let limit = gossip.max_message_size;
+        let (mut a, _a_key) = spawn_panda(SigningKey::generate(), gossip.clone())
             .await
             .expect("spawn node A");
-        let (mut b, _b_key) = spawn_panda(SigningKey::generate())
+        let (mut b, _b_key) = spawn_panda(SigningKey::generate(), gossip)
             .await
             .expect("spawn node B");
+        assert_eq!(a.max_message_size(), Some(limit));
 
         // Give mDNS + discovery a moment to find each other and populate
         // the gossip overlay before we start publishing.
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        let probe = b"hello from node A".to_vec();
-
         // Retry the broadcast: the overlay may still be converging.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        let mut got = None;
-        while tokio::time::Instant::now() < deadline && got.is_none() {
+        let mut got = false;
+        while tokio::time::Instant::now() < deadline && !got {
             a.broadcast(probe.clone()).await.expect("broadcast");
+            // Anything else on the LAN's overlay is not ours; skip it.
             got = tokio::time::timeout(Duration::from_millis(500), b.recv())
                 .await
                 .ok()
-                .flatten();
+                .flatten()
+                .is_some_and(|incoming| incoming.bytes == probe);
         }
 
-        let incoming = got.expect("node B receives node A's probe within 30s");
-        assert_eq!(incoming.bytes, probe);
+        assert!(got, "node B receives node A's probe within 30s");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "binds real sockets and mDNS; run manually: cargo test -p dash-router --features p2panda -- --ignored"]
+    async fn two_panda_nodes_gossip_on_localhost() {
+        gossip_probe(GossipConfig::default(), b"hello from node A".to_vec()).await;
+    }
+
+    /// A raised gossip `max_message_size` is reported by the transport, and
+    /// a broadcast of the matching wire budget -- past p2panda's default
+    /// 4096 bytes -- is published and delivered rather than refused.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "binds real sockets and mDNS; run manually: cargo test -p dash-router --features p2panda -- --ignored"]
+    async fn raised_max_message_size_carries_large_messages() {
+        let gossip = GossipConfig {
+            max_message_size: 16 * 1024,
+            ..GossipConfig::default()
+        };
+        let probe = vec![0xAB; crate::pack::wire_budget(gossip.max_message_size)];
+        gossip_probe(gossip, probe).await;
     }
 }

@@ -281,7 +281,7 @@ impl<L: TestLog> Driver<L> {
             // few-byte ops), so packing never splits a broadcast here and the
             // exact `broadcasts` comparison below stays one-to-one with the
             // model's single Want/Have.
-            max_wire_bytes: dash_router::pack::DEFAULT_MAX_WIRE_BYTES,
+            max_wire_bytes: None,
         };
         let mut core = NodeCore::new(
             0u32,

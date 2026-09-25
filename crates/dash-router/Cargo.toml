@@ -19,12 +19,19 @@ tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 trait-variant = "0.1"
 tracing = "0.1"
 redb = "4.3.0"
-p2panda-net = { version = "0.7", optional = true }
-p2panda-core = { version = "0.7", optional = true }
+p2panda-core = { git = "https://github.com/dash-chat/p2panda", rev = "64bc5b54", optional = true }
+p2panda-net = { git = "https://github.com/dash-chat/p2panda", rev = "64bc5b54", optional = true }
 futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 rand_chacha = { workspace = true }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }
+tokio = { version = "1", features = [
+  "rt",
+  "rt-multi-thread",
+  "sync",
+  "time",
+  "macros",
+  "test-util",
+] }
 tempfile = "3"

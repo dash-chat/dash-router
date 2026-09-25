@@ -18,6 +18,9 @@ serde = { version = "1", features = ["derive"] }
 serde_norway = "0.9"
 postcard = { version = "1", features = ["use-std"] }
 
-# Uncomment to develop against a local polestar checkout.
-[patch."https://github.com/maackle/polestar-rs.git"]
-polestar = { path = "/home/michael/proj/polestar-rs/polestar" }
+# [patch."https://github.com/maackle/polestar-rs.git"]
+# polestar = { path = "/home/michael/proj/polestar-rs/polestar" }
+
+# [patch.crates-io]
+# p2panda-core = { path = "/home/michael/work/p2panda/p2panda-core" }
+# p2panda-net = { path = "/home/michael/work/p2panda/p2panda-net" }

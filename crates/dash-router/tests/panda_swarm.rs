@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use dash_router::panda::{PandaTransport, spawn_panda};
+use dash_router::panda::{GossipConfig, PandaTransport, spawn_panda};
 use dash_router::{CoreConfig, MemStore, PolicyIntervals, RouterEvent, RouterHandle, spawn};
 use dash_router_core::{Op, OpsMap, RouterConfig, Storage};
 use dash_router_policy::{IntervalPolicy, PushDebouncePolicy};
@@ -52,7 +52,7 @@ fn config() -> CoreConfig {
             window_ms: 50,
             max_latency_ms: 200,
         },
-        max_wire_bytes: dash_router::pack::DEFAULT_MAX_WIRE_BYTES,
+        max_wire_bytes: None,
     }
 }
 
@@ -90,9 +90,10 @@ struct Node {
 }
 
 async fn spawn_node(i: usize) -> Node {
-    let (transport, key): (PandaTransport, VerifyingKey) = spawn_panda(SigningKey::generate())
-        .await
-        .unwrap_or_else(|e| panic!("spawn p2panda node {i}: {e:#}"));
+    let (transport, key): (PandaTransport, VerifyingKey) =
+        spawn_panda(SigningKey::generate(), GossipConfig::default())
+            .await
+            .unwrap_or_else(|e| panic!("spawn p2panda node {i}: {e:#}"));
     let neighbours = transport.neighbours();
     let ext = MemStore::<Log>::new();
     // The wire identity `N` is the node's p2panda public key (spec §6),

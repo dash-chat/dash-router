@@ -25,7 +25,7 @@ fn config() -> CoreConfig {
             window_ms: 50,
             max_latency_ms: 200,
         },
-        max_wire_bytes: dash_router::pack::DEFAULT_MAX_WIRE_BYTES,
+        max_wire_bytes: None,
     }
 }
 
@@ -315,5 +315,76 @@ async fn relay_held_errors_after_shutdown() {
     assert!(
         matches!(result, Ok(Err(_))),
         "errors, does not hang: {result:?}"
+    );
+}
+
+/// A transport that hears nothing, records every broadcast, and reports a
+/// fixed gossip `max_message_size`.
+struct Limited {
+    limit: usize,
+    sent: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl Transport for Limited {
+    async fn broadcast(&mut self, bytes: Vec<u8>) -> anyhow::Result<()> {
+        let _ = self.sent.send(bytes);
+        Ok(())
+    }
+    async fn recv(&mut self) -> Option<dash_router::Incoming> {
+        std::future::pending().await
+    }
+    fn max_message_size(&self) -> Option<usize> {
+        Some(self.limit)
+    }
+}
+
+/// The Have bytes a lone node broadcasts after appending three ~300-byte
+/// ops, with `max_wire_bytes: None` and a transport reporting `limit`.
+async fn pushed_haves(limit: usize) -> Vec<Vec<u8>> {
+    let (sent, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (a, _events, _task) = spawn(
+        1u32,
+        config(),
+        Duration::from_secs(1),
+        BTreeSet::from([0u8]),
+        MemStore::<u8>::new(),
+        OpsMap::default(),
+        Limited { limit, sent },
+        intervals(1),
+    );
+    for seq in 0..3u32 {
+        let op = Op {
+            header: vec![seq as u8],
+            payload: Some(vec![seq as u8; 300]),
+        };
+        a.append(0, seq, op).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut haves = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let msg = WireMessage::<u32, u8>::decode(&bytes).expect("decodes");
+        if matches!(msg.body, dash_router_core::WireBody::Have(_)) {
+            haves.push(bytes);
+        }
+    }
+    haves
+}
+
+/// With `max_wire_bytes: None` the shell packs to the transport's limit:
+/// a small limit splits the push, a large one carries it whole.
+#[tokio::test(start_paused = true)]
+async fn broadcasts_are_sized_to_the_transport_limit() {
+    let small = pushed_haves(800).await;
+    let budget = dash_router::pack::wire_budget(800);
+    assert!(small.len() >= 2, "3 × ~305 bytes cannot fit {budget}");
+    assert!(
+        small.iter().all(|b| b.len() <= budget),
+        "a Have over budget"
+    );
+
+    let large = pushed_haves(8192).await;
+    assert!(
+        large.iter().any(|b| b.len() > budget),
+        "a larger limit lets the push go out in fewer, bigger Haves"
     );
 }

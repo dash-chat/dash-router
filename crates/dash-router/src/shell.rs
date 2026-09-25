@@ -67,9 +67,18 @@ pub struct CoreConfig {
     /// Maintenance evicts once relay usage reaches `evict_at * relay_cap`.
     pub evict_at: f64,
     pub debounce: PushDebouncePolicy,
-    /// Every broadcast is packed to encode at or under this many bytes; see
-    /// [`pack::DEFAULT_MAX_WIRE_BYTES`](crate::pack::DEFAULT_MAX_WIRE_BYTES).
-    pub max_wire_bytes: usize,
+    /// Every broadcast is packed to encode at or under this many bytes.
+    /// `None` derives it from the transport's
+    /// [`Transport::max_message_size`] via
+    /// [`pack::wire_budget`](crate::pack::wire_budget), falling back to
+    /// [`pack::DEFAULT_MAX_WIRE_BYTES`](crate::pack::DEFAULT_MAX_WIRE_BYTES)
+    /// for a transport with no limit. `Some(n)` is used as given, but
+    /// [`spawn`] still clamps it to the transport's budget.
+    ///
+    /// Gossip drops frames over the *receiver's* limit, so raising the
+    /// gossip `max_message_size` only helps if every node on the overlay
+    /// raises it.
+    pub max_wire_bytes: Option<usize>,
 }
 
 /// A single unit of shell output: either a wire message to broadcast, or an
@@ -148,7 +157,9 @@ where
             debounce: config.debounce,
             relay_cap: config.relay_cap,
             evict_at: config.evict_at,
-            max_wire_bytes: config.max_wire_bytes,
+            max_wire_bytes: config
+                .max_wire_bytes
+                .unwrap_or(crate::pack::DEFAULT_MAX_WIRE_BYTES),
             pending_push: LogRanges::empty(),
             pending_since: None,
             latest_append: Duration::ZERO,
@@ -859,6 +870,13 @@ where
     // panicking (the core holds the sending store alive, so `Closed` isn't
     // expected in practice, but a trait method here must never panic).
     let mut hints_open = true;
+    let config = CoreConfig {
+        max_wire_bytes: Some(resolve_max_wire_bytes(
+            config.max_wire_bytes,
+            transport.max_message_size(),
+        )),
+        ..config
+    };
     let mut core = NodeCore::new(id, config, subscriptions, ext, relay, intervals);
     let mut transport = transport;
 
@@ -994,6 +1012,19 @@ where
     (RouterHandle::new(cmd_tx), event_rx, task)
 }
 
+/// The packing budget `spawn` runs with: the configured one clamped to
+/// what the transport can carry, or the transport's own budget if none is
+/// configured (see [`CoreConfig::max_wire_bytes`]).
+fn resolve_max_wire_bytes(configured: Option<usize>, transport_limit: Option<usize>) -> usize {
+    let transport_budget = transport_limit.map(crate::pack::wire_budget);
+    match (configured, transport_budget) {
+        (Some(n), Some(t)) => n.min(t),
+        (Some(n), None) => n,
+        (None, Some(t)) => t,
+        (None, None) => crate::pack::DEFAULT_MAX_WIRE_BYTES,
+    }
+}
+
 async fn log_exit(run: impl Future<Output = Result<()>>) -> Result<()> {
     let result = run.await;
     match &result {
@@ -1090,7 +1121,7 @@ mod tests {
                 window_ms: 100,
                 max_latency_ms: 250,
             },
-            max_wire_bytes: 3800,
+            max_wire_bytes: None,
         }
     }
 
@@ -1395,13 +1426,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn max_wire_bytes_follows_the_transport_limit() {
+        use super::resolve_max_wire_bytes as resolve;
+        use crate::pack::{DEFAULT_MAX_WIRE_BYTES, wire_budget};
+        assert_eq!(resolve(None, None), DEFAULT_MAX_WIRE_BYTES);
+        assert_eq!(resolve(None, Some(16_384)), wire_budget(16_384));
+        assert_eq!(resolve(Some(600), None), 600);
+        assert_eq!(resolve(Some(600), Some(16_384)), 600, "config below limit");
+        assert_eq!(
+            resolve(Some(16_384), Some(4096)),
+            wire_budget(4096),
+            "config clamped to what the transport can carry"
+        );
+    }
+
     /// Spec 2026-09-22 §3.3: a Have reply bigger than `max_wire_bytes` is
     /// split into several Haves, each under budget, together carrying every
     /// op in `(log, seq)` order.
     #[tokio::test]
     async fn have_reply_is_packed_under_max_wire_bytes() {
         let mut config = config(100);
-        config.max_wire_bytes = 600;
+        config.max_wire_bytes = Some(600);
         config.debounce = PushDebouncePolicy {
             window_ms: 100_000,
             max_latency_ms: 100_000,
