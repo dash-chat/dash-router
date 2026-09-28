@@ -11,6 +11,14 @@
 //! positionally, so the behavior binary-searches for the current index at
 //! fire time — duplicates are identical, so any match is correct.
 //!
+//! Time is fine by default: each event happens at its sampled instant.
+//! With a *quantum* set ([`SimParams::quantum`]) time is coarse: an
+//! event's time is rounded up to the next quantum boundary when it pops,
+//! so everything due within a window happens at the window's end, in
+//! queue order, and a periodic `Quantum` event ticks every node's clock
+//! up to the boundary (stopping at a due timer, as the protocol requires).
+//! Intervals and TTLs then want setting on the quantum's scale.
+//!
 //! Backpressure discipline: the behavior only ever proposes enabled
 //! actions. Actions that would overflow the in-flight cap are deferred
 //! (timer fires: the node's clock freezes at the due time, which the
@@ -69,6 +77,9 @@ pub struct SimParams {
     pub maintain_interval: Option<Duration>,
     pub native_sync_per_sec: f64,
     pub app_gc: Option<AppGcSpec>,
+    /// Coarse time: round every event up to a multiple of this. `None`
+    /// is fine time. See the [module docs](self).
+    pub quantum: Option<Duration>,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +98,8 @@ enum Ev {
     Maintain(NodeId),
     NativeSync,
     AppGc,
+    /// Coarse time only: catch every node's clock up to the boundary.
+    Quantum,
 }
 
 #[derive(Clone, Debug)]
@@ -168,6 +181,27 @@ impl SimBehavior {
     /// Current simulated time.
     pub fn now(&self) -> Duration {
         self.now
+    }
+
+    /// The coarse-time quantum, or `None` in fine time.
+    pub fn quantum(&self) -> Option<Duration> {
+        self.params.quantum
+    }
+
+    /// `at` rounded up to the next quantum boundary; `at` itself in fine
+    /// time or when already on one.
+    pub fn quantize(&self, at: Duration) -> Duration {
+        match self.params.quantum {
+            Some(q) => {
+                let rem = at.as_nanos() % q.as_nanos();
+                if rem == 0 {
+                    at
+                } else {
+                    at + Duration::from_nanos((q.as_nanos() - rem) as u64)
+                }
+            }
+            None => at,
+        }
     }
 
     /// The longest interval the Want policy can arm.
@@ -347,6 +381,9 @@ impl SimBehavior {
             }
             self.schedule_next_append();
             self.schedule(self.params.sample_interval, Ev::Sample);
+            if let Some(q) = self.params.quantum {
+                self.schedule(q, Ev::Quantum);
+            }
             if let Some(interval) = self.params.maintain_interval {
                 for n in state.nodes.keys().copied().collect::<Vec<_>>() {
                     self.schedule(interval, Ev::Maintain(n));
@@ -364,7 +401,7 @@ impl SimBehavior {
         let Some(entry) = self.queue.pop() else {
             return Ok(());
         };
-        self.now = entry.at;
+        self.now = self.quantize(entry.at);
 
         match entry.ev {
             Ev::Deliver { flight, deferrals } => {
@@ -562,6 +599,16 @@ impl SimBehavior {
                         }
                     }
                     self.schedule_next_native_sync();
+                }
+            }
+
+            Ev::Quantum => {
+                for n in state.nodes.keys().copied().collect::<Vec<_>>() {
+                    self.advance(state, n, actions);
+                }
+                if self.now < self.params.duration * 2 {
+                    let q = self.params.quantum.expect("scheduled only when set");
+                    self.schedule(self.now + q, Ev::Quantum);
                 }
             }
 

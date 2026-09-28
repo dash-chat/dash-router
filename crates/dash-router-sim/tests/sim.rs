@@ -241,3 +241,49 @@ fn delivery_latency_splits_by_have_origin() {
     assert_eq!(r.t_pull_ms.max, 500.0);
     assert_eq!(r.ops_fully_covered, 1);
 }
+
+/// Coarse time: every event's time is rounded up to the next quantum, so
+/// the driver's clock only ever lands on quantum boundaries, and the run
+/// still converges with intervals set on that scale.
+#[test]
+fn coarse_time_lands_on_quantum_boundaries() {
+    let yaml = r#"
+defaults: { seeds: 1, duration_ms: 8000 }
+scenarios:
+  coarse:
+    nodes: 8
+    topology: { kind: random-tree, extra_edges: 0.0 }
+    loss: 0.0
+    latency_ms: { distribution: uniform, min_ms: 2, max_ms: 20 }
+    router: { want_ttl_ms: 3000, have_ttl_ms: 3000 }
+    storage: { relay_cap: 1048576 }
+    policy:
+      want: { kind: fixed, min_ms: 1000, max_ms: 2000 }
+      have: { kind: fixed, min_ms: 500, max_ms: 1000 }
+    workload: { writers: 2, appends_per_sec: 3.0 }
+    time_quantum_ms: 500
+"#;
+    let config = Config::from_yaml(yaml).unwrap();
+    let spec = &config.scenarios["coarse"];
+    let quantum = std::time::Duration::from_millis(500);
+    let mut sim = spec.build(1, &config.defaults).unwrap();
+    assert_eq!(sim.behavior().quantum(), Some(quantum));
+    let mut boundaries_seen = 0;
+    while sim.step().unwrap() {
+        let now = sim.behavior().now();
+        assert!(
+            now.as_nanos().is_multiple_of(quantum.as_nanos()),
+            "coarse time off the grid: {now:?}"
+        );
+        if now > std::time::Duration::ZERO {
+            boundaries_seen += 1;
+        }
+    }
+    assert!(boundaries_seen > 0);
+    let record = sim.metrics().finish(&sim.behavior().driver, 1);
+    assert!(record.ops_authored > 0);
+    assert_eq!(
+        record.ops_missed, 0,
+        "coarse lossless run must converge: {record:?}"
+    );
+}

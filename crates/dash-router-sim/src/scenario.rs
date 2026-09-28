@@ -74,6 +74,10 @@ pub struct ScenarioSpec {
     pub workload: WorkloadSpec,
     pub seeds: Option<u64>,
     pub duration_ms: Option<u64>,
+    /// Coarse time: every event happens at the next multiple of this.
+    /// Unset is fine time. Intervals and TTLs want setting on this scale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_quantum_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -307,6 +311,7 @@ impl ScenarioSpec {
             maintain_interval: self.storage.maintain_interval_ms.map(ms),
             native_sync_per_sec: self.workload.native_sync_per_sec,
             app_gc: self.workload.app_gc.clone(),
+            quantum: self.time_quantum_ms.map(ms),
         };
         ensure!(
             topology.nodes().count() == self.nodes as usize,

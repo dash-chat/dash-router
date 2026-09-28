@@ -22,8 +22,10 @@
 //!
 //! The viz steps a `polestar_sim::Scenario` over the same
 //! [`SimBehavior`] and [`Metered`] net the sim crate's own `Simulation`
-//! runs, so what the viewer shows is exactly one seeded sim run, one
-//! event per step. As there, the driver rides inside the model state
+//! runs, so what the viewer shows is exactly one seeded sim run. A step
+//! is one frame: one event in fine time, and in coarse time every event
+//! of the next quantum, so a frame shows all that happened "at once"
+//! ([`RunModel`]). As there, the driver rides inside the model state
 //! ([`RunModel`]): simviz steps back by reset-and-replay, and a
 //! `Scenario` reset restores only the model state, so a driver kept
 //! outside it (its event queue, RNG, clocks) would replay a different run.
@@ -34,9 +36,10 @@ use anyhow::Context;
 use dash_router_core::{EvictableStorage, Storage, WireBody};
 use dash_router_net_model::Topology as NetTopology;
 use dash_router_sim::{
-    Config, Meter, Metered, NodeId as SimNodeId, SimBehavior, SimFlight, SimNetState,
+    Config, Meter, Metered, MeteredFx, NodeId as SimNodeId, SimBehavior, SimFlight, SimNet,
+    SimNetState,
 };
-use polestar::{Behavior, BehaviorModel, StateMachine};
+use polestar::{Behavior, BehaviorModel, Machine, StateMachine, TransitionResult};
 use polestar_sim::Scenario;
 use simviz::{
     EdgeStyle, Field, FieldValue, MoonStyle, NodeId, NodeStyle, Presenter, Topology, UiAction,
@@ -44,11 +47,46 @@ use simviz::{
 };
 
 /// One seeded run as a single machine: the driver's state is model state.
-pub type RunModel = BehaviorModel<SimBehavior>;
+///
+/// One action is one frame. In fine time that is one event; in coarse
+/// time it is every event of the next quantum, so the frame lands on the
+/// quantum boundary with all of that window's events applied.
+#[derive(Clone, Debug)]
+pub struct RunModel(BehaviorModel<SimBehavior>);
+
+impl RunModel {
+    pub fn new(model: Metered<SimNet>) -> Self {
+        Self(BehaviorModel::new(model))
+    }
+}
+
+impl Machine for RunModel {
+    type State = VizState;
+    type Action = ();
+    type Fx = Vec<MeteredFx>;
+    type Error = anyhow::Error;
+
+    fn transition(&self, state: VizState, (): ()) -> TransitionResult<Self> {
+        let (mut state, mut fx) = self.0.transition(state, ())?;
+        if state.0.quantum().is_some() {
+            let frame_end = state.0.now();
+            while state
+                .0
+                .peek_at()
+                .is_some_and(|at| state.0.quantize(at) <= frame_end)
+            {
+                let (next, more) = self.0.transition(state, ())?;
+                state = next;
+                fx.extend(more);
+            }
+        }
+        Ok((state, fx))
+    }
+}
 /// The state simviz steps: the driver, then the network and its meter.
 pub type VizState = (SimBehavior, (SimNetState, Meter));
 
-/// The trivial driver over [`RunModel`]: one event per step. Stateless, so
+/// The trivial driver over [`RunModel`]: one frame per step. Stateless, so
 /// it is safe to leave outside the model state.
 #[derive(Clone, Debug)]
 pub struct Tick;
@@ -415,6 +453,19 @@ scenarios:
       want: { kind: density-scaled, min_ms: 200, max_ms: 400, ref_n: 10 }
       have: { kind: fixed, min_ms: 20, max_ms: 80 }
     workload: { writers: 2, appends_per_sec: 20.0 }
+  coarse:
+    nodes: 6
+    duration_ms: 10000
+    topology: { kind: random-tree, extra_edges: 0.2 }
+    loss: 0.1
+    latency_ms: { distribution: uniform, min_ms: 1, max_ms: 5 }
+    router: { want_ttl_ms: 3000, have_ttl_ms: 3000 }
+    storage: { relay_cap: 65536 }
+    policy:
+      want: { kind: fixed, min_ms: 1000, max_ms: 2000 }
+      have: { kind: fixed, min_ms: 500, max_ms: 1000 }
+    workload: { writers: 2, appends_per_sec: 20.0 }
+    time_quantum_ms: 500
 "#,
         )
         .unwrap()
@@ -733,6 +784,32 @@ scenarios:
             assert!(
                 matches!(item, FieldValue::Link { action: UiAction::SelectNode { node: Some(n) }, .. } if n.0 == sender)
             );
+        }
+    }
+
+    /// In coarse time one frame is one quantum: every event due within it
+    /// happens in that step, and each node ends the frame caught up to the
+    /// boundary unless a due timer holds its clock there.
+    #[test]
+    fn coarse_time_steps_one_quantum_per_frame() {
+        let (scenario, presenter) = scenario(&config(), Some("coarse"), 0).unwrap();
+        let mut viewer = Viewer::new(Simulation::new(scenario), presenter);
+        let quantum = Duration::from_millis(500);
+        // Frame 1 arms the timers at time zero.
+        viewer.handle(Command::StepForward).unwrap();
+        for k in 1..=8u32 {
+            viewer.handle(Command::StepForward).unwrap();
+            let (driver, (net, _)) = viewer.simulation().state();
+            assert_eq!(driver.now(), quantum * k, "frame {k}");
+            assert!(
+                driver.peek_at().is_some_and(|at| at > driver.now()),
+                "frame {k} left an event due within it"
+            );
+            for (id, node) in &net.nodes {
+                let lag = driver.lag(*id);
+                let held = node.router.next_due().is_some_and(|d| (*d).is_zero());
+                assert!(lag.is_zero() || held, "node {id} lags {lag:?} at frame {k}");
+            }
         }
     }
 }

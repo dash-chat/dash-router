@@ -23,6 +23,22 @@ scenarios:
       have: { kind: fixed, min_ms: 30, max_ms: 120 }
     workload: { writers: 4, appends_per_sec: 2.0 }
 
+  # The same network in coarse time: every event happens at the next
+  # 500ms boundary, so a viz frame is one quantum with everything due in
+  # it applied at once. Intervals and TTLs are set on that scale.
+  lan-20-coarse:
+    nodes: 20
+    topology: { kind: random-tree, extra_edges: 0.2 }
+    loss: 0.02
+    latency_ms: { distribution: log-normal, median_ms: 3.0, sigma: 0.6 }
+    router: { want_ttl_ms: 4000, have_ttl_ms: 4000 }
+    storage: { relay_cap: 1048576 }
+    policy:
+      want: { kind: density-scaled, min_ms: 1000, max_ms: 10000, ref_n: 20 }
+      have: { kind: fixed, min_ms: 500, max_ms: 10000 }
+    workload: { writers: 4, appends_per_sec: 2.0 }
+    time_quantum_ms: 500
+
   # Saturate the relays: 20 nodes, only 6 subscribers per log, a cap that
   # cannot hold 4 logs' payloads, maintenance evicting payloads-first.
   # Expect: occupancy pinned near the cap, evictions > 0, coverage held by

@@ -101,6 +101,7 @@ fn base(args: &Args) -> ScenarioSpec {
         },
         seeds: Some(args.seeds),
         duration_ms: Some(args.duration_ms),
+        time_quantum_ms: None,
     }
 }
 
