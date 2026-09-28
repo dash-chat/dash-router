@@ -1,0 +1,4 @@
+# simviz is a git dependency on the private simdash repo over SSH; cargo's
+# built-in fetcher cannot use the ssh agent, the git CLI can.
+[net]
+git-fetch-with-cli = true

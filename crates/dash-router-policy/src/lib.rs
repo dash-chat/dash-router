@@ -49,6 +49,21 @@ impl IntervalPolicy {
         };
         Duration::from_secs_f64(ms.max(0.001) / 1000.0)
     }
+
+    /// The largest interval [`sample`](Self::sample) can return for
+    /// network size `n`.
+    pub fn max(&self, n: usize) -> Duration {
+        let ms = match self {
+            IntervalPolicy::Fixed { max_ms, .. } => *max_ms,
+            IntervalPolicy::DensityScaled {
+                max_ms,
+                ref_n,
+                alpha,
+                ..
+            } => max_ms * (n as f64 / *ref_n as f64).powf(*alpha),
+        };
+        Duration::from_secs_f64(ms.max(0.001) / 1000.0)
+    }
 }
 
 /// When to flush pending pushed appends (spec §4). Pure: given the times,
@@ -106,6 +121,30 @@ mod tests {
         let at_40 = p.sample(&mut rng, 40);
         assert_eq!(at_10, Duration::from_millis(100));
         assert_eq!(at_40, Duration::from_millis(400));
+    }
+
+    #[test]
+    fn max_bounds_every_sample() {
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let fixed = IntervalPolicy::Fixed {
+            min_ms: 100.0,
+            max_ms: 200.0,
+        };
+        assert_eq!(fixed.max(7), Duration::from_millis(200));
+        let scaled = IntervalPolicy::DensityScaled {
+            min_ms: 100.0,
+            max_ms: 200.0,
+            ref_n: 10,
+            alpha: 0.5,
+        };
+        assert_eq!(scaled.max(40), Duration::from_millis(400));
+        for p in [&fixed, &scaled] {
+            for n in [1, 10, 40] {
+                for _ in 0..100 {
+                    assert!(p.sample(&mut rng, n) <= p.max(n));
+                }
+            }
+        }
     }
 
     #[test]

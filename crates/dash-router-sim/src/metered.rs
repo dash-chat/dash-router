@@ -28,7 +28,8 @@ use polestar::prelude::*;
 
 use crate::{HaveOrigin, LogId, Metrics, NodeId, SimNetAction, SimNetFx, SimNetState};
 
-type SimFlight = Flight<NodeId, LogId>;
+/// A message in the simulated network's air.
+pub type SimFlight = Flight<NodeId, LogId>;
 
 /// A machine that forwards every action to `M` and meters the transition.
 /// See the [module docs](self).
@@ -53,6 +54,9 @@ impl<M> Metered<M> {
 #[derive(Clone, Debug)]
 pub struct Meter {
     pub metrics: Metrics,
+    /// What the most recent transition did, for anything that shows a run
+    /// one transition at a time (the viz). Cleared as each one starts.
+    pub last: LastTransition,
     /// Mirror of the wrapped state's `inflight`, maintained incrementally
     /// so the flights a transition added can be picked out without
     /// cloning the whole multiset beforehand.
@@ -67,10 +71,22 @@ impl Meter {
     pub fn new(metrics: Metrics) -> Self {
         Self {
             metrics,
+            last: LastTransition::default(),
             known_inflight: Vec::new(),
             flight_origins: BTreeMap::new(),
         }
     }
+}
+
+/// The one-step view of a transition: what the network did with a flight,
+/// if it touched one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LastTransition {
+    /// A flight the network lost.
+    pub dropped: Option<SimFlight>,
+    /// A flight that arrived, and whether the receipt taught the receiver
+    /// anything (`false` is what `Metrics::redundant_receives` counts).
+    pub received: Option<(SimFlight, bool)>,
 }
 
 /// What a metered transition produced: the flights it put in the air (for
@@ -83,6 +99,7 @@ pub struct MeteredFx {
 
 /// A `Deliver` about to happen, read off the pre-state.
 struct Receipt {
+    flight: SimFlight,
     to: NodeId,
     /// A Have receipt as opposed to a Want receipt (the wire no longer
     /// marks a Have as fresh-vs-reply, so that finer split is gone).
@@ -107,9 +124,11 @@ where
     ) -> TransitionResult<Self> {
         let Meter {
             metrics,
+            last,
             known_inflight,
             flight_origins,
         } = &mut meter;
+        *last = LastTransition::default();
 
         // Before: what the action is about to consume, while it is still
         // there. `origin` is the attribution any Have this transition sends
@@ -130,12 +149,14 @@ where
                 if matches!(action, SimNetAction::Deliver(_)) {
                     metrics.receives += 1;
                     receipt = Some(Receipt {
+                        flight: flight.clone(),
                         to: flight.to,
                         is_have: matches!(flight.message.body, WireBody::Have(_)),
                         held_before: net.node(&flight.to).router.held.clone(),
                     });
                 } else {
                     metrics.drops += 1;
+                    last.dropped = Some(flight.clone());
                 }
             }
             SimNetAction::Node(n, node_action) => match node_action {
@@ -189,6 +210,7 @@ where
             } else if receipt.is_have {
                 metrics.backfill_receives += 1;
             }
+            last.received = Some((receipt.flight, taught));
         }
 
         // And what went out.

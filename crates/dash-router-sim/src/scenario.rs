@@ -191,6 +191,15 @@ fn ms(v: u64) -> Duration {
     Duration::from_millis(v)
 }
 
+/// The pieces of one seeded run, as [`ScenarioSpec::build_parts`] makes them.
+pub struct RunParts {
+    pub net: SimNet,
+    pub state: SimNetState,
+    pub behavior: SimBehavior,
+    pub metrics: Metrics,
+    pub duration: Duration,
+}
+
 impl ScenarioSpec {
     pub fn validate(&self) -> anyhow::Result<()> {
         ensure!(self.nodes >= 2, "need at least 2 nodes");
@@ -249,6 +258,20 @@ impl ScenarioSpec {
 
     /// Build one seeded, ready-to-run simulation.
     pub fn build(&self, seed: u64, defaults: &Defaults) -> anyhow::Result<Simulation> {
+        let parts = self.build_parts(seed, defaults)?;
+        Ok(Simulation::new(
+            parts.net,
+            parts.state,
+            parts.behavior,
+            parts.metrics,
+            parts.duration,
+        ))
+    }
+
+    /// Build the pieces of one seeded run without assembling them into a
+    /// [`Simulation`], for harnesses that drive the behavior themselves
+    /// (e.g. a viewer stepping a `polestar_sim::Scenario`).
+    pub fn build_parts(&self, seed: u64, defaults: &Defaults) -> anyhow::Result<RunParts> {
         self.validate().context("invalid scenario")?;
         let duration = ms(self.duration_ms.unwrap_or(defaults.duration_ms));
         let topology = self.topology(seed);
@@ -291,13 +314,13 @@ impl ScenarioSpec {
         );
         let behavior = SimBehavior::new(topology.clone(), params, seed);
         let net = SimNet::new(topology, node_machine);
-        Ok(Simulation::new(
+        Ok(RunParts {
             net,
             state,
             behavior,
-            Metrics::new(expected),
+            metrics: Metrics::new(expected),
             duration,
-        ))
+        })
     }
 
     pub fn seeds(&self, defaults: &Defaults) -> u64 {

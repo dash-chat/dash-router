@@ -46,7 +46,7 @@ pub type SimNetAction = NetAction<NodeId, LogId, RealTime, K>;
 pub type SimNetFx = Vec<(NodeId, NodeEffect<NodeId, LogId>)>;
 
 pub use behavior::SimBehavior;
-pub use metered::{Meter, Metered, MeteredFx};
-pub use metrics::{DriverMetrics, HaveOrigin, Metrics, RunRecord};
-pub use scenario::{Config, ScenarioSpec, StorageSpec};
+pub use metered::{LastTransition, Meter, Metered, MeteredFx, SimFlight};
+pub use metrics::{DriverMetrics, HaveOrigin, Metrics, NodeCoverage, RunRecord};
+pub use scenario::{Config, RunParts, ScenarioSpec, StorageSpec};
 pub use sim::Simulation;

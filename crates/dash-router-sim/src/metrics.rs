@@ -50,6 +50,14 @@ impl DriverMetrics {
     }
 }
 
+/// One node's share of coverage: how many authored ops it should deliver,
+/// and how many it has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NodeCoverage {
+    pub delivered: u64,
+    pub expected: u64,
+}
+
 /// Live protocol collectors, updated by [`Metered`](crate::Metered) as
 /// transitions flow past.
 #[derive(Clone, Debug, Default)]
@@ -58,6 +66,9 @@ pub struct Metrics {
     /// must deliver an op for it to count as fully covered.
     expected: BTreeMap<LogId, BTreeSet<NodeId>>,
     ops: BTreeMap<(LogId, u32), OpCoverage>,
+    /// The same coverage seen from each node's side, kept as it happens so
+    /// a per-node fraction is a lookup rather than a scan of `ops`.
+    node_coverage: BTreeMap<NodeId, NodeCoverage>,
 
     /// Want broadcasts of any origin.
     pub want_msgs: u64,
@@ -102,14 +113,28 @@ impl Metrics {
     }
 
     pub fn authored(&mut self, log: LogId, seq: u32, now: Duration) {
-        self.ops.insert(
-            (log, seq),
-            OpCoverage {
-                born: now,
-                covered: BTreeSet::new(),
-                full_at: None,
-            },
-        );
+        let fresh = self
+            .ops
+            .insert(
+                (log, seq),
+                OpCoverage {
+                    born: now,
+                    covered: BTreeSet::new(),
+                    full_at: None,
+                },
+            )
+            .is_none();
+        if fresh {
+            for node in self.expected.get(&log).into_iter().flatten() {
+                self.node_coverage.entry(*node).or_default().expected += 1;
+            }
+        }
+    }
+
+    /// How much of what `node` should deliver it has, over the ops
+    /// authored so far. Zero expected means nothing is asked of it yet.
+    pub fn node_coverage(&self, node: NodeId) -> NodeCoverage {
+        self.node_coverage.get(&node).copied().unwrap_or_default()
     }
 
     pub fn delivered(
@@ -128,6 +153,7 @@ impl Metrics {
         }
         if let Some(op) = self.ops.get_mut(&(log, seq)) {
             if op.covered.insert(node) {
+                self.node_coverage.entry(node).or_default().delivered += 1;
                 let latency = (now - op.born).as_secs_f64() * 1000.0;
                 match origin {
                     Some(HaveOrigin::Push) => self.push_latencies.push(latency),

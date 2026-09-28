@@ -170,6 +170,24 @@ impl SimBehavior {
         self.now
     }
 
+    /// The longest interval the Want policy can arm.
+    pub fn max_want_interval(&self) -> Duration {
+        self.params.want_policy.max(self.params.n)
+    }
+
+    /// The longest interval the Have policy can arm.
+    pub fn max_have_interval(&self) -> Duration {
+        self.params.have_policy.max(self.params.n)
+    }
+
+    /// How far node `n`'s clock trails [`now`](Self::now). A node's clock
+    /// advances only when an event touches it, so its timers' `remaining`
+    /// is as of `now - lag(n)`.
+    pub fn lag(&self, n: NodeId) -> Duration {
+        self.now
+            .saturating_sub(self.clocks.get(&n).copied().unwrap_or_default())
+    }
+
     /// Whether the first tick (arming every node's Want timer) has run.
     pub fn is_initialized(&self) -> bool {
         self.initialized
