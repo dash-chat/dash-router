@@ -11,6 +11,12 @@
 //!   (amber), the next clockwise the Have timer (blue). Each is a pie of
 //!   the time the timer has left, as of the sim clock, over the longest
 //!   interval its policy can arm, so it empties as the fire approaches;
+//! - a third moon (green) is the node's held share: the ops it holds
+//!   (relay and ext together) over every op authored so far, absent until
+//!   the first op exists;
+//! - a node that authored during the frame gets a bright green border
+//!   (in coarse time the frame merges a quantum's transitions, and every
+//!   author within it is bordered);
 //! - the transition that produced the frame leaves a one-frame trace: a
 //!   dropped flight paints its direction of the link red, a receipt paints
 //!   the receiver's border green if it taught something and red if it was
@@ -33,12 +39,13 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::Context;
-use dash_router_core::{EvictableStorage, Storage, WireBody};
+use dash_router_core::{EvictableStorage, NodeState as CoreNodeState, Storage, WireBody};
 use dash_router_net_model::Topology as NetTopology;
 use dash_router_sim::{
-    Config, Meter, Metered, MeteredFx, NodeId as SimNodeId, SimBehavior, SimFlight, SimNet,
-    SimNetState,
+    Config, LogId as SimLogId, Meter, Metered, MeteredFx, NodeId as SimNodeId, SimBehavior,
+    SimFlight, SimNet, SimNetState,
 };
+use polestar::time::RealTime;
 use polestar::{Behavior, BehaviorModel, Machine, StateMachine, TransitionResult};
 use polestar_sim::Scenario;
 use simviz::{
@@ -70,6 +77,10 @@ impl Machine for RunModel {
         let (mut state, mut fx) = self.0.transition(state, ())?;
         if state.0.quantum().is_some() {
             let frame_end = state.0.now();
+            // The meter's one-transition trace resets each transition; the
+            // frame keeps every author it merged, so an append mid-quantum
+            // still shows on the frame.
+            let mut authored = std::mem::take(&mut state.1.1.last.authored);
             while state
                 .0
                 .peek_at()
@@ -78,7 +89,9 @@ impl Machine for RunModel {
                 let (next, more) = self.0.transition(state, ())?;
                 state = next;
                 fx.extend(more);
+                authored.extend(state.1.1.last.authored.iter().copied());
             }
+            state.1.1.last.authored = authored;
         }
         Ok((state, fx))
     }
@@ -108,9 +121,14 @@ const TAUGHT_COLOR: &str = "#7ee787";
 /// Node fill at zero and at full coverage.
 const COLD_FILL: (u8, u8, u8) = (0x30, 0x36, 0x3d);
 const FULL_FILL: (u8, u8, u8) = (0x23, 0x86, 0x36);
-/// Moon slots: the Want timer on top, the Have timer next clockwise.
-const WANT_MOON: u8 = 0;
-const HAVE_MOON: u8 = 1;
+/// Held-share moon, and the border of a node authoring this frame.
+const HELD_COLOR: &str = "#3fb950";
+const AUTHOR_COLOR: &str = "#26ff5c";
+/// Moon slots: the Want timer on top, then clockwise the Have timer and
+/// the held share.
+const HELD_MOON: u8 = 0;
+const WANT_MOON: u8 = 1;
+const HAVE_MOON: u8 = 2;
 
 /// Presenter for a dash-router network.
 ///
@@ -193,6 +211,19 @@ fn timer_ratio(remaining: Duration, max: Duration) -> f32 {
         return 0.0;
     }
     (remaining.as_secs_f64() / max.as_secs_f64()).clamp(0.0, 1.0) as f32
+}
+
+/// The ops a node holds, relay and ext together. An open-ended held range
+/// has no cardinality and counts nothing, but held ranges of real ops are
+/// finite.
+fn held_count(node: &CoreNodeState<SimNodeId, SimLogId, RealTime>) -> usize {
+    node.relay
+        .0
+        .held_all()
+        .union(&node.ext.0.held_all())
+        .iter()
+        .map(|(_, r)| r.len().unwrap_or(0))
+        .sum()
 }
 
 /// An armed timer's moon: a pie of `remaining` over `max`, no label.
@@ -282,16 +313,22 @@ impl Presenter for RouterPresenter {
             .as_ref()
             .map(|(f, taught)| (f.to, if *taught { TAUGHT_COLOR } else { BAD_COLOR }));
 
-        // Nodes: coverage as fill, the last receipt as border, timers as
-        // moons. A timer's `remaining` is as of the node's own clock, which
-        // trails the sim clock until an event touches the node.
+        // Nodes: coverage as fill, authoring (else the last receipt) as
+        // border, timers and the held share as moons. A timer's `remaining`
+        // is as of the node's own clock, which trails the sim clock until
+        // an event touches the node.
         let max_want = driver.max_want_interval();
         let max_have = driver.max_have_interval();
+        let total_ops = meter.metrics.ops_authored();
         for (id, node) in &net.nodes {
             let lag = driver.lag(*id);
-            let border_color = receipt_border
-                .filter(|(to, _)| to == id)
-                .map(|(_, c)| c.to_string());
+            let border_color = if meter.last.authored.contains(id) {
+                Some(AUTHOR_COLOR.to_string())
+            } else {
+                receipt_border
+                    .filter(|(to, _)| to == id)
+                    .map(|(_, c)| c.to_string())
+            };
             let style = NodeStyle {
                 color: coverage_fill(meter, *id),
                 border_color,
@@ -310,6 +347,19 @@ impl Presenter for RouterPresenter {
             if let Some(t) = &node.router.have_timer {
                 let left = (*t.remaining).saturating_sub(lag);
                 events.push(timer_moon(*id, HAVE_MOON, HAVE_COLOR, left, max_have));
+            }
+            if total_ops > 0 {
+                events.push(VizEvent::MoonStyle {
+                    node: NodeId(*id),
+                    slot: HELD_MOON,
+                    style: MoonStyle {
+                        color: Some(HELD_COLOR.into()),
+                        border_color: Some("#555".into()),
+                        background: Some("#333".into()),
+                        ratio: Some((held_count(node) as f32 / total_ops as f32).clamp(0.0, 1.0)),
+                        ..Default::default()
+                    },
+                });
             }
         }
 
@@ -673,6 +723,88 @@ scenarios:
             }
         }
         assert!(moons.iter().all(|(_, s, _)| *s < simviz::MOON_SLOTS));
+    }
+
+    #[test]
+    fn held_moon_shows_the_held_share() {
+        let (scenario, presenter) = scenario(&config(), Some("tiny"), 0).unwrap();
+        let mut viewer = Viewer::new(Simulation::new(scenario), presenter);
+        // No ops yet: no held moons.
+        assert!(
+            !viewer
+                .frame()
+                .events
+                .iter()
+                .any(|e| matches!(e, VizEvent::MoonStyle { slot, .. } if *slot == HELD_MOON))
+        );
+        let f = step_until(&mut viewer, 2000, |_, (_, (_, meter))| {
+            meter.metrics.ops_authored() > 0
+        });
+        let (_, (net, meter)) = viewer.simulation().state();
+        let total = meter.metrics.ops_authored();
+        for (id, node) in &net.nodes {
+            let moon = f
+                .events
+                .iter()
+                .find_map(|e| match e {
+                    VizEvent::MoonStyle {
+                        node: n,
+                        slot,
+                        style,
+                    } if *n == NodeId(*id) && *slot == HELD_MOON => Some(style),
+                    _ => None,
+                })
+                .expect("every node has a held moon once ops exist");
+            assert_eq!(moon.color.as_deref(), Some(HELD_COLOR));
+            assert_eq!(
+                moon.ratio,
+                Some(held_count(node) as f32 / total as f32),
+                "node {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn authoring_paints_a_bright_border() {
+        let (scenario, presenter) = scenario(&config(), Some("tiny"), 0).unwrap();
+        let mut viewer = Viewer::new(Simulation::new(scenario), presenter);
+        let f = step_until(&mut viewer, 2000, |_, (_, (_, meter))| {
+            !meter.last.authored.is_empty()
+        });
+        let (_, (_, meter)) = viewer.simulation().state();
+        for n in &meter.last.authored {
+            assert_eq!(
+                node_style(&f, *n).and_then(|s| s.border_color.as_deref()),
+                Some(AUTHOR_COLOR)
+            );
+        }
+        // The trace is gone on the next frame unless it happens again.
+        let next = viewer.handle(Command::StepForward).unwrap();
+        let (_, (_, meter)) = viewer.simulation().state();
+        if meter.last.authored.is_empty() {
+            assert!(!next.events.iter().any(|e| matches!(e,
+                VizEvent::NodeStyle { style, .. }
+                    if style.border_color.as_deref() == Some(AUTHOR_COLOR))));
+        }
+    }
+
+    /// In coarse time the frame merges a quantum's transitions; an append
+    /// that was not the quantum's last event still borders its author.
+    #[test]
+    fn coarse_frames_keep_every_author() {
+        let (scenario, presenter) = scenario(&config(), Some("coarse"), 0).unwrap();
+        let mut viewer = Viewer::new(Simulation::new(scenario), presenter);
+        let f = step_until(&mut viewer, 100, |_, (_, (_, meter))| {
+            !meter.last.authored.is_empty()
+        });
+        let (_, (_, meter)) = viewer.simulation().state();
+        for n in &meter.last.authored {
+            assert_eq!(
+                node_style(&f, *n).and_then(|s| s.border_color.as_deref()),
+                Some(AUTHOR_COLOR),
+                "author {n} bordered in the coarse frame"
+            );
+        }
     }
 
     #[test]

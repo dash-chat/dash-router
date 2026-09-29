@@ -145,6 +145,11 @@ impl Metrics {
         self.node_coverage.get(&node).copied().unwrap_or_default()
     }
 
+    /// Ops authored so far, network-wide.
+    pub fn ops_authored(&self) -> usize {
+        self.ops.len()
+    }
+
     pub fn delivered(
         &mut self,
         node: NodeId,

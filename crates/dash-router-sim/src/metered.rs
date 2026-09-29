@@ -19,7 +19,10 @@
 //! it took) is not a transition and stays in its own
 //! [`DriverMetrics`](crate::metrics::DriverMetrics).
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use anyhow::anyhow;
 use dash_router_core::{LogRanges, NodeAction, NodeEffect, RouterAction, WireBody};
@@ -87,6 +90,10 @@ pub struct LastTransition {
     /// A flight that arrived, and whether the receipt taught the receiver
     /// anything (`false` is what `Metrics::redundant_receives` counts).
     pub received: Option<(SimFlight, bool)>,
+    /// Nodes that authored an op. At most one per transition; a set so a
+    /// consumer that merges transitions into one frame (the viz in coarse
+    /// time) can accumulate several.
+    pub authored: BTreeSet<NodeId>,
 }
 
 /// What a metered transition produced: the flights it put in the air (for
@@ -162,6 +169,7 @@ where
             SimNetAction::Node(n, node_action) => match node_action {
                 NodeAction::Authored(log, seq, _) => {
                     metrics.authored(*n, *log, *seq, now);
+                    last.authored.insert(*n);
                     origin = Some(HaveOrigin::Push);
                 }
                 NodeAction::Router(RouterAction::FireHave) => origin = Some(HaveOrigin::Repair),
