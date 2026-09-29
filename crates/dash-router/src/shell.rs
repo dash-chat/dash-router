@@ -1079,32 +1079,8 @@ mod tests {
 
     use super::*;
     use crate::handle::RouterEvent;
+    use crate::testing::Scripted;
     use crate::transport::Incoming;
-
-    /// Deterministic intervals for tests: pops from the front, repeats the
-    /// last entry forever.
-    struct Scripted(Vec<Duration>, usize);
-    impl Scripted {
-        fn ms(script: &[u64]) -> Self {
-            Scripted(
-                script.iter().map(|&m| Duration::from_millis(m)).collect(),
-                0,
-            )
-        }
-        fn next(&mut self) -> Duration {
-            let i = self.1.min(self.0.len() - 1);
-            self.1 += 1;
-            self.0[i]
-        }
-    }
-    impl IntervalSource for Scripted {
-        fn next_want(&mut self) -> Duration {
-            self.next()
-        }
-        fn next_have(&mut self) -> Duration {
-            self.next()
-        }
-    }
 
     type Core = NodeCore<u32, u8, OpsMap<u8>, OpsMap<u8>, Scripted>;
     type PairCore = NodeCore<u32, Pair, OpsMap<Pair>, OpsMap<Pair>, Scripted>;

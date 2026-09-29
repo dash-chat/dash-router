@@ -6,6 +6,7 @@ edition.workspace = true
 
 [features]
 p2panda = ["dep:p2panda-net", "dep:p2panda-core", "dep:futures-util"]
+testing = []
 
 [dependencies]
 dash-router-core = { path = "../dash-router-core" }
@@ -24,6 +25,7 @@ p2panda-net = { git = "https://github.com/dash-chat/p2panda", rev = "64bc5b54", 
 futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
+dash-router = { path = ".", features = ["testing"] }
 proptest = { workspace = true }
 rand_chacha = { workspace = true }
 tokio = { version = "1", features = [

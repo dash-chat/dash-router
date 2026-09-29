@@ -11,6 +11,8 @@ pub mod pack;
 pub mod panda;
 pub mod shell;
 pub mod storage;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod transport;
 
 pub use disk::{DiskRelayStore, LogKey};

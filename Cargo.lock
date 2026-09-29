@@ -812,6 +812,7 @@ name = "dash-router"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dash-router",
  "dash-router-core",
  "dash-router-policy",
  "futures-util",

@@ -30,6 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::time::Duration;
 
+use dash_router::testing::Scripted;
 use dash_router::{CoreConfig, IntervalSource, NodeCore, Out, RouterEvent};
 use dash_router_core::{
     EvictableStorage, Log, LogRanges, NodeAction, NodeEffect, NodeMachine, NodeState, Op, OpsMap,
@@ -41,37 +42,6 @@ use polestar::prelude::*;
 use polestar::time::RealTime;
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
-
-// --- Scripted intervals (own copy: a #[cfg(test)] item in another crate is
-// not reachable from an integration test) -----------------------------------
-
-/// Deterministic intervals: pops from the front, repeats the last entry
-/// forever. Mirrors `dash_router::shell`'s private test-only `Scripted`.
-#[derive(Clone)]
-struct Scripted(Vec<Duration>, usize);
-
-impl Scripted {
-    fn ms(script: &[u64]) -> Self {
-        Scripted(
-            script.iter().map(|&m| Duration::from_millis(m)).collect(),
-            0,
-        )
-    }
-    fn next(&mut self) -> Duration {
-        let i = self.1.min(self.0.len() - 1);
-        self.1 += 1;
-        self.0[i]
-    }
-}
-
-impl IntervalSource for Scripted {
-    fn next_want(&mut self) -> Duration {
-        self.next()
-    }
-    fn next_have(&mut self) -> Duration {
-        self.next()
-    }
-}
 
 // --- Log universes ----------------------------------------------------
 
