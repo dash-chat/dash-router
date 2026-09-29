@@ -338,15 +338,12 @@ impl ScenarioSpec {
         (0..k).map(|i| (log as NodeId + i) % self.nodes).collect()
     }
 
-    /// Per-log coverage targets: each log's subscribers minus its author
-    /// (`Deliver` never fires for a node's own authored data).
+    /// Per-log coverage targets: each log's subscribers, author included.
+    /// `Deliver` never fires for a node's own authored data; the metric
+    /// counts the author as covered the moment it authors.
     pub fn expected_coverage(&self) -> BTreeMap<LogId, BTreeSet<NodeId>> {
         (0..self.workload.writers)
-            .map(|log| {
-                let mut subs = self.subscribers_of(log);
-                subs.remove(&(log as NodeId));
-                (log, subs)
-            })
+            .map(|log| (log, self.subscribers_of(log)))
             .collect()
     }
 }

@@ -161,7 +161,7 @@ where
             }
             SimNetAction::Node(n, node_action) => match node_action {
                 NodeAction::Authored(log, seq, _) => {
-                    metrics.authored(*log, *seq, now);
+                    metrics.authored(*n, *log, *seq, now);
                     origin = Some(HaveOrigin::Push);
                 }
                 NodeAction::Router(RouterAction::FireHave) => origin = Some(HaveOrigin::Repair),

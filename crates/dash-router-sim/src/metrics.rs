@@ -62,8 +62,8 @@ pub struct NodeCoverage {
 /// transitions flow past.
 #[derive(Clone, Debug, Default)]
 pub struct Metrics {
-    /// Per-log coverage targets: the subscriber set (minus the author) that
-    /// must deliver an op for it to count as fully covered.
+    /// Per-log coverage targets: the subscriber set (author included) that
+    /// must hold an op for it to count as fully covered.
     expected: BTreeMap<LogId, BTreeSet<NodeId>>,
     ops: BTreeMap<(LogId, u32), OpCoverage>,
     /// The same coverage seen from each node's side, kept as it happens so
@@ -112,23 +112,31 @@ impl Metrics {
         }
     }
 
-    pub fn authored(&mut self, log: LogId, seq: u32, now: Duration) {
-        let fresh = self
-            .ops
-            .insert(
-                (log, seq),
-                OpCoverage {
-                    born: now,
-                    covered: BTreeSet::new(),
-                    full_at: None,
-                },
-            )
-            .is_none();
-        if fresh {
-            for node in self.expected.get(&log).into_iter().flatten() {
-                self.node_coverage.entry(*node).or_default().expected += 1;
-            }
+    /// A fresh op: every expected node now owes it, and the author holds
+    /// it from birth, so it is covered there at once (with no latency: it
+    /// was never delivered). With no other subscriber the op is full now.
+    pub fn authored(&mut self, author: NodeId, log: LogId, seq: u32, now: Duration) {
+        if self.ops.contains_key(&(log, seq)) {
+            return;
         }
+        let expected = self.expected.get(&log).cloned().unwrap_or_default();
+        for node in &expected {
+            self.node_coverage.entry(*node).or_default().expected += 1;
+        }
+        let mut covered = BTreeSet::new();
+        if expected.contains(&author) {
+            covered.insert(author);
+            self.node_coverage.entry(author).or_default().delivered += 1;
+        }
+        let full_at = (covered.len() >= expected.len()).then_some(now);
+        self.ops.insert(
+            (log, seq),
+            OpCoverage {
+                born: now,
+                covered,
+                full_at,
+            },
+        );
     }
 
     /// How much of what `node` should deliver it has, over the ops

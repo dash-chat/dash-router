@@ -81,8 +81,9 @@ fn identical_seeds_reproduce_identical_runs() {
 }
 
 /// With `subscribers: k`, log w is subscribed by nodes (w + i) % nodes for
-/// i in 0..k, coverage counts only those subscribers (minus the author),
-/// and unsubscribed traffic finally lands in relay stores.
+/// i in 0..k, coverage counts only those subscribers (the author included,
+/// covered at birth), and unsubscribed traffic finally lands in relay
+/// stores.
 #[test]
 fn partial_subscription_exercises_the_relay_path() {
     let yaml = r#"
@@ -103,14 +104,14 @@ scenarios:
     let config = dash_router_sim::Config::from_yaml(yaml).unwrap();
     let spec = &config.scenarios["partial"];
 
-    // Log 0: author node 0, subscribers {0, 1}; expected coverage {1}.
+    // Log 0: author node 0, subscribers {0, 1}; expected coverage {0, 1}.
     let expected = spec.expected_coverage();
     assert_eq!(
         expected[&0],
-        std::collections::BTreeSet::from([1u32]),
-        "author excluded from its own log's expected set"
+        std::collections::BTreeSet::from([0u32, 1]),
+        "author is in its own log's expected set"
     );
-    assert_eq!(expected[&1], std::collections::BTreeSet::from([2u32]));
+    assert_eq!(expected[&1], std::collections::BTreeSet::from([1u32, 2]));
 
     let mut sim = spec.build(0, &config.defaults).unwrap();
     let record = sim.run(0).unwrap();
@@ -225,10 +226,10 @@ fn delivery_latency_splits_by_have_origin() {
     use std::collections::{BTreeMap, BTreeSet};
     use std::time::Duration;
 
-    let expected = BTreeMap::from([(0u8, BTreeSet::from([1u32, 2, 3]))]);
+    let expected = BTreeMap::from([(0u8, BTreeSet::from([0u32, 1, 2, 3]))]);
     let mut m = Metrics::new(expected);
     let ms = Duration::from_millis;
-    m.authored(0, 0, ms(0));
+    m.authored(0, 0, 0, ms(0));
     m.delivered(1, 0, 0, ms(10), Some(HaveOrigin::Push));
     m.delivered(2, 0, 0, ms(500), Some(HaveOrigin::Repair));
     m.delivered(3, 0, 0, ms(20), None); // e.g. native sync
@@ -240,6 +241,54 @@ fn delivery_latency_splits_by_have_origin() {
     assert_eq!(r.t_push_ms.max, 10.0);
     assert_eq!(r.t_pull_ms.max, 500.0);
     assert_eq!(r.ops_fully_covered, 1);
+}
+
+/// The author holds its own op from birth: it counts as covered the
+/// moment it authors, so its per-node coverage is never 0/0 while its
+/// subscribers' climbs, and an op with no other subscriber is full at
+/// birth. The author's own delivery never records a latency.
+#[test]
+fn author_is_covered_at_birth() {
+    use dash_router_sim::metrics::{DriverMetrics, HaveOrigin, Metrics, NodeCoverage};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::time::Duration;
+
+    let ms = Duration::from_millis;
+    let expected = BTreeMap::from([(0u8, BTreeSet::from([0u32, 1]))]);
+    let mut m = Metrics::new(expected);
+    m.authored(0, 0, 0, ms(0));
+    assert_eq!(
+        m.node_coverage(0),
+        NodeCoverage {
+            delivered: 1,
+            expected: 1
+        }
+    );
+    assert_eq!(
+        m.node_coverage(1),
+        NodeCoverage {
+            delivered: 0,
+            expected: 1
+        }
+    );
+    assert!(!m.all_covered(), "the other subscriber is still owed it");
+    // A later "delivery" to the author never double-counts.
+    m.delivered(0, 0, 0, ms(5), Some(HaveOrigin::Push));
+    assert_eq!(m.node_coverage(0).delivered, 1);
+    m.delivered(1, 0, 0, ms(10), Some(HaveOrigin::Push));
+    assert!(m.all_covered());
+    let r = m.finish(&DriverMetrics::default(), 0);
+    assert_eq!(r.ops_fully_covered, 1);
+    assert_eq!(r.push_deliveries, 1, "only the real delivery has a latency");
+
+    // Only the author subscribed: full at birth, with a zero t_full.
+    let expected = BTreeMap::from([(0u8, BTreeSet::from([0u32]))]);
+    let mut m = Metrics::new(expected);
+    m.authored(0, 0, 0, ms(7));
+    assert!(m.all_covered());
+    let r = m.finish(&DriverMetrics::default(), 0);
+    assert_eq!(r.ops_fully_covered, 1);
+    assert_eq!(r.t_full_ms.max, 0.0);
 }
 
 /// Coarse time: every event's time is rounded up to the next quantum, so

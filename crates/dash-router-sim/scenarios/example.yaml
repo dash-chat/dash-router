@@ -36,7 +36,7 @@ scenarios:
     policy:
       want: { kind: density-scaled, min_ms: 1000, max_ms: 10000, ref_n: 20 }
       have: { kind: fixed, min_ms: 500, max_ms: 10000 }
-    workload: { writers: 4, appends_per_sec: 2.0 }
+    workload: { writers: 3, appends_per_sec: 0.25 }
     time_quantum_ms: 500
 
   # Saturate the relays: 20 nodes, only 6 subscribers per log, a cap that
