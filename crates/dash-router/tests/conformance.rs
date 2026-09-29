@@ -33,9 +33,9 @@ use std::time::Duration;
 use dash_router::testing::Scripted;
 use dash_router::{CoreConfig, IntervalSource, NodeCore, Out, RouterEvent};
 use dash_router_core::{
-    EvictableStorage, Log, LogRanges, NodeAction, NodeEffect, NodeMachine, NodeState, Op, OpsMap,
-    Pair, Ranges, RouterAction, RouterConfig, RouterState, Seq, Storage, Units, WireBody, WireLog,
-    WireMessage, eviction_candidates,
+    Entry, EvictableStorage, Interest, Log, NodeAction, NodeEffect, NodeMachine, NodeState, Op,
+    OpsMap, Pair, Ranges, RouterAction, RouterConfig, RouterState, Seq, Storage, Units, WireBody,
+    WireLog, WireMessage, eviction_candidates,
 };
 use dash_router_policy::PushDebouncePolicy;
 use polestar::prelude::*;
@@ -68,28 +68,27 @@ impl TestLog for Pair {
 
 #[derive(Clone, Debug)]
 enum Step<L> {
-    /// `origin` 0 is this node: its own Want, echoed back by `from`.
+    /// A Want from `from` claiming to have `start..end` of `log` (and so
+    /// asking for the rest of it and every other log under its channel).
     RecvWant {
         from: u32,
-        origin: u32,
         log: L,
         start: u32,
         end: u32,
     },
-    /// A Want naming no ranges, only a channel: "every log under it".
+    /// A pure want for a channel: "every log under it".
     RecvChannelWant {
         from: u32,
-        origin: u32,
         channel: u8,
     },
-    /// A Want mixing named ranges with channels, packed by `pack_want`
-    /// under `budget` bytes and delivered piece by piece (a small budget
-    /// splits it), so both machines record a split Want.
+    /// A Want mixing claimed haves with pure channels, packed by
+    /// `pack_want` under `budget` bytes and delivered frame by frame (a
+    /// small budget splits a channel into scoped frames), so both machines
+    /// see a fragmented Want.
     RecvMixedWant {
         from: u32,
-        origin: u32,
-        ranges: Vec<(L, u32, u32)>,
-        channels: Vec<u8>,
+        have: Vec<(L, u32, u32)>,
+        pure: Vec<u8>,
         budget: usize,
     },
     RecvHave {
@@ -120,26 +119,24 @@ fn step_strategy<L: TestLog>(
 ) -> impl Strategy<Value = Step<L>> {
     let mixed = (
         1u32..4,
-        0u32..5,
         proptest::collection::vec((log.clone(), 0u32..8, 0u32..8), 0..4),
         proptest::collection::vec(channel.clone(), 0..3),
-        prop_oneof![Just(12usize), Just(3800usize)],
+        // 40 bytes holds one whole entry with an author or two, so a
+        // channel with more splits into scoped frames; 3800 never splits.
+        prop_oneof![Just(40usize), Just(3800usize)],
     )
-        .prop_map(
-            |(from, origin, ranges, channels, budget)| Step::RecvMixedWant {
-                from,
-                origin,
-                ranges,
-                channels,
-                budget,
-            },
-        );
+        .prop_map(|(from, have, pure, budget)| Step::RecvMixedWant {
+            from,
+            have,
+            pure,
+            budget,
+        });
     prop_oneof![
-        3 => (1u32..4, 0u32..5, log.clone(), 0u32..8, 0u32..8).prop_map(
-            |(from, origin, log, start, end)| Step::RecvWant { from, origin, log, start, end }
+        3 => (1u32..4, log.clone(), 0u32..8, 0u32..8).prop_map(
+            |(from, log, start, end)| Step::RecvWant { from, log, start, end }
         ),
-        1 => (1u32..4, 0u32..5, channel.clone())
-            .prop_map(|(from, origin, channel)| Step::RecvChannelWant { from, origin, channel }),
+        1 => (1u32..4, channel.clone())
+            .prop_map(|(from, channel)| Step::RecvChannelWant { from, channel }),
         2 => mixed,
         3 => (1u32..4, log.clone(), proptest::collection::vec((0u32..8, any::<bool>()), 0..4))
             .prop_map(|(from, log, seqs)| Step::RecvHave { from, log, seqs }),
@@ -149,6 +146,29 @@ fn step_strategy<L: TestLog>(
         2 => (10u64..600).prop_map(Step::Advance),
         1 => Just(Step::Maintain),
     ]
+}
+
+/// An Interest with a whole-scope entry per channel: `have` claims
+/// `start..end` of each log (an empty claim is dropped), and `pure` adds a
+/// pure want for each channel not already claimed under.
+fn interest<L: TestLog>(have: Vec<(L, u32, u32)>, pure: Vec<u8>) -> Interest<L> {
+    let mut by_channel: BTreeMap<u8, BTreeMap<L::Author, Ranges>> = BTreeMap::new();
+    for (log, start, end) in have {
+        by_channel
+            .entry(log.channel())
+            .or_default()
+            .insert(log.author(), Ranges::range(start, end));
+    }
+    let mut out = Interest::empty();
+    for (c, h) in by_channel {
+        out.insert(c, Entry::whole(h));
+    }
+    for c in pure {
+        if out.get(&c).is_none() {
+            out.insert(c, Entry::default());
+        }
+    }
+    out
 }
 
 // --- Deterministic op construction --------------------------------------
@@ -199,11 +219,11 @@ fn assert_router_matches<L: TestLog>(
 ) -> Result<(), TestCaseError> {
     check!(idx, "held", sut.held, refr.held);
     check!(idx, "open", sut.open, refr.open);
-    check!(idx, "wants", sut.wants, refr.wants);
+    // Final review F2: the whole seen-sets, record by record — interests
+    // and TTLs — not just their unions.
+    check!(idx, "seen", sut.seen, refr.seen);
+    check!(idx, "heard", sut.heard, refr.heard);
     check!(idx, "haves", sut.haves, refr.haves);
-    // Final review F2: the whole seen-sets, record by record — ranges,
-    // channels and TTLs — not just their range unions.
-    check!(idx, "relayed_wants", sut.relayed_wants, refr.relayed_wants);
     check!(idx, "relayed_haves", sut.relayed_haves, refr.relayed_haves);
     check!(idx, "want_timer", sut.want_timer, refr.want_timer);
     check!(idx, "have_timer", sut.have_timer, refr.have_timer);
@@ -238,6 +258,7 @@ impl<L: TestLog> Driver<L> {
         let router_config: RouterConfig<RealTime> = RouterConfig {
             want_ttl: Duration::from_millis(500).into(),
             have_ttl: Duration::from_millis(500).into(),
+            heard_ttl: Duration::from_millis(500).into(),
         };
         let core_config = CoreConfig {
             router: router_config.clone(),
@@ -332,7 +353,7 @@ impl<L: TestLog> Driver<L> {
             if self.ref_state.router.have_due() {
                 let fx = self.ref_step(idx, NodeAction::Router(RouterAction::FireHave))?;
                 out.extend(fx);
-                if !self.ref_state.router.wants.is_empty() {
+                if !self.ref_state.router.network_ask().is_empty() {
                     let next = self.ref_script.next_have();
                     let fx2 = self.ref_step(
                         idx,
@@ -372,13 +393,13 @@ impl<L: TestLog> Driver<L> {
             return Ok(Vec::new());
         }
         let held_payloads = EvictableStorage::held_payloads(&self.ref_state.relay.0);
-        let others_wants = self.ref_state.router.others_wants();
-        let candidates = eviction_candidates(&held_payloads, &others_wants);
+        let network_ask = self.ref_state.router.network_ask();
+        let candidates = eviction_candidates(&held_payloads, &network_ask);
         if !candidates.is_empty() {
             return self.ref_step(idx, NodeAction::RelayEvictPayloads(candidates));
         }
         let held_all = Storage::held_all(&self.ref_state.relay.0);
-        let full = held_all.difference(&others_wants);
+        let full = held_all.difference(&network_ask);
         if !full.is_empty() {
             return self.ref_step(idx, NodeAction::RelayEvict(full));
         }
@@ -422,47 +443,33 @@ impl<L: TestLog> Driver<L> {
             }
             Step::RecvWant {
                 from,
-                origin,
                 log,
                 start,
                 end,
             } => {
-                let ranges = LogRanges::from_pairs([(log, Ranges::range(start, end))]);
                 let msg: WireMessage<u32, L> =
-                    WireMessage::want(from, origin, ranges, BTreeSet::new());
+                    WireMessage::want(from, interest(vec![(log, start, end)], vec![]));
                 (sut_out, ref_fx) = self.recv_want(idx, msg).await?;
             }
-            Step::RecvChannelWant {
-                from,
-                origin,
-                channel,
-            } => {
+            Step::RecvChannelWant { from, channel } => {
                 let msg: WireMessage<u32, L> =
-                    WireMessage::want(from, origin, LogRanges::empty(), BTreeSet::from([channel]));
+                    WireMessage::want(from, interest(vec![], vec![channel]));
                 (sut_out, ref_fx) = self.recv_want(idx, msg).await?;
             }
             Step::RecvMixedWant {
                 from,
-                origin,
-                ranges,
-                channels,
+                have,
+                pure,
                 budget,
             } => {
-                let ranges = LogRanges::from_pairs(
-                    ranges
-                        .into_iter()
-                        .map(|(log, start, end)| (log, Ranges::range(start, end))),
-                );
-                let channels: BTreeSet<u8> = channels.into_iter().collect();
-                let (pieces, dropped) =
-                    dash_router::pack::pack_want(from, origin, ranges, channels, budget);
+                let (pieces, truncated) =
+                    dash_router::pack::pack_want(from, interest(have, pure), budget);
                 // The small budget must split the Want, never hollow it: a
-                // dropped range would silently turn "named" into "unnamed"
-                // for both machines at once and hide a wholesale-vs-named
-                // divergence.
-                if dropped != 0 {
+                // truncated have would silently shrink a claim for both
+                // machines at once and hide a divergence in what is asked.
+                if truncated != 0 {
                     return Err(TestCaseError::fail(format!(
-                        "budget {budget} dropped {dropped} named log(s)"
+                        "budget {budget} truncated {truncated} author(s)"
                     )));
                 }
                 let (mut sut, mut refr) = (Vec::new(), Vec::new());
@@ -509,40 +516,31 @@ impl<L: TestLog> Driver<L> {
 
     /// Deliver a Want to both machines, mirroring the SUT's arm-on-recv.
     ///
-    /// Finding 8(a) / review focus 6: the SUT only arms the have timer when
-    /// the RECEIVED Want names something — ranges or channels (an empty
-    /// Want must not arm a forever no-op fire/re-arm loop; a channel-only
-    /// Want is a real request and must arm) and only when it is someone
-    /// else's (an echo of this node's own Want is not recorded, so arming
-    /// on it would be illegal). Mirror that exact gate here, not
-    /// `wants.is_empty()` (which is always false after a foreign Want,
-    /// since `RouterAction::RecvWant` records its origin's entry in `wants`
-    /// regardless of whether its ranges were empty).
+    /// Spec 2026-09-29 §4.4: the SUT arms the have timer after a received
+    /// Want only when none is armed and this node holds something some
+    /// seen Want asks for (`network_ask` is non-empty). Mirror that exact
+    /// gate here, after the reference has taken the same `Recv`.
     async fn recv_want(
         &mut self,
         idx: usize,
         msg: WireMessage<u32, L>,
     ) -> Result<(Vec<Out<u32, L>>, Vec<NodeEffect<u32, L>>), TestCaseError> {
-        let WireBody::Want {
-            origin,
-            ranges,
-            channels,
-        } = &msg.body
-        else {
-            unreachable!("recv_want is only called with a Want");
-        };
-        let want_nonempty = !ranges.is_empty() || !channels.is_empty();
-        let foreign = *origin != self.ref_state.router.id;
+        assert!(
+            matches!(msg.body, WireBody::Want(_)),
+            "recv_want is only called with a Want"
+        );
         let sut_out = self
             .core
             .on_wire(self.now, incoming(&msg))
             .await
             .map_err(|e| TestCaseError::fail(format!("step {idx}: SUT on_wire(Want): {e}")))?;
         let mut fx = self.ref_step(idx, NodeAction::Recv(msg))?;
-        // Binding semantics #1: a witnessed non-empty Want arms the Have
-        // timer when none is armed. Mirror the SUT's arm-on-recv, in the
-        // same call.
-        if want_nonempty && foreign && self.ref_state.router.have_timer.is_none() {
+        // Binding semantics #1: a Want this node can help with arms the
+        // Have timer when none is armed. Mirror the SUT's arm-on-recv, in
+        // the same call.
+        if self.ref_state.router.have_timer.is_none()
+            && !self.ref_state.router.network_ask().is_empty()
+        {
             let next = self.ref_script.next_have();
             let more = self.ref_step(
                 idx,
@@ -666,7 +664,6 @@ fn fixed_regression_sequence() {
         Step::Advance(150), // past the initial 100ms want interval
         Step::RecvWant {
             from: 1,
-            origin: 1,
             log: 1,
             start: 0,
             end: 5,
@@ -694,9 +691,9 @@ fn fixed_regression_sequence() {
             seqs: vec![(0, true), (1, true), (2, true), (3, true), (4, true)],
         },
         // Usage (9) now sits above the evict_at*relay_cap threshold (7), so
-        // this Maintain genuinely evicts: log 2's payloads aren't wanted by
-        // anyone (only log 1 is, via peer 1's still-live Want above), so
-        // `eviction_candidates` picks them for payload-first GC.
+        // this Maintain genuinely evicts: log 2's payloads aren't asked for
+        // by anyone (peer 1's still-live Want above asks only for log 1's
+        // tail), so `eviction_candidates` picks them for payload-first GC.
         Step::Maintain,
         Step::Unsubscribe(0),
         Step::Advance(700), // past want_ttl/have_ttl (500ms) expiry
@@ -708,30 +705,17 @@ fn fixed_regression_sequence() {
 
 /// Final review F2: the `Pair` universe's shape, pinned. Two logs under
 /// channel 1 park in the relay, then a Subscribe migrates both; a peer's
-/// mixed Want (a named tail plus the channel) arrives split into pieces, and
-/// this node's own Want comes back echoed by a relay; the Have that answers
-/// must agree between the machines.
+/// Want claiming twenty authors under channel 1 arrives split into scoped
+/// frames, another peer's claims `b` plus a pure want for channel 0; the
+/// Have that answers must agree between the machines.
 #[test]
 fn fixed_pair_regression_sequence() {
     let (a, b, other) = (Pair::new(1, 0), Pair::new(1, 1), Pair::new(0, 0));
-    let mixed = |from, origin, log, budget| Step::RecvMixedWant {
-        from,
-        origin,
-        ranges: vec![(log, 1, 8)],
-        channels: vec![1],
-        budget,
-    };
-    let split = dash_router::pack::pack_want(
-        1u32,
-        4u32,
-        LogRanges::from_pairs([(a, Ranges::range(1, 8))]),
-        BTreeSet::from([1u8]),
-        12,
-    );
-    assert_eq!(
-        (split.0.len(), split.1),
-        (2, 0),
-        "a 12-byte budget splits channels from ranges, dropping nothing"
+    let twenty: Vec<(Pair, u32, u32)> = (0..20u8).map(|x| (Pair::new(1, x), 1, 8)).collect();
+    let split = dash_router::pack::pack_want(1u32, interest(twenty.clone(), vec![]), 60);
+    assert!(
+        split.0.len() >= 2 && split.1 == 0,
+        "a 60-byte budget splits twenty authors into scoped frames, truncating nothing"
     );
     let steps = vec![
         Step::RecvHave {
@@ -749,11 +733,21 @@ fn fixed_pair_regression_sequence() {
             log: other,
             seqs: vec![(0, false)],
         },
-        Step::Subscribe(1),   // migrates a and b, not `other`
-        Step::Advance(600),   // past have_ttl: the Haves above expire
-        mixed(1, 4, a, 12),   // 4 names a's tail and wants channel 1, split
-        mixed(2, 0, b, 3800), // this node's own Want, echoed by 2
-        Step::Advance(300),   // the have timer fires and answers 4
+        Step::Subscribe(1), // migrates a and b, not `other`
+        Step::Advance(600), // past have_ttl: the Haves above expire
+        Step::RecvMixedWant {
+            from: 1,
+            have: twenty,
+            pure: vec![],
+            budget: 60,
+        }, // split into scoped frames
+        Step::RecvMixedWant {
+            from: 2,
+            have: vec![(b, 1, 8)],
+            pure: vec![0],
+            budget: 3800,
+        },
+        Step::Advance(300), // the have timer fires and answers
         Step::Unsubscribe(1),
         Step::Append { log: other },
         Step::Advance(700),

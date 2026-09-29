@@ -1,9 +1,9 @@
 //! Scenario tests driving whole networks, with bounded model types.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::sync::Arc;
 
 use dash_router_core::{
-    LogRanges, NodeAction, NodeEffect, NodeMachine, NodeState, Op, RouterAction, RouterConfig,
+    Entry, Interest, NodeAction, NodeEffect, NodeMachine, NodeState, Op, RouterAction, RouterConfig,
 };
 use dash_router_net_model::{Fair, NetAction, NetMachine, NetState, Topology};
 use polestar::{StateMachine, prelude::*, time::FiniteTime};
@@ -39,6 +39,7 @@ fn router_config() -> RouterConfig<T> {
     RouterConfig {
         want_ttl: t(2),
         have_ttl: t(2),
+        heard_ttl: t(2),
     }
 }
 
@@ -232,9 +233,7 @@ fn absent_messages_and_smuggled_recvs_are_disabled() {
             n(1),
             NodeAction::Router(RouterAction::RecvWant {
                 from: n(0),
-                origin: n(0),
-                ranges: LogRanges::empty(),
-                channels: BTreeSet::new(),
+                interest: Interest::single(l(0), Entry::default()),
             }),
         ),
     );
@@ -362,7 +361,7 @@ mod channel_behind_relay {
             drain(net);
         }
         for id in ids {
-            if !net.nodes[&id].router.wants.is_empty() {
+            if !net.nodes[&id].router.network_ask().is_empty() {
                 router(net, id, RouterAction::ArmHaveTimer(ms(0)));
                 router(net, id, RouterAction::FireHave);
                 drain(net);
@@ -383,6 +382,7 @@ mod channel_behind_relay {
             RouterConfig {
                 want_ttl: ms(500),
                 have_ttl: ms(500),
+                heard_ttl: ms(500),
             },
             10_000,
         );

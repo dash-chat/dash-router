@@ -193,7 +193,7 @@ where
             peers = self.peers_heard.len(),
             subscriptions = self.subscriptions.len(),
             held_logs = self.held_cache.len(),
-            wanters = self.router.wants.len(),
+            seen_wants = self.router.seen.len(),
             dropped_total = self.dropped_msgs,
             relay_errors_total = self.relay_errors,
             oversize_drops_total = self.oversize_drops,
@@ -257,7 +257,10 @@ where
                 let fx = self.router.step(RouterAction::FireHave)?;
                 self.route_fx(fx, &BTreeMap::new(), &BTreeSet::new(), &mut out)
                     .await?;
-                if !self.router.wants.is_empty() {
+                // Re-arm while some live Want still asks for something this
+                // node holds: a fire suppressed by a recent Have is retried
+                // until the record expires (bounded by want_ttl).
+                if !self.router.network_ask().is_empty() {
                     let next = self.intervals.next_have();
                     self.router.step(RouterAction::ArmHaveTimer(next.into()))?;
                 }
@@ -317,41 +320,24 @@ where
             tracing::info!(peer = %msg.sender, "dash-router heard from a new peer");
         }
         match msg.body {
-            WireBody::Want {
-                origin,
-                ranges,
-                channels,
-            } => {
+            WireBody::Want(interest) => {
                 tracing::trace!(
                     from = %msg.sender,
-                    %origin,
-                    logs = ranges.len(),
-                    channels = channels.len(),
+                    channels = interest.len(),
                     "dash-router received want"
                 );
-                // Finding 8(a): an EMPTY Want must not arm the have timer —
-                // otherwise it arms a forever no-op fire/re-arm loop (fire
-                // finds nothing to reply to, re-arms, repeats). Gate on the
-                // received Want naming something — ranges or channels (a
-                // channel-only Want is a real request: it asks for every log
-                // under the channel) — and on it being someone else's: an
-                // echo of this node's own Want is not recorded, so it
-                // witnesses nothing to answer. Mirrored exactly by the
-                // conformance driver (see tests/conformance.rs).
-                let want_nonempty = !ranges.is_empty() || !channels.is_empty();
-                let foreign = origin != self.router.id;
                 let fx = self.router.step(RouterAction::RecvWant {
                     from: msg.sender,
-                    origin,
-                    ranges,
-                    channels,
+                    interest,
                 })?;
                 self.route_fx(fx, &BTreeMap::new(), &BTreeSet::new(), &mut out)
                     .await?;
-                // A witnessed Want is what makes arming the Have timer
-                // legal (mirrors the sim behavior's arm-on-recv): do it
-                // right after the Recv, in the same call.
-                if want_nonempty && foreign && self.router.have_timer.is_none() {
+                // A Want arms the Have timer only when this node holds
+                // something some seen Want asks for (spec 2026-09-29 §4.4):
+                // an echo of its own Want, or a Want for data it lacks, arms
+                // nothing. Mirrored exactly by the conformance driver (see
+                // tests/conformance.rs) and the sim behavior.
+                if self.router.have_timer.is_none() && !self.router.network_ask().is_empty() {
                     let next = self.intervals.next_have();
                     self.router.step(RouterAction::ArmHaveTimer(next.into()))?;
                 }
@@ -535,8 +521,8 @@ where
                     return Ok(out);
                 }
             };
-            let others_wants = self.router.others_wants();
-            let candidates = eviction_candidates(&held_payloads, &others_wants);
+            let network_ask = self.router.network_ask();
+            let candidates = eviction_candidates(&held_payloads, &network_ask);
             if !candidates.is_empty() {
                 // Payloads-first: headers survive, so no `Held` snapshot is
                 // needed.
@@ -551,7 +537,7 @@ where
                         return Ok(out);
                     }
                 };
-                let full = held_all.difference(&others_wants);
+                let full = held_all.difference(&network_ask);
                 if !full.is_empty() {
                     if let Err(e) = self.relay.evict(&full).await {
                         self.relay_error("on_maintain: relay.evict", e);
@@ -567,7 +553,7 @@ where
 
     /// Take the accumulated pending push and run it through the router, if
     /// non-empty.
-    fn flush_push(&mut self) -> Result<Vec<Effect<N, L>>> {
+    fn flush_push(&mut self) -> Result<Vec<Effect<L>>> {
         let ranges = std::mem::replace(&mut self.pending_push, LogRanges::empty());
         self.pending_since = None;
         if ranges.is_empty() {
@@ -581,7 +567,7 @@ where
     /// the async transcription of `NodeMachine::route_router_fx`.
     async fn route_fx(
         &mut self,
-        fx: Vec<Effect<N, L>>,
+        fx: Vec<Effect<L>>,
         parked: &BTreeMap<(L, Seq), Op>,
         failed: &BTreeSet<(L, Seq)>,
         out: &mut Vec<Out<N, L>>,
@@ -605,25 +591,11 @@ where
                         }
                     }
                 }
-                Effect::SendWant {
-                    origin,
-                    ranges,
-                    channels,
-                } => {
-                    tracing::trace!(
-                        %origin,
-                        logs = ranges.len(),
-                        channels = channels.len(),
-                        "dash-router sending want"
-                    );
-                    let (msgs, dropped) = pack_want(
-                        self.router.id,
-                        origin,
-                        ranges,
-                        channels,
-                        self.max_wire_bytes,
-                    );
-                    self.oversize_drops += dropped;
+                Effect::SendWant(interest) => {
+                    tracing::trace!(channels = interest.len(), "dash-router sending want");
+                    let (msgs, truncated) =
+                        pack_want(self.router.id, interest, self.max_wire_bytes);
+                    self.oversize_drops += truncated;
                     self.sent_msgs += msgs.len() as u64;
                     out.extend(msgs.into_iter().map(Out::Broadcast));
                 }
@@ -1070,8 +1042,8 @@ mod tests {
     use std::time::Duration;
 
     use dash_router_core::{
-        EvictableStorage, LogRanges, Op, OpsMap, Pair, Ranges, RouterConfig, Storage, WireBody,
-        WireMessage,
+        Entry, EvictableStorage, Interest, LogRanges, Op, OpsMap, Pair, Ranges, RouterConfig,
+        Storage, WireBody, WireMessage,
     };
     // NOTE: OpsMap has both the sync traits and (via the blanket bridge) the
     // async ones; assertions below use UFCS on the sync traits to
@@ -1090,6 +1062,7 @@ mod tests {
             router: RouterConfig {
                 want_ttl: Duration::from_millis(500).into(),
                 have_ttl: Duration::from_millis(500).into(),
+                heard_ttl: Duration::from_millis(500).into(),
             },
             relay_cap: cap,
             evict_at: 0.75,
@@ -1257,21 +1230,25 @@ mod tests {
         );
     }
 
-    /// Review focus 6: a Want naming no ranges and no channels must not arm
-    /// the have timer; a channel-only Want must.
+    /// Spec 2026-09-29 §4.4: a Want arms the have timer only when this
+    /// node can satisfy some of it. Holding nothing, a pure want for the
+    /// channel arms nothing; once seq 0 is held, the same Want arms.
     #[tokio::test]
-    async fn channel_only_want_arms_have_timer_but_empty_want_does_not() {
-        let mut c = core(100, &[]).await;
-        let empty = WireMessage::want(7, 7, LogRanges::<u8>::empty(), BTreeSet::new());
-        c.on_wire(Duration::from_millis(1), wire(empty))
+    async fn a_want_arms_the_have_timer_only_when_this_node_can_help() {
+        let mut c = core(100, &[0]).await;
+        let pure = WireMessage::want(7, Interest::<u8>::single(0u8, Entry::default()));
+        c.on_wire(Duration::from_millis(1), wire(pure.clone()))
             .await
             .unwrap();
-        assert!(c.router.have_timer.is_none(), "empty Want must not arm");
-        let channel_only = WireMessage::want(7, 7, LogRanges::<u8>::empty(), BTreeSet::from([0u8]));
-        c.on_wire(Duration::from_millis(2), wire(channel_only))
+        assert!(c.router.have_timer.is_none(), "nothing held: must not arm");
+        let _ = c
+            .on_append(Duration::from_millis(2), 0, 0, op(1, true))
             .await
             .unwrap();
-        assert!(c.router.have_timer.is_some(), "channel-only Want arms");
+        c.on_wire(Duration::from_millis(3), wire(pure))
+            .await
+            .unwrap();
+        assert!(c.router.have_timer.is_some(), "seq 0 held: the Want arms");
     }
 
     /// Push debounce: appends accumulate; the flush pushes one hydrated Have
@@ -1341,11 +1318,7 @@ mod tests {
         // stored is wanted through the Want's `channels`, not a `(0, full)`
         // range.
         assert!(
-            matches!(
-                &bs[0].body,
-                WireBody::Want { origin: 0, ranges, channels }
-                    if channels.contains(&0) && ranges.get(&0).is_none()
-            ),
+            matches!(&bs[0].body, WireBody::Want(i) if i.get(&0).is_some_and(|e| e.is_pure())),
             "fresh subscription wants the whole channel"
         );
 
@@ -1358,34 +1331,20 @@ mod tests {
             .await
             .unwrap();
 
-        let want = WireMessage::want(
-            7,
-            7,
-            LogRanges::from_pairs([(0u8, Ranges::full())]),
-            BTreeSet::new(),
-        );
-        let _out = c
+        let want = WireMessage::want(7, Interest::<u8>::single(0u8, Entry::default()));
+        let out = c
             .on_wire(Duration::from_millis(150), wire(want))
             .await
             .unwrap();
-        // NOTE (deviation from the brief's literal assertion, see task-9
-        // report): RouterMachine's RecvWant relays only the range NOT
-        // already in `relayed_want_ranges()` (the flood's seen-set,
-        // DESIGN.md-mandated termination). Our own FireWant at t=100
-        // already flooded the full range for log 0 with a 500ms want_ttl,
-        // so a peer's identical want at t=150 is witnessed (recorded in
-        // `wants`, which is what legalizes arming the have timer) but is
-        // correctly NOT re-flooded — re-broadcasting it would be redundant
-        // per the seen-set's own accounting. This is core, unmodified
-        // behavior (verified directly against `RouterMachine::transition`),
-        // not a shell bug.
-        assert!(
-            c.router.wants.contains_key(&7),
-            "the peer's want is witnessed"
-        );
+        // The peer's pure want for channel 0 asks for nothing this node's
+        // own Want at t=100 (also pure, still seen) did not ask for, so it
+        // is not relayed; but this node now holds seq 0, so it can help,
+        // and that is what arms the Have timer.
+        assert!(broadcasts(&out).is_empty(), "covered: not re-relayed");
+        assert_eq!(c.router.seen.len(), 2, "own Want and the peer's are seen");
         assert!(
             c.router.have_timer.is_some(),
-            "witnessed Want arms the have timer"
+            "a Want this node can help with arms the have timer"
         );
         // The push from the append is still pending (not yet flushed) and,
         // by construction (window/max_latency both 100s), cannot flush
@@ -1449,12 +1408,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let want = WireMessage::want(
-            7,
-            7,
-            LogRanges::from_pairs([(0u8, Ranges::full())]),
-            BTreeSet::new(),
-        );
+        let want = WireMessage::want(7, Interest::<u8>::single(0u8, Entry::default()));
         let _ = c
             .on_wire(Duration::from_millis(10), wire(want))
             .await
@@ -1485,17 +1439,13 @@ mod tests {
         assert_eq!(c.oversize_drops, 0);
     }
 
-    /// Spec 2026-09-22 §3.3 end to end: a Want that `pack_want` splits into
-    /// several wire messages is recorded whole by the receiver — channels
-    /// (first piece) and every piece's ranges — not just the last piece.
-    ///
-    /// Final review F1: the receiver holds two logs under the wanted
-    /// channel, `a` (named by the split Want) and `b` (not named). The split
-    /// Want arrives relayed by 7, as does the receiver's own Want, echoed
-    /// back. The echo names both logs; it must not count as the wanter
-    /// naming them, so `a` goes as its named tail and `b` wholesale.
+    /// Spec 2026-09-29 §5.2 end to end: a Want that `pack_want` splits into
+    /// scoped frames is answered by the receiver as one ask, with no
+    /// reassembly: the author it listed gets what it lacks, the author it
+    /// did not list goes wholesale. The receiver's own Want, echoed back
+    /// by the same relay, is inert.
     #[tokio::test]
-    async fn split_want_is_fully_recorded_by_the_receiver() {
+    async fn split_want_is_answered_as_one_ask_by_the_receiver() {
         let a = Pair::new(1, 1);
         let b = Pair::new(1, 2);
         let mut c: PairCore = NodeCore::new(
@@ -1522,46 +1472,51 @@ mod tests {
             .iter()
             .rev()
             .find_map(|o| match o {
-                Out::Broadcast(m) if matches!(m.body, WireBody::Want { .. }) => Some(m.clone()),
+                Out::Broadcast(m) if matches!(m.body, WireBody::Want(_)) => Some(m.clone()),
                 _ => None,
             })
             .expect("the receiver fires its own Want");
 
-        let ranges = LogRanges::from_pairs(
-            std::iter::once((a, Ranges::from(5)))
-                .chain((0..200u8).map(|l| (Pair::new(2, l), Ranges::from(3)))),
-        );
-        let channels: BTreeSet<u8> = std::iter::once(1).chain(100..110).collect();
-        let (msgs, dropped) =
-            crate::pack::pack_want(8u32, 8u32, ranges.clone(), channels.clone(), 200);
-        assert_eq!(dropped, 0);
+        // Peer 8 holds a up to 5 and two hundred other authors' prefixes
+        // under channel 1; it has never seen b.
+        let peer_have: BTreeMap<u8, Ranges> = std::iter::once((1u8, Ranges::range(0, 5)))
+            .chain((10..210u8).map(|x| (x, Ranges::range(0, 3))))
+            .collect();
+        let (msgs, truncated) =
+            crate::pack::pack_want(8u32, Interest::single(1u8, Entry::whole(peer_have)), 200);
+        assert_eq!(truncated, 0);
         assert!(msgs.len() >= 3, "the Want must actually split");
-        // Relayer 7 re-signs; the origin rides through unchanged.
+        // Relayer 7 re-signs every frame, and the echo.
+        let mut relayed_wants = 0;
         for (i, mut msg) in msgs.into_iter().chain([own_want]).enumerate() {
             msg.sender = 7;
-            let _ = c
+            let out = c
                 .on_wire(Duration::from_millis(600 + i as u64), wire(msg))
                 .await
                 .unwrap();
+            relayed_wants += out
+                .iter()
+                .filter(|o| matches!(o, Out::Broadcast(m) if matches!(m.body, WireBody::Want(_))))
+                .count();
         }
         assert_eq!(
             c.router.next_have(),
             LogRanges::from_pairs([(a, Ranges::range(5, 10)), (b, Ranges::range(0, 5))]),
-            "named log: its tail only; unnamed log under the channel: wholesale"
+            "listed author: what it lacks; unlisted author: wholesale"
         );
-        assert_eq!(
-            c.router.wants.keys().copied().collect::<Vec<_>>(),
-            vec![8],
-            "recorded under the origin only: not the relayer, not the echo"
+        assert!(
+            c.router.have_timer.is_some(),
+            "a Want this node can help with arms the have timer"
         );
-        let recorded = c.router.wants[&8]
-            .iter()
-            .fold(LogRanges::empty(), |acc, r| acc.union(&r.ranges));
-        assert_eq!(recorded, ranges, "every piece's ranges");
+        // Relay on first sight is judged against the receiver's own Want,
+        // which already asks for all of every author it does not hold:
+        // only the fragment listing `a` (it asks for a's 5..10, which the
+        // receiver, holding 0..10, does not) says anything new. The other
+        // fragments ask for tails of authors the receiver's Want wants in
+        // full, and the echo asks for nothing, so none of those is relayed.
         assert_eq!(
-            c.router.others_channels(),
-            channels,
-            "the channel piece too"
+            relayed_wants, 1,
+            "exactly the fragment asking for something new is relayed whole"
         );
     }
 
@@ -1602,9 +1557,7 @@ mod tests {
         };
         let echo = wire(WireMessage::want(
             0,
-            0,
-            LogRanges::from_pairs([(0u8, Ranges::full())]),
-            BTreeSet::new(),
+            Interest::<u8>::single(0u8, Entry::default()),
         ));
         for inc in [foreign, garbage, echo] {
             assert!(c.on_wire(Duration::ZERO, inc).await.unwrap().is_empty());
@@ -1651,12 +1604,7 @@ mod tests {
             Scripted::ms(&[1000]),
         );
         c.init().await.unwrap();
-        let msg = WireMessage::want(
-            Keyed(2),
-            Keyed(2),
-            LogRanges::from_pairs([(0u8, Ranges::full())]),
-            BTreeSet::new(),
-        );
+        let msg = WireMessage::want(Keyed(2), Interest::<u8>::single(0u8, Entry::default()));
         let forged = Incoming {
             remote: None,
             author: Some(PeerKey([3; 32])),
@@ -1664,7 +1612,7 @@ mod tests {
         };
         c.on_wire(Duration::from_millis(1), forged).await.unwrap();
         assert_eq!(c.dropped_msgs, 1, "claimed k2, envelope says k3: dropped");
-        assert!(c.router.wants.is_empty());
+        assert!(c.router.seen.is_empty());
 
         let genuine = Incoming {
             remote: None,
@@ -1673,7 +1621,7 @@ mod tests {
         };
         c.on_wire(Duration::from_millis(2), genuine).await.unwrap();
         assert_eq!(c.dropped_msgs, 1);
-        assert!(c.router.wants.contains_key(&Keyed(2)));
+        assert_eq!(c.router.seen.len(), 1, "the genuine Want is seen");
 
         let unverified = Incoming {
             remote: None,

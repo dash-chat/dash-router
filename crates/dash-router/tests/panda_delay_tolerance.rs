@@ -20,7 +20,12 @@
 //! signing key, the same ext store and the same relay store, exactly as a
 //! phone coming back into range would.
 //!
-//! Schedule, with only nodes `n` and `n+1` on the LAN at each step:
+//! Schedule, with only nodes `n` and `n+1` on the LAN at each step, each
+//! step starting with both joining afresh (the node carried over from the
+//! previous step leaves and rejoins too: a long-lived p2panda peer meeting
+//! a rejoining key can lose the link one-sidedly to the iroh-gossip fork's
+//! supersede/close race, which is a transport bug, not what this test is
+//! about):
 //!
 //! - forward, n = 0 ..= N-2: wait until `n+1` holds A's op (Z: in its ext
 //!   store; anyone else: in its relay store);
@@ -214,17 +219,14 @@ impl Node {
     }
 }
 
-/// Make exactly `on` the set of nodes on the LAN.
+/// Make exactly `on` the set of nodes on the LAN, every one of them with a
+/// fresh transport: whoever was already on leaves first and rejoins.
 async fn set_lan(nodes: &mut [Node], on: &[usize]) {
     for (i, node) in nodes.iter_mut().enumerate() {
-        if !on.contains(&i) {
-            node.leave(i).await;
-        }
+        node.leave(i).await;
     }
     for &i in on {
-        if nodes[i].live.is_none() {
-            nodes[i].join(i).await;
-        }
+        nodes[i].join(i).await;
     }
 }
 

@@ -16,6 +16,7 @@ pub fn config() -> CoreConfig {
         router: RouterConfig {
             want_ttl: Duration::from_secs(2).into(),
             have_ttl: Duration::from_secs(2).into(),
+            heard_ttl: Duration::from_secs(2).into(),
         },
         relay_cap: 1 << 20,
         evict_at: 0.75,

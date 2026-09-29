@@ -2,13 +2,15 @@
 //! router with the relay/ext stores into a single routing table over the
 //! wire. See task-4-brief.md.
 
-use std::collections::BTreeSet;
-
 use dash_router_core::{
-    EvictableStorage, LogRanges, NodeAction, NodeEffect, NodeMachine, NodeState, Op, Ranges,
-    RouterAction, RouterConfig, Storage, Units, WireBody, WireMessage,
+    Entry, EvictableStorage, Interest, LogRanges, NodeAction, NodeEffect, NodeMachine, NodeState,
+    Op, Ranges, RouterAction, RouterConfig, Storage, Units, WireBody, WireMessage,
 };
-use polestar::{id::UpTo, prelude::*, time::FiniteTime};
+use polestar::{
+    id::{IdUnit, UpTo},
+    prelude::*,
+    time::FiniteTime,
+};
 
 type N = UpTo<3>;
 type L = UpTo<2>;
@@ -34,6 +36,7 @@ fn machine() -> Node {
         RouterConfig {
             want_ttl: t(2),
             have_ttl: t(2),
+            heard_ttl: t(2),
         },
         100,
     )
@@ -44,6 +47,7 @@ fn tiny(cap: Units) -> Node {
         RouterConfig {
             want_ttl: t(2),
             have_ttl: t(2),
+            heard_ttl: t(2),
         },
         cap,
     )
@@ -283,9 +287,9 @@ fn unsubscribe_keeps_advertising_and_keeps_wanting() {
         })
         .unwrap();
     match &want.body {
-        WireBody::Want { ranges, .. } => assert!(
-            ranges.get(&l(0)).is_some_and(|r| r.contains(1)),
-            "still wants the log's open tail after unsubscribe"
+        WireBody::Want(i) => assert!(
+            i.get(&l(0)).is_some_and(|e| e.have_of(&IdUnit).contains(0)),
+            "still claims seq 0 after unsubscribe, so it asks for the tail"
         ),
         other => panic!("expected a Want, got {other:?}"),
     }
@@ -310,9 +314,7 @@ fn ext_spontaneity_reconciles_and_smuggled_recvs_are_disabled() {
             s.clone(),
             NodeAction::Router(RouterAction::RecvWant {
                 from: n(1),
-                origin: n(1),
-                ranges: lr([(0, Ranges::full())]),
-                channels: BTreeSet::new(),
+                interest: Interest::single(l(0), Entry::default()),
             })
         )
         .is_err()
@@ -375,9 +377,7 @@ fn send_have_hydration_prefers_the_payload_bearing_copy() {
             s,
             NodeAction::Recv(WireMessage::want(
                 n(1),
-                n(1),
-                lr([(0, Ranges::full())]),
-                BTreeSet::new(),
+                Interest::single(l(0), Entry::default()),
             )),
         )
         .unwrap();
@@ -416,8 +416,15 @@ fn relay_evict_payloads_frees_units_and_keeps_advertising() {
     let (s, _) = m.transition(s, NodeAction::Recv(have)).unwrap();
     assert_eq!(s.relay.0.usage(), 4);
 
-    // Peer 2 wants seq 0: its payload must survive to answer the Want.
-    let want = WireMessage::want(n(2), n(2), lr([(1, Ranges::range(0, 1))]), BTreeSet::new());
+    // Peer 2 has seq 1 and so asks for seq 0: its payload must survive to
+    // answer the Want.
+    let want = WireMessage::want(
+        n(2),
+        Interest::single(
+            l(1),
+            Entry::whole([(IdUnit, Ranges::range(1, 2))].into_iter().collect()),
+        ),
+    );
     let (s, _) = m.transition(s, NodeAction::Recv(want)).unwrap();
     let candidates = s.eviction_candidates();
     assert_eq!(
@@ -461,8 +468,8 @@ mod channel {
     use std::time::Duration;
 
     use dash_router_core::{
-        LogRanges, NodeAction, NodeEffect, NodeMachine, NodeState, Op, Pair, Ranges, RouterConfig,
-        WireBody, WireMessage,
+        Entry, Interest, NodeAction, NodeEffect, NodeMachine, NodeState, Op, Pair, Ranges,
+        RouterConfig, WireBody, WireMessage,
     };
     use dash_router_core::{RouterAction, Storage};
     use polestar::prelude::*;
@@ -475,6 +482,7 @@ mod channel {
             RouterConfig {
                 want_ttl: Duration::from_millis(500).into(),
                 have_ttl: Duration::from_millis(500).into(),
+                heard_ttl: Duration::from_millis(500).into(),
             },
             1 << 20,
         )
@@ -572,40 +580,47 @@ mod channel {
             .unwrap();
         let want = fx.iter().find_map(|e| match e {
             NodeEffect::Broadcast(WireMessage {
-                body:
-                    WireBody::Want {
-                        origin,
-                        ranges,
-                        channels,
-                    },
+                body: WireBody::Want(i),
                 ..
-            }) => Some((*origin, ranges.clone(), channels.clone())),
+            }) => Some(i.clone()),
             _ => None,
         });
         assert_eq!(
             want,
-            Some((0u32, LogRanges::empty(), BTreeSet::from([1u8]))),
-            "an own Want names this node as its origin"
+            Some(Interest::single(1u8, Entry::default())),
+            "a pure want for the channel, nothing else"
         );
     }
 
-    /// Final review F1: a relayer re-signs a Want but keeps its origin, so
-    /// the answerer keys it by the wanter and recognises its own echoes.
+    /// Final review F1, restated: a relayer forwards a Want whole and
+    /// re-signed, and the wanter recognises the echo of its own Want by
+    /// content — it is covered by its own emission, so it is neither
+    /// relayed again nor answered, and a pure want is never adopted.
     #[test]
-    fn relayed_want_keeps_its_origin() {
+    fn a_relayed_want_serves_the_wanter_and_echoes_are_inert() {
         let m = machine();
-        let s = NodeState::new(1u32, m.clone(), []);
-        let (s, fx) = m
+        // The wanter (node 0, subscribed to channel 1, holding nothing)
+        // emits its pure want.
+        let s0 = NodeState::new(0u32, m.clone(), [1u8]);
+        let (s0, _) = m
             .transition(
-                s,
-                NodeAction::Recv(WireMessage::want(
-                    0u32,
-                    0u32,
-                    LogRanges::empty(),
-                    BTreeSet::from([1u8]),
-                )),
+                s0,
+                NodeAction::Router(RouterAction::ArmWantTimer(Duration::ZERO.into())),
             )
             .unwrap();
+        let (s0, fx) = m
+            .transition(s0, NodeAction::Router(RouterAction::FireWant))
+            .unwrap();
+        let own = fx
+            .iter()
+            .find_map(|e| match e {
+                NodeEffect::Broadcast(w) => Some(w.clone()),
+                _ => None,
+            })
+            .expect("the wanter emits");
+        // The relay (node 1, holding nothing) forwards it whole.
+        let s1 = NodeState::new(1u32, m.clone(), []);
+        let (s1, fx) = m.transition(s1, NodeAction::Recv(own)).unwrap();
         let relayed: Vec<_> = fx
             .iter()
             .filter_map(|e| match e {
@@ -617,20 +632,19 @@ mod channel {
             relayed,
             vec![WireMessage::want(
                 1u32,
-                0u32,
-                LogRanges::empty(),
-                BTreeSet::from([1u8])
+                Interest::single(1u8, Entry::default())
             )]
         );
-        assert!(s.router.wants.contains_key(&0), "keyed by the origin");
-        // The same Want, relayed back to its origin by this node: no record.
-        let s0 = NodeState::new(0u32, m.clone(), [1u8]);
-        let (s0, _) = m
+        assert_eq!(s1.router.seen.len(), 1, "seen at the relay");
+        assert!(s1.router.heard.is_empty(), "a pure want is not adopted");
+        // The echo reaches the wanter: nothing to relay, nothing to answer.
+        let (s0, fx) = m
             .transition(s0, NodeAction::Recv(relayed[0].clone()))
             .unwrap();
+        assert!(fx.is_empty(), "an echo is covered by the own emission");
         assert!(
-            s0.router.wants.is_empty(),
-            "an echo of an own Want is ignored"
+            s0.router.next_have().is_empty(),
+            "and asks for nothing held"
         );
     }
 }

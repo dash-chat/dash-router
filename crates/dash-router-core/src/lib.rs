@@ -1,3 +1,4 @@
+pub mod interest;
 pub mod log;
 pub mod node;
 pub mod op;
@@ -6,13 +7,16 @@ pub mod router;
 pub mod storage;
 pub mod wire;
 
+pub use interest::{Entry, Interest};
 pub use log::{Log, Pair, WireLog};
 pub use node::{
     NodeAction, NodeEffect, NodeMachine, NodeState, eviction_candidates, group_ops, ranges_of,
 };
 pub use op::Op;
 pub use ranges::{LogRanges, Ranges, Seq};
-pub use router::{Effect, RouterAction, RouterConfig, RouterMachine, RouterState};
+pub use router::{
+    Effect, Record, RouterAction, RouterConfig, RouterMachine, RouterState, SeenWant,
+};
 pub use storage::{
     EvictableStorage, ExtStoreAction, ExtStoreMachine, ExtStoreState, OpsMap, RelayStoreAction,
     RelayStoreMachine, RelayStoreState, Storage, StoreEffect, Units,

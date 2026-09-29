@@ -22,6 +22,11 @@ pub trait Log: Id {
     /// `Self::new(l.channel(), l.author()) == l`. A nested `LogRanges`
     /// rebuilds ids through this when iterated.
     fn new(channel: Self::Channel, author: Self::Author) -> Self;
+    /// The first four bytes of an author's identity, big-endian: the key a
+    /// Want's scope is expressed over (spec 2026-09-29 §2, `Interest`).
+    /// Authors sharing a prefix always fall in the same scope, so the
+    /// prefix must be a function of the author alone.
+    fn author_prefix(author: &Self::Author) -> u32;
 }
 
 macro_rules! self_channeled {
@@ -32,6 +37,7 @@ macro_rules! self_channeled {
             fn channel(&self) -> Self { *self }
             fn author(&self) -> IdUnit { IdUnit }
             fn new(channel: Self, _: IdUnit) -> Self { channel }
+            fn author_prefix(_: &IdUnit) -> u32 { 0 }
         })*
     };
 }
@@ -54,6 +60,9 @@ where
     }
     fn new(channel: Self, _: IdUnit) -> Self {
         channel
+    }
+    fn author_prefix(_: &IdUnit) -> u32 {
+        0
     }
 }
 
@@ -106,6 +115,10 @@ impl Log for Pair {
     }
     fn new(channel: u8, author: u8) -> Self {
         Self { channel, author }
+    }
+    /// A one-byte author is its own first byte.
+    fn author_prefix(author: &u8) -> u32 {
+        (*author as u32) << 24
     }
 }
 

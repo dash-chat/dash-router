@@ -282,6 +282,7 @@ impl ScenarioSpec {
         let router_config = RouterConfig::<RealTime> {
             want_ttl: ms(self.router.want_ttl_ms).into(),
             have_ttl: ms(self.router.have_ttl_ms).into(),
+            heard_ttl: ms(self.router.want_ttl_ms).into(),
         };
         let node_machine = NodeMachine::new(router_config, self.storage.relay_cap);
         let logs: Vec<LogId> = (0..self.workload.writers).collect();

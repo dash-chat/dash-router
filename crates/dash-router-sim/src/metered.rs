@@ -217,7 +217,7 @@ where
         let sent = sync_inflight(known_inflight, taken, &net.inflight);
         for flight in &sent {
             match &flight.message.body {
-                WireBody::Want { .. } => metrics.want_msgs += 1,
+                WireBody::Want(_) => metrics.want_msgs += 1,
                 WireBody::Have(_) => {
                     metrics.have_msgs += 1;
                     if let Some(o) = origin {

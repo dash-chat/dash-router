@@ -155,9 +155,9 @@ fn flight_edge(f: &SimFlight) -> (SimNodeId, SimNodeId) {
     (f.message.sender, f.to)
 }
 
-fn kind(body: &WireBody<SimNodeId, u8>) -> &'static str {
+fn kind(body: &WireBody<u8>) -> &'static str {
     match body {
-        WireBody::Want { .. } => "Want",
+        WireBody::Want(_) => "Want",
         WireBody::Have(_) => "Have",
     }
 }
@@ -246,7 +246,7 @@ impl Presenter for RouterPresenter {
         for flight in &net.inflight {
             let entry = flights.entry(flight_edge(flight)).or_default();
             match flight.message.body {
-                WireBody::Want { .. } => entry.0 += 1,
+                WireBody::Want(_) => entry.0 += 1,
                 WireBody::Have(_) => entry.1 += 1,
             }
         }
@@ -329,14 +329,6 @@ impl Presenter for RouterPresenter {
                         )
                     })
                     .collect();
-                let wants: Vec<FieldValue> = node
-                    .router
-                    .wants
-                    .iter()
-                    .map(|(origin, records)| {
-                        node_link(format!("{origin} ({})", records.len()), *origin)
-                    })
-                    .collect();
                 let held = node.relay.0.held_all().union(&node.ext.0.held_all());
                 let coverage = meter.metrics.node_coverage(id);
                 VizEvent::Sidebar {
@@ -358,10 +350,11 @@ impl Presenter for RouterPresenter {
                             "have timer",
                             timer_text(node.router.have_timer.as_ref().map(|t| &t.remaining)),
                         ),
-                        Field {
-                            label: "wants witnessed".into(),
-                            value: FieldValue::List { items: wants },
-                        },
+                        text("wants seen", node.router.seen.len()),
+                        text(
+                            "channels heard",
+                            format!("{:?}", node.router.heard.keys().collect::<Vec<_>>()),
+                        ),
                         Field {
                             label: "inbound in flight".into(),
                             value: FieldValue::List { items: inbound },

@@ -18,6 +18,7 @@ fn config() -> CoreConfig {
         router: RouterConfig {
             want_ttl: Duration::from_millis(500).into(),
             have_ttl: Duration::from_millis(500).into(),
+            heard_ttl: Duration::from_millis(500).into(),
         },
         relay_cap: 1024 as Units,
         evict_at: 0.75,
@@ -187,6 +188,7 @@ async fn late_joiner_under_channel_is_served_before_want_ttl() {
         router: RouterConfig {
             want_ttl: want_ttl.into(),
             have_ttl: want_ttl.into(),
+            heard_ttl: want_ttl.into(),
         },
         ..config()
     };
@@ -387,4 +389,59 @@ async fn broadcasts_are_sized_to_the_transport_limit() {
         large.iter().any(|b| b.len() > budget),
         "a larger limit lets the push go out in fewer, bigger Haves"
     );
+}
+
+/// Spec 2026-09-29 §9, the backward hop at the shell level: a relay that
+/// rejoins holding part of a channel (A's op) meets a relay holding more of
+/// it (A's and Z's ops). Neither subscribes. The joiner's Want claims what
+/// it has and so asks for the rest; the holder answers with Z's op within a
+/// Want/Have cycle, and the joiner's relay store ends up holding it.
+#[tokio::test(start_paused = true)]
+async fn a_rejoining_relay_is_topped_up_by_a_relay_holding_more() {
+    use dash_router_core::{OpsMap, Pair, Storage};
+    let a_log = Pair::new(7, 0);
+    let z_log = Pair::new(7, 5);
+    let op = |author: u8| Op {
+        header: vec![author],
+        payload: Some(vec![author; 8]),
+    };
+    let mut both = OpsMap::<Pair>::default();
+    Storage::ingest(&mut both, a_log, 0, op(0));
+    Storage::ingest(&mut both, z_log, 0, op(5));
+    let mut only_a = OpsMap::<Pair>::default();
+    Storage::ingest(&mut only_a, a_log, 0, op(0));
+
+    let hub = LoopbackHub::new();
+    let (_holder, _holder_events, _holder_task) = spawn(
+        4u32,
+        config(),
+        Duration::from_secs(1),
+        BTreeSet::<u8>::new(),
+        MemStore::<Pair>::new(),
+        both,
+        hub.join("192.168.0.4".parse().unwrap()),
+        intervals(4),
+    );
+    let (joiner, _joiner_events, _joiner_task) = spawn(
+        3u32,
+        config(),
+        Duration::from_secs(1),
+        BTreeSet::<u8>::new(),
+        MemStore::<Pair>::new(),
+        only_a,
+        hub.join("192.168.0.3".parse().unwrap()),
+        intervals(3),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let held = joiner.relay_held().await.expect("relay_held");
+        if held.contains(&z_log, 0) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the joiner never got Z's op; relay holds {held:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }

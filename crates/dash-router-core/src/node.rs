@@ -101,7 +101,7 @@ impl<N: Id, L: Log, T: polestar::time::TimeInterval> NodeState<N, L, T> {
 
     /// See [`eviction_candidates`].
     pub fn eviction_candidates(&self) -> LogRanges<L> {
-        eviction_candidates(&self.relay.0.held_payloads(), &self.router.others_wants())
+        eviction_candidates(&self.relay.0.held_payloads(), &self.router.network_ask())
     }
 }
 
@@ -196,15 +196,17 @@ pub fn ranges_of<L: Log>(parked: &BTreeMap<(L, Seq), Op>) -> LogRanges<L> {
     )
 }
 
-/// Payload-eviction candidates: relay payloads nobody currently wants
-/// (DESIGN.md's payloads-first GC). Evicting a wanted payload would force
-/// the network to re-send it, so recent Wants are spared. Pure policy,
-/// shared verbatim by the model composition and the tokio shell.
+/// Payload-eviction candidates: relay payloads nobody currently asks for
+/// (DESIGN.md's payloads-first GC). `network_ask` is
+/// `RouterState::network_ask`, everything some seen Want lacks of what
+/// this node holds; evicting that would force the network to re-send it.
+/// Pure policy, shared verbatim by the model composition and the tokio
+/// shell.
 pub fn eviction_candidates<L: Log>(
     relay_held_payloads: &LogRanges<L>,
-    others_wants: &LogRanges<L>,
+    network_ask: &LogRanges<L>,
 ) -> LogRanges<L> {
-    relay_held_payloads.difference(others_wants)
+    relay_held_payloads.difference(network_ask)
 }
 
 impl<N, L, T> Machine for NodeMachine<N, L, T>
@@ -241,16 +243,10 @@ where
                 self.route_router_fx(&mut s, fx, &BTreeMap::new(), &mut out)?;
             }
             NodeAction::Recv(wire) => match wire.body {
-                WireBody::Want {
-                    origin,
-                    ranges,
-                    channels,
-                } => {
+                WireBody::Want(interest) => {
                     let fx = s.router.step(RouterAction::RecvWant {
                         from: wire.sender,
-                        origin,
-                        ranges,
-                        channels,
+                        interest,
                     })?;
                     self.route_router_fx(&mut s, fx, &BTreeMap::new(), &mut out)?;
                 }
@@ -368,7 +364,7 @@ where
     fn route_router_fx(
         &self,
         s: &mut NodeState<N, L, T>,
-        fx: Vec<Effect<N, L>>,
+        fx: Vec<Effect<L>>,
         parked: &BTreeMap<(L, Seq), Op>,
         out: &mut Vec<NodeEffect<N, L>>,
     ) -> anyhow::Result<()> {
@@ -388,16 +384,10 @@ where
                         }
                     }
                 }
-                Effect::SendWant {
-                    origin,
-                    ranges,
-                    channels,
-                } => {
+                Effect::SendWant(interest) => {
                     out.push(NodeEffect::Broadcast(WireMessage::want(
                         s.router.id,
-                        origin,
-                        ranges,
-                        channels,
+                        interest,
                     )));
                 }
                 Effect::SendHave(r) => {

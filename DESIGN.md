@@ -56,10 +56,32 @@ Two message types. Want and Have.
 ```rust
 
 enum Message {
-    Want(LogRanges),
+    /// What the sender *has* under each channel it is interested in; it
+    /// asks for everything else in each entry's scope. No origin: a Want
+    /// is not attributable to a wanter, and a relayer re-signs it and
+    /// forwards it whole.
+    Want(Interest),
     Have {
         ops: HaveOps,
     }
+}
+
+/// At most one entry per channel. The Want's ask is the union of its
+/// entries' asks.
+struct Interest(BTreeMap<Channel, Entry>);
+
+/// The sender's have under one channel, within an inclusive scope of
+/// 32-bit author prefixes (the first four bytes of the author id; the
+/// default `[0, u32::MAX]` is the whole channel). The entry asks for every
+/// `(author, seq)` in scope that `have` does not list: an author absent
+/// from `have` is asked for in full, and an entry with an empty `have` is a
+/// *pure want* for its scope. A Want too big for one frame is cut into
+/// entries with disjoint scopes, each a complete ask on its own, so the
+/// receiver never reassembles.
+struct Entry {
+    lo: u32,
+    hi: u32,
+    have: BTreeMap<Author, Ranges>,
 }
 
 struct HaveOps(HashMap<LogId, Vec<(Seq, Op)>>);
@@ -120,14 +142,14 @@ To avoid overwhelming the network, rather than making careful decisions about re
 
 Each node emits Wants at random intervals (determined at the moment of the last Want emitted). The Want represents a request for other nodes to send a Have.
 
+A node is interested in a channel for one of three reasons: it subscribes to it; it holds at least one op under it, in either store (which is how interest survives across LANs: a relay carrying data under a channel keeps asking for the rest of it wherever it goes); or it has recently *heard* the channel wanted by a node that holds data under it (a node holding nothing would otherwise want nothing, and a holder answers only Wants). The last source expires on its own short TTL, is never persisted, and is never adopted from a pure want, so a want with no data behind it cannot chain from node to node and live forever.
+
 After each interval, the node calculates its next Want to send as follows:
 
-- Compute the LogRanges for all logs in its own stores
-    - Always ends with an open-ended range starting after the highest seq number held, including any earlier gaps
-- Subtract from that the union of all other recent Wants from other nodes
+- For each channel of interest, an entry claiming exactly what it holds under it (an empty claim for a channel it holds nothing under)
+- Drop every entry that the Wants it has recently seen — its own included — already *cover*: an entry is covered when everything it asks for is asked for by the union of the seen Wants. Concretely, the seen scopes for the channel together contain the entry's scope, and at every author listed by the entry or by a seen entry, the intersection of the seen haves is a subset of the entry's have.
 
-This accounts for the expectation that others' Wants will be responded to soon, while still requesting the portion that has not recently been requested.
-When other's wants' TTLs expire, it results in the next node to fire a Want re-including a request for that range to the network.
+Emission therefore cancels: whoever fires first after the seen records expire speaks for everyone whose interest theirs covers, and the rest stay silent. In a stable LAN one representative re-emits each distinct interest once per want TTL. Subscription is invisible on the wire: a subscriber's Want and a relay's are the same "what I have under channels I care about", and nothing says who wanted.
 
 ### 2. Emitting pushed Haves
 
@@ -140,13 +162,15 @@ Each node is also emitting Haves at intervals in response to Wants from other no
 When a node sees a Want from another node, and is not already waiting to send its next Have, it chooses a random interval after which it will fire off a new Have.
 (This means that as long as a node sees no new Wants from other nodes, and does not author new data itself, it will never send a Have.)
 
+A Want arms the Have timer only if the node holds something some seen Want asks for; an echo of its own Want, or a Want for data it lacks, arms nothing. After a fire the timer is re-armed while that still holds, so an answer suppressed by a recent Have is retried until the Want record expires.
+
 When the interval is up, the node calculates the next Have to emit:
 
-- Compute the LogRanges held by this node
-- Intersect that with the union of any recent Wants from other nodes.
+- For each recently seen Want, what it asks for out of what this node holds: the held ranges in each entry's scope minus the entry's have
+- Take the union over the seen Wants (merging asks by union is the same as intersecting haves, so it needs no knowledge of who sent which)
 - Subtract from that the union of Haves recently received from other nodes
 
-This represents any data held by the node which could be of use to any other node, minus the data which was recently circulating through the network
+This represents any data held by the node which some asker lacks, minus the data which was recently circulating through the network
 
 ### Rationale
 

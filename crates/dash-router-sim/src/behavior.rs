@@ -428,15 +428,27 @@ impl SimBehavior {
                     .binary_search(&flight)
                     .map_err(|_| anyhow::anyhow!("scheduled flight not in flight: {flight:?}"))?;
                 let to = flight.to;
-                // An echo of `to`'s own Want is not recorded, so it
-                // witnesses nothing and must not arm the Have timer.
-                let foreign_want =
-                    matches!(flight.message.body, WireBody::Want { origin, .. } if origin != to);
-                self.advance(state, to, actions);
+                // Arm the Have timer only for a Want this node can help
+                // with (spec 2026-09-29 §4.4), judged on the state as it
+                // stands: an echo of `to`'s own Want, or one asking for
+                // nothing `to` holds, arms nothing. Mirrors the shell.
+                let (dt, _, _) = self.advance(state, to, actions);
+                let helpful_want = match &flight.message.body {
+                    WireBody::Want(i) => {
+                        let router = &state.node(&to).router;
+                        // Only records surviving the tick just proposed
+                        // still count, plus the Want being delivered.
+                        !i.ask_within(&router.held).is_empty()
+                            || router
+                                .seen
+                                .iter()
+                                .filter(|r| dt < *r.ttl_left)
+                                .any(|r| !r.interest.ask_within(&router.held).is_empty())
+                    }
+                    WireBody::Have(_) => false,
+                };
                 actions.push(SimNetAction::Deliver(UpTo::new(idx)));
-                // A witnessed Want is what makes arming the Have timer
-                // legal; do it in the same tick, right after the Recv.
-                if foreign_want && state.node(&to).router.have_timer.is_none() {
+                if helpful_want && state.node(&to).router.have_timer.is_none() {
                     self.arm_have(to, actions);
                 }
             }
@@ -481,17 +493,17 @@ impl SimBehavior {
                                 n,
                                 NodeAction::Router(RouterAction::FireHave),
                             ));
-                            // Wants may still be outstanding — but only the
-                            // ones that survive the tick we just proposed:
-                            // arming with none witnessed is not enabled.
-                            let wants_survive = state
-                                .node(&n)
-                                .router
-                                .wants
-                                .values()
-                                .flatten()
-                                .any(|r| dt < *r.ttl_left);
-                            if wants_survive {
+                            // Re-arm while some Want surviving the tick we
+                            // just proposed still asks for something this
+                            // node holds (arming otherwise is not enabled);
+                            // mirrors the shell's re-arm after a fire.
+                            let router = &state.node(&n).router;
+                            let asks_survive = router
+                                .seen
+                                .iter()
+                                .filter(|r| dt < *r.ttl_left)
+                                .any(|r| !r.interest.ask_within(&router.held).is_empty());
+                            if asks_survive {
                                 self.arm_have(n, actions);
                             }
                         } else {
@@ -557,7 +569,7 @@ impl SimBehavior {
                             .relay
                             .0
                             .held_all()
-                            .difference(&node.router.others_wants());
+                            .difference(&node.router.network_ask());
                         if !full.is_empty() {
                             self.advance(state, n, actions);
                             actions.push(SimNetAction::Node(n, NodeAction::RelayEvict(full)));
