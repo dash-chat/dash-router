@@ -25,12 +25,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use dash_router::panda::{GossipConfig, PandaTransport, spawn_panda};
-use dash_router::{CoreConfig, MemStore, PolicyIntervals, RouterEvent, RouterHandle, spawn};
-use dash_router_core::{Op, OpsMap, RouterConfig, Storage};
-use dash_router_policy::{IntervalPolicy, PushDebouncePolicy};
+use dash_router::{MemStore, RouterEvent, RouterHandle, spawn};
+use dash_router_core::{OpsMap, Storage};
 use p2panda_core::{SigningKey, VerifyingKey};
-use rand::SeedableRng;
 use tokio::sync::{mpsc, watch};
+
+mod common;
+use common::{authored_op, config, intervals};
 
 const N: usize = 50;
 /// Every node must have joined the overlay within this long.
@@ -39,47 +40,6 @@ const JOIN_DEADLINE: Duration = Duration::from_secs(90);
 const REPLICATION_DEADLINE: Duration = Duration::from_secs(180);
 
 type Log = u8;
-
-fn config() -> CoreConfig {
-    CoreConfig {
-        router: RouterConfig {
-            want_ttl: Duration::from_secs(2).into(),
-            have_ttl: Duration::from_secs(2).into(),
-        },
-        relay_cap: 1 << 20,
-        evict_at: 0.75,
-        debounce: PushDebouncePolicy {
-            window_ms: 50,
-            max_latency_ms: 200,
-        },
-        max_wire_bytes: None,
-    }
-}
-
-fn intervals(seed: u64) -> PolicyIntervals {
-    PolicyIntervals {
-        want: IntervalPolicy::Fixed {
-            min_ms: 500.0,
-            max_ms: 1500.0,
-        },
-        have: IntervalPolicy::Fixed {
-            min_ms: 50.0,
-            max_ms: 250.0,
-        },
-        n: N,
-        rng: rand::rngs::StdRng::seed_from_u64(seed),
-    }
-}
-
-/// The op node `i` authors on log `i`: a header that names the author and
-/// a small payload, so a Have bundling all N logs stays well under
-/// p2panda's 4 KiB max gossip message size.
-fn authored_op(i: usize) -> Op {
-    Op {
-        header: vec![i as u8],
-        payload: Some(vec![i as u8; 8]),
-    }
-}
 
 struct Node {
     key: VerifyingKey,
@@ -106,7 +66,7 @@ async fn spawn_node(i: usize) -> Node {
         ext.clone(),
         OpsMap::default(),
         transport,
-        intervals(i as u64),
+        intervals(i as u64, N),
     );
     Node {
         key,

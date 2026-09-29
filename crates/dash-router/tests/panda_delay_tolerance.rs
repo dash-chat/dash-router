@@ -34,15 +34,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dash_router::panda::{GossipConfig, PandaTransport, spawn_panda};
-use dash_router::{CoreConfig, MemStore, PolicyIntervals, RouterEvent, RouterHandle, spawn};
+use dash_router::{MemStore, RouterEvent, RouterHandle, spawn};
 use dash_router_core::{
-    EvictableStorage, LogRanges, Op, OpsMap, Pair, Ranges, RouterConfig, Seq, Storage, Units,
+    EvictableStorage, LogRanges, Op, OpsMap, Pair, Ranges, Seq, Storage, Units,
 };
-use dash_router_policy::{IntervalPolicy, PushDebouncePolicy};
 use p2panda_core::{SigningKey, VerifyingKey};
-use rand::SeedableRng;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+
+mod common;
+// Only ever two nodes on the LAN at once, so the interval policy scales
+// for an overlay of 2, not of N.
+use common::{authored_op, config, intervals};
 
 const N: usize = 6;
 const A: usize = 0;
@@ -56,46 +59,6 @@ type Log = Pair;
 
 const A_LOG: Log = Pair::new(CHANNEL, A as u8);
 const Z_LOG: Log = Pair::new(CHANNEL, Z as u8);
-
-fn config() -> CoreConfig {
-    CoreConfig {
-        router: RouterConfig {
-            want_ttl: Duration::from_secs(2).into(),
-            have_ttl: Duration::from_secs(2).into(),
-        },
-        relay_cap: 1 << 20,
-        evict_at: 0.75,
-        debounce: PushDebouncePolicy {
-            window_ms: 50,
-            max_latency_ms: 200,
-        },
-        max_wire_bytes: None,
-    }
-}
-
-fn intervals(seed: u64) -> PolicyIntervals {
-    PolicyIntervals {
-        want: IntervalPolicy::Fixed {
-            min_ms: 500.0,
-            max_ms: 1500.0,
-        },
-        have: IntervalPolicy::Fixed {
-            min_ms: 50.0,
-            max_ms: 250.0,
-        },
-        // Only ever two nodes on the LAN at once.
-        n: 2,
-        rng: rand::rngs::StdRng::seed_from_u64(seed),
-    }
-}
-
-/// The op node `i` authors: a header naming the author and a small payload.
-fn authored_op(i: usize) -> Op {
-    Op {
-        header: vec![i as u8],
-        payload: Some(vec![i as u8; 8]),
-    }
-}
 
 /// A relay store that survives its shell: `spawn` takes the relay store by
 /// value and moves it into the node task, so to re-spawn a node with the
@@ -209,7 +172,7 @@ impl Node {
             self.ext.clone(),
             self.relay.clone(),
             transport,
-            intervals(i as u64),
+            intervals(i as u64, 2),
         );
         self.live = Some(Live {
             handle,
