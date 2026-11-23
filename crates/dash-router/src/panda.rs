@@ -90,6 +90,7 @@ fn topic() -> Topic {
 pub struct PandaTransport {
     handle: GossipHandle,
     subscription: GossipSubscription,
+    max_message_size: usize,
     /// The node's current direct gossip neighbours on our topic, folded
     /// from p2panda's membership events by a small tracker task. This is
     /// the set a `broadcast` actually hands bytes to; everyone else hears
@@ -146,6 +147,7 @@ pub async fn spawn_panda(
         .await
         .context("spawning p2panda discovery")?;
 
+    let max_message_size = gossip.max_message_size;
     let gossip = Gossip::builder(address_book.clone(), endpoint.clone())
         .config(gossip)
         .spawn()
@@ -171,6 +173,7 @@ pub async fn spawn_panda(
         PandaTransport {
             handle,
             subscription,
+            max_message_size,
             neighbours,
             _address_book: address_book,
             _endpoint: endpoint,
@@ -240,7 +243,7 @@ impl Transport for PandaTransport {
     }
 
     fn max_message_size(&self) -> Option<usize> {
-        Some(self.handle.max_message_size())
+        Some(self.max_message_size)
     }
 
     async fn recv(&mut self) -> Option<Incoming> {
