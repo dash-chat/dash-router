@@ -3,118 +3,512 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Dash Router demos</title>
+    <title>Dash Router</title>
+    <meta
+      name="description"
+      content="Dash Router carries Dash Chat messages across a local network, hop by hop, when there is no internet."
+    />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Rubik:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
     <style>
       :root {
         color-scheme: light dark;
-        --bg: #ffffff;
-        --fg: #1f2328;
-        --muted: #59636e;
-        --card: #f6f8fa;
-        --border: #d1d9e0;
+        --bg: #fcfcfc;
+        --surface: #fff;
+        --text: #111;
+        --muted: #555;
+        --faint: #888;
+        --border: #e5e7eb;
+        --accent: #6e7bff;
+        --accent-hover: #5662e6;
         --want: #b7791f;
         --have: #1f6fd0;
+        --held: #1a7f37;
       }
       @media (prefers-color-scheme: dark) {
         :root {
-          --bg: #0d1117;
-          --fg: #e6edf3;
-          --muted: #9198a1;
-          --card: #161b22;
-          --border: #30363d;
+          --bg: #0b0c0f;
+          --surface: #111318;
+          --text: #e5e7eb;
+          --muted: #94a3b8;
+          --faint: #64748b;
+          --border: #1e293b;
+          --accent: #8c97ff;
+          --accent-hover: #b0b8ff;
           --want: #e6a23c;
           --have: #3c8fe6;
+          --held: #3fb950;
         }
       }
-      body {
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
         margin: 0;
+        padding: 0;
+      }
+      html {
+        scroll-behavior: smooth;
+      }
+      body {
+        font-family: 'Rubik', system-ui, sans-serif;
         background: var(--bg);
-        color: var(--fg);
-        font: 16px/1.5 system-ui, sans-serif;
+        color: var(--text);
+        line-height: 1.62;
+        -webkit-font-smoothing: antialiased;
       }
-      main {
-        max-width: 720px;
+      a {
+        color: var(--accent);
+        text-decoration: none;
+        font-weight: 500;
+      }
+      a:hover {
+        color: var(--accent-hover);
+        text-decoration: underline;
+      }
+      nav {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        background: var(--bg);
+        border-bottom: 1px solid var(--border);
+      }
+      .nav-inner {
+        max-width: 1000px;
         margin: 0 auto;
-        padding: 48px 16px;
+        padding: 0 24px;
+        min-height: 60px;
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 4px 22px;
       }
-      h1 {
-        margin: 0 0 8px;
-        font-size: 28px;
+      .nav-brand {
+        font-weight: 600;
+        color: var(--text);
       }
-      p {
-        margin: 0 0 16px;
+      .nav-links {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px 22px;
+        font-size: 0.92rem;
+      }
+      .nav-links a {
         color: var(--muted);
       }
-      ol {
+      .nav-links a:hover {
+        color: var(--text);
+        text-decoration: none;
+      }
+      .container {
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 0 24px;
+      }
+      header {
+        padding: 72px 0 24px;
+        text-align: center;
+      }
+      h1 {
+        font-size: clamp(2.2rem, 5.5vw, 3.2rem);
+        font-weight: 700;
+        line-height: 1.1;
+        margin-bottom: 16px;
+      }
+      .subtitle {
+        font-size: clamp(1.1rem, 2.5vw, 1.3rem);
+        color: var(--muted);
+        max-width: 560px;
+        margin: 0 auto 36px;
+        line-height: 1.5;
+      }
+      figure img {
+        display: block;
+        width: 100%;
+        height: auto;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+      }
+      video {
+        display: block;
+        width: 100%;
+        height: auto;
+        max-height: 80vh;
+        background: #000;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+      }
+      figcaption {
+        margin-top: 12px;
+        color: var(--faint);
+        font-size: 0.92rem;
+      }
+      section {
+        scroll-margin-top: 60px;
+        padding: 40px 0;
+      }
+      h2 {
+        font-size: clamp(1.5rem, 3vw, 1.9rem);
+        font-weight: 700;
+        line-height: 1.2;
+        margin-bottom: 20px;
+      }
+      h3 {
+        font-size: 1.1rem;
+        font-weight: 600;
+        margin: 28px 0 8px;
+      }
+      section p,
+      section li {
+        color: var(--muted);
+        font-size: 1.05rem;
+      }
+      section p {
+        margin-bottom: 16px;
+      }
+      section p:last-child {
+        margin-bottom: 0;
+      }
+      strong {
+        color: var(--text);
+        font-weight: 600;
+      }
+      .messages {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 12px;
+        margin: 20px 0 28px;
+      }
+      .message {
+        padding: 16px 18px;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-block-start: 3px solid;
+        border-radius: 8px;
+      }
+      .message.want {
+        border-block-start-color: var(--want);
+      }
+      .message.have {
+        border-block-start-color: var(--have);
+      }
+      .message b {
+        display: block;
+        font-size: 1.1rem;
+        margin-bottom: 4px;
+      }
+      .message span {
+        color: var(--muted);
+        font-size: 0.98rem;
+      }
+      .callout {
+        margin: 24px 0 0;
+        padding: 18px 20px;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-inline-start: 3px solid var(--accent);
+        border-radius: 8px;
+      }
+      .callout b {
+        display: block;
+        color: var(--text);
+        font-size: 1.1rem;
+        font-weight: 600;
+        margin-bottom: 6px;
+      }
+      .callout span {
+        color: var(--muted);
+      }
+      ol.steps {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        padding-inline-start: 22px;
+      }
+      ol.demos {
         display: flex;
         flex-direction: column;
         gap: 12px;
-        margin: 32px 0;
-        padding: 0;
+        margin: 24px 0 32px;
         list-style: none;
       }
       a.demo {
         display: block;
-        padding: 16px;
+        padding: 18px;
+        background: var(--surface);
         border: 1px solid var(--border);
         border-radius: 8px;
-        background: var(--card);
         color: inherit;
-        text-decoration: none;
+        font-weight: 400;
       }
       a.demo:hover {
-        border-color: var(--have);
+        border-color: var(--accent);
+        text-decoration: none;
       }
-      a.demo strong {
+      a.demo b {
         display: block;
-        font-size: 18px;
+        color: var(--text);
+        font-size: 1.1rem;
+        font-weight: 600;
       }
       a.demo span {
         color: var(--muted);
       }
-      .want {
+      ul.legend {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        list-style: none;
+      }
+      ul.legend li {
+        font-size: 0.98rem;
+      }
+      .want-text {
         color: var(--want);
         font-weight: 600;
       }
-      .have {
+      .have-text {
         color: var(--have);
         font-weight: 600;
+      }
+      .held-text {
+        color: var(--held);
+        font-weight: 600;
+      }
+      footer {
+        padding: 28px 0 40px;
+        color: var(--faint);
+        font-size: 0.9rem;
       }
     </style>
   </head>
   <body>
+    <nav>
+      <div class="nav-inner">
+        <a class="nav-brand" href="#top">Dash Router</a>
+        <div class="nav-links">
+          <a href="#why">Why</a>
+          <a href="#try">Try it</a>
+          <a href="#protocol">How it works</a>
+          <a href="#simulations">Simulations</a>
+          <a href="https://github.com/dash-chat/dash-router">GitHub</a>
+        </div>
+      </div>
+    </nav>
+
+
+    <header id="top">
+      <div class="container">
+        <h1>Dash Router</h1>
+        <p class="subtitle">
+          Nearby devices store and forward each other's messages until they reach their recipients.
+        </p>
+        <figure>
+          <img
+            src="mesh.gif"
+            width="1920"
+            height="1080"
+            alt="Alice's encrypted message is passed between nearby phones until it reaches Bob's phone, then a delivery receipt travels back the same way"
+          />
+          <figcaption>Alice's message gets to Bob through the phones in between, and his receipt comes back the same way.</figcaption>
+        </figure>
+      </div>
+    </header>
+
     <main>
-      <h1>Dash Router demos</h1>
-      <p>
-        Recorded simulations of Dash Router spreading messages across a network. Press play, or
-        step with the arrows.
-      </p>
-      <ol>
-        <li>
-          <a class="demo" href="viewer/?recording=../recordings/line-5.json">
-            <strong>1. A line of five</strong>
-            <span>One writer at the end of a line, no loss. A Want travels out, the Have comes back.</span>
-          </a>
-        </li>
-        <li>
-          <a class="demo" href="viewer/?recording=../recordings/lan-20.json">
-            <strong>2. A small LAN</strong>
-            <span>Twenty nodes, four writers, 2% loss. Many timers at once, Wants suppressing each other.</span>
-          </a>
-        </li>
-        <li>
-          <a class="demo" href="viewer/?recording=../recordings/mesh-50-lossy.json">
-            <strong>3. A lossy mesh</strong>
-            <span>Fifty nodes, six writers, 15% of messages lost. Repair traffic keeps everyone in sync.</span>
-          </a>
-        </li>
-      </ol>
-      <p>
-        Each node carries small pie timers: <span class="want">amber</span> counts down to its next
-        Want (asking for what it is missing), <span class="have">blue</span> to its next Have
-        (answering with what it holds). Edges light up in the same colours while those messages
-        are in flight.
-      </p>
+      <section id="why">
+        <div class="container">
+          <h2>Why Dash Router</h2>
+          <p>
+            When the internet is not available, we need a way to send messages through a mesh of
+            phones until they reach their recipients.
+          </p>
+          <p>
+            Dash Router is our prototype of that. So far we've built its first routing protocol. It only works on a LAN, with the phones
+            connected to each other. In the future we'd like to add more protocols and transports.
+          </p>
+          <p>
+            It's integrated in <a href="https://dashchat.org">Dash Chat</a>, a messenger that works
+            without internet and is built on <a href="https://p2panda.org">p2panda</a>.
+          </p>
+
+          <div class="callout">
+            <b>The phones in between can't read your messages</b>
+            <span>
+              Dash Chat uses p2panda to encrypt messages with
+              <a href="https://github.com/p2panda/p2panda/tree/main/p2panda-spaces">p2panda spaces</a>
+              before they leave your phone. A phone passing one along only ever holds encrypted
+              data.
+            </span>
+          </div>
+        </div>
+      </section>
+
+
+
+
+
+
+      <section id="try">
+        <div class="container">
+          <h2>See it in Dash Chat</h2>
+          <figure>
+            <video
+              controls
+              playsinline
+              preload="metadata"
+              src="https://dashchat.org/demo/dash-router/dash-router-demo.mp4"
+            ></video>
+            <figcaption>Recorded in Dash Chat, September 2026. 1 min 42 s.</figcaption>
+          </figure>
+
+          <h3>Try it yourself</h3>
+          <p>
+            Dash Router is in Dash Chat from version 0.23.1, but it's experimental and off by
+            default. You need at least two devices on the same Wi-Fi or hotspot. On each one:
+          </p>
+          <ol class="steps">
+            <li>Install Dash Chat from the <a href="https://dashchat.org/download">download page</a>.</li>
+            <li>
+              Go to <strong>Settings › Help</strong> and tap <strong>Version</strong> seven times.
+              A "Developer mode enabled" message shows up.
+            </li>
+            <li>
+              Back in Settings there is now a <strong>Developer options</strong> entry. Open it
+              and turn on <strong>Enable Dash Router</strong>.
+            </li>
+          </ol>
+        </div>
+      </section>
+
+      <section id="protocol">
+        <div class="container">
+          <h2>How it works right now</h2>
+          <p>
+            Conversations are append-only logs, one per author, so a device can describe everything
+            it has for a conversation as a few ranges of sequence numbers. The protocol's two
+            messages are built on that:
+          </p>
+
+          <div class="messages">
+            <div class="message want">
+              <b class="want-text">Want</b>
+              <span>A list of what the sender already has. Anyone who has more is being asked to send it. A Want doesn't say who it came from.</span>
+            </div>
+            <div class="message have">
+              <b class="have-text">Have</b>
+              <span>Actual messages, sent because somebody's Want showed they were missing.</span>
+            </div>
+          </div>
+
+          <p>
+            Relaying is deliberately dumb. A device that receives a Want or a Have forwards it to
+            everyone else straight away, so every one of them ends up crossing the whole network.
+            What keeps that from getting out of hand is being careful about when a device starts
+            one.
+          </p>
+          <ol class="steps">
+            <li>
+              <strong>You send a message.</strong> Your phone waits a moment and then sends it out
+              as a Have. Most of the time that's all it takes.
+            </li>
+            <li>
+              <strong>Devices ask for what they missed.</strong> Messages get lost, and phones
+              join late. So every device also sends a Want now and then, on a random timer, saying
+              what it has so far. Before it does, it looks at the Wants it has heard recently and
+              leaves out anything they already asked for. In practice one device ends up asking on
+              behalf of everybody who is missing the same thing.
+            </li>
+            <li>
+              <strong>Someone who has it answers.</strong> A device that hears a Want and has some
+              of what's missing doesn't reply immediately either. It starts another random timer,
+              and when that runs out it sends whatever is still missing. If someone else's Have
+              covered it in the meantime, it sends less, or nothing.
+            </li>
+            <li>
+              <strong>Old messages make room.</strong> The relay store has a size limit. Once a
+              device hits it, it throws away the oldest message bodies first and keeps their
+              headers, which are small.
+            </li>
+          </ol>
+
+          <h3>Why the timers are random</h3>
+          <p>
+            So that devices don't all answer the same Want at the same moment and fill the network
+            with copies. The one that happens to fire first does the work, and the others see the
+            answer go by and drop it from their own.
+          </p>
+          <p>
+            How long the timers should be depends on how many devices are around and how many
+            messages get lost. We're still tuning that, and it's what the simulations below are
+            for.
+            <a href="https://github.com/dash-chat/dash-router/blob/main/DESIGN.md">DESIGN.md</a>
+            has the full protocol.
+          </p>
+        </div>
+      </section>
+
+      <section id="simulations">
+        <div class="container">
+          <h2>Simulations</h2>
+          <p>
+            These are recordings of the protocol running in a simulator, in order of difficulty.
+            Hit play or step through with the arrow buttons. Clicking a node shows its state.
+          </p>
+
+          <ol class="demos">
+            <li>
+              <a class="demo" href="viewer/?recording=../recordings/line-5.json">
+                <b>1. A line of five</b>
+                <span>Five devices in a row, one of them writing, nothing lost. Good for following a single message from one end to the other.</span>
+              </a>
+            </li>
+            <li>
+              <a class="demo" href="viewer/?recording=../recordings/lan-20.json">
+                <b>2. A small network</b>
+                <span>Twenty devices, four of them writing, 2% of messages lost.</span>
+              </a>
+            </li>
+            <li>
+              <a class="demo" href="viewer/?recording=../recordings/mesh-50-lossy.json">
+                <b>3. A lossy mesh</b>
+                <span>Fifty devices, six of them writing, and 15% of messages lost on the way.</span>
+              </a>
+            </li>
+          </ol>
+
+          <h3>What you're looking at</h3>
+          <ul class="legend">
+            <li>
+              Circles are devices. A device gets greener the more of the written messages it has,
+              and its border flashes bright green when it writes one.
+            </li>
+            <li>
+              Each device has up to three small pies around it. The
+              <span class="want-text">amber</span> one is the countdown to its next Want. The
+              <span class="have-text">blue</span> one is the countdown to its next Have, and is
+              only there while the device has something to answer. The
+              <span class="held-text">green</span> one shows how much of everything written so far
+              it holds.
+            </li>
+            <li>
+              A link turns <span class="want-text">amber</span> while a Want is crossing it and
+              <span class="have-text">blue</span> when a Have is.
+            </li>
+          </ul>
+        </div>
+      </section>
     </main>
+
+    <footer>
+      <div class="container">
+        Dash Router is a collaboration project between
+        <a href="https://dashchat.org">Dash Chat</a> and <a href="https://p2panda.org">p2panda</a> ·
+        <a href="https://github.com/dash-chat/dash-router">Source on GitHub</a>
+      </div>
+    </footer>
   </body>
 </html>
