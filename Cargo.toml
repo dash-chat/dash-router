@@ -9,7 +9,7 @@ edition = "2024"
 [workspace.dependencies]
 polestar = { git = "https://github.com/maackle/polestar-rs.git", branch = "main" }
 polestar-sim = { git = "https://github.com/maackle/polestar-rs.git", branch = "main" }
-simviz = { git = "ssh://git@github.com/dash-chat/simdash.git", branch = "simviz" }
+simviz = { git = "https://github.com/dash-chat/simdash.git", branch = "simviz" }
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = "1"
@@ -27,8 +27,8 @@ postcard = { version = "1", features = ["use-std"] }
 # polestar = { path = "/home/michael/proj/polestar-rs/polestar" }
 # polestar-sim = { path = "/home/michael/proj/polestar-rs/polestar-sim" }
 
-[patch."ssh://git@github.com/dash-chat/simdash.git"]
-simviz = { path = "/home/michael/work/simdash/crates/simviz" }
+# [patch."https://github.com/dash-chat/simdash.git"]
+# simviz = { path = "/home/michael/work/simdash/crates/simviz" }
 
 # [patch.crates-io]
 # p2panda-core = { path = "/home/michael/work/p2panda/p2panda-core" }

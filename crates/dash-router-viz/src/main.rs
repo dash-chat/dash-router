@@ -33,12 +33,22 @@ struct Cli {
     /// Where to write the recording
     #[arg(long, default_value = "recording.json")]
     out: PathBuf,
+
+    /// Instead of serving, write the viewer frontend to this directory and exit
+    #[arg(long, value_name = "DIR")]
+    export_ui: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
+
+    if let Some(dir) = &cli.export_ui {
+        simviz::export_ui(dir)?;
+        println!("wrote the viewer frontend to {}", dir.display());
+        return Ok(());
+    }
 
     let config = Config::from_yaml(&std::fs::read_to_string(&cli.config)?)
         .with_context(|| format!("reading {}", cli.config.display()))?;
