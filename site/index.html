@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Dash Router demos</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #ffffff;
+        --fg: #1f2328;
+        --muted: #59636e;
+        --card: #f6f8fa;
+        --border: #d1d9e0;
+        --want: #b7791f;
+        --have: #1f6fd0;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0d1117;
+          --fg: #e6edf3;
+          --muted: #9198a1;
+          --card: #161b22;
+          --border: #30363d;
+          --want: #e6a23c;
+          --have: #3c8fe6;
+        }
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font: 16px/1.5 system-ui, sans-serif;
+      }
+      main {
+        max-width: 720px;
+        margin: 0 auto;
+        padding: 48px 16px;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 28px;
+      }
+      p {
+        margin: 0 0 16px;
+        color: var(--muted);
+      }
+      ol {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        margin: 32px 0;
+        padding: 0;
+        list-style: none;
+      }
+      a.demo {
+        display: block;
+        padding: 16px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--card);
+        color: inherit;
+        text-decoration: none;
+      }
+      a.demo:hover {
+        border-color: var(--have);
+      }
+      a.demo strong {
+        display: block;
+        font-size: 18px;
+      }
+      a.demo span {
+        color: var(--muted);
+      }
+      .want {
+        color: var(--want);
+        font-weight: 600;
+      }
+      .have {
+        color: var(--have);
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Dash Router demos</h1>
+      <p>
+        Recorded simulations of Dash Router spreading messages across a network. Press play, or
+        step with the arrows.
+      </p>
+      <ol>
+        <li>
+          <a class="demo" href="viewer/?recording=../recordings/line-5.json">
+            <strong>1. A line of five</strong>
+            <span>One writer at the end of a line, no loss. A Want travels out, the Have comes back.</span>
+          </a>
+        </li>
+        <li>
+          <a class="demo" href="viewer/?recording=../recordings/lan-20.json">
+            <strong>2. A small LAN</strong>
+            <span>Twenty nodes, four writers, 2% loss. Many timers at once, Wants suppressing each other.</span>
+          </a>
+        </li>
+        <li>
+          <a class="demo" href="viewer/?recording=../recordings/mesh-50-lossy.json">
+            <strong>3. A lossy mesh</strong>
+            <span>Fifty nodes, six writers, 15% of messages lost. Repair traffic keeps everyone in sync.</span>
+          </a>
+        </li>
+      </ol>
+      <p>
+        Each node carries small pie timers: <span class="want">amber</span> counts down to its next
+        Want (asking for what it is missing), <span class="have">blue</span> to its next Have
+        (answering with what it holds). Edges light up in the same colours while those messages
+        are in flight.
+      </p>
+    </main>
+  </body>
+</html>
