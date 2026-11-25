@@ -390,7 +390,7 @@
           <h3>Try it yourself</h3>
           <p>
             Dash Router is in Dash Chat from version 0.23.1, but it's experimental and off by
-            default. You need at least two devices on the same Wi-Fi or hotspot. On each one:
+            default. You need at least three devices on the same Wi-Fi or hotspot. On each one:
           </p>
           <ol class="steps">
             <li>Install Dash Chat from the <a href="https://dashchat.org/download">download page</a>.</li>
@@ -403,6 +403,13 @@
               and turn on <strong>Enable Dash Router</strong>.
             </li>
           </ol>
+
+          <p>
+            You need at least <em>three</em> devices to really see Dash Router in action, because Dash Chat
+            already makes it easy for any two devices to connect peer-to-peer. Dash Router is only useful when
+            there are two devices that can't connect directly (e.g. because they're not connected to the network at the same time)
+            and need one or more intermediaries to relay messages between them.
+          </p>
         </div>
       </section>
 
@@ -418,7 +425,7 @@
           <div class="messages">
             <div class="message want">
               <b class="want-text">Want</b>
-              <span>A list of what the sender already has. Anyone who has more is being asked to send it. A Want doesn't say who it came from.</span>
+              <span>A list of what the sender already has. Anyone who has more is being asked to send the difference. A Want doesn't say who it came from.</span>
             </div>
             <div class="message have">
               <b class="have-text">Have</b>
@@ -429,8 +436,8 @@
           <p>
             Relaying is deliberately dumb. A device that receives a Want or a Have forwards it to
             everyone else straight away, so every one of them ends up crossing the whole network.
-            What keeps that from getting out of hand is being careful about when a device starts
-            one.
+            What keeps that from getting out of hand is being careful about when a device decides
+            to create a new Want or Have.
           </p>
           <ol class="steps">
             <li>
@@ -439,10 +446,11 @@
             </li>
             <li>
               <strong>Devices ask for what they missed.</strong> Messages get lost, and phones
-              join late. So every device also sends a Want now and then, on a random timer, saying
+              join and leave the network over time. So every device also sends a Want now and then, on a random timer, saying
               what it has so far. Before it does, it looks at the Wants it has heard recently and
-              leaves out anything they already asked for. In practice one device ends up asking on
-              behalf of everybody who is missing the same thing.
+              leaves out anything that's already been asked for by others.
+              If everything that a device wants has already been recently asked for by others, it doesn't send a Want at all.
+              In practice, one device ends up asking on behalf of everybody who is missing the same thing.
             </li>
             <li>
               <strong>Someone who has it answers.</strong> A device that hears a Want and has some
@@ -460,7 +468,7 @@
           <h3>Why the timers are random</h3>
           <p>
             So that devices don't all answer the same Want at the same moment and fill the network
-            with copies. The one that happens to fire first does the work, and the others see the
+            with copies. The one that happens to fire first does the work, and most or all of the others see the
             answer go by and drop it from their own.
           </p>
           <p>
