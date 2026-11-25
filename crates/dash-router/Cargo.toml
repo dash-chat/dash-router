@@ -20,8 +20,8 @@ tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 trait-variant = "0.1"
 tracing = "0.1"
 redb = "4.3.0"
-p2panda-core = { git = "https://github.com/dash-chat/p2panda", rev = "8cf91fb9e6a16e4c979081c7e351481bf24df1be", optional = true }
-p2panda-net = { git = "https://github.com/dash-chat/p2panda", rev = "8cf91fb9e6a16e4c979081c7e351481bf24df1be", optional = true }
+p2panda-core = { git = "https://github.com/dash-chat/p2panda", rev = "2adf7a6b154356daadad6fb2309231cb02e9d064", optional = true }
+p2panda-net = { git = "https://github.com/dash-chat/p2panda", rev = "2adf7a6b154356daadad6fb2309231cb02e9d064", optional = true }
 futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
