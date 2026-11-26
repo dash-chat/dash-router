@@ -53,7 +53,7 @@
         scroll-behavior: smooth;
       }
       body {
-        font-family: 'Rubik', system-ui, sans-serif;
+        font-family: "Rubik", system-ui, sans-serif;
         background: var(--bg);
         color: var(--text);
         line-height: 1.62;
@@ -247,6 +247,32 @@
         flex-direction: column;
         gap: 14px;
         padding-inline-start: 22px;
+        margin-bottom: 24px;
+      }
+      hr.divider {
+        border: 0;
+        border-top: 1px solid var(--border);
+        margin: 36px 0 28px;
+      }
+      .rules {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        margin-bottom: 16px;
+        padding-inline-start: 22px;
+      }
+      .rules ol,
+      .rules ul {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-top: 8px;
+        padding-inline-start: 22px;
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.9em;
+        color: var(--text);
       }
       ol.demos {
         display: flex;
@@ -294,9 +320,38 @@
         color: var(--have);
         font-weight: 600;
       }
+      .lost-text {
+        color: #f85149;
+        font-weight: 600;
+      }
       .held-text {
         color: var(--held);
         font-weight: 600;
+      }
+      .funders {
+        display: flex;
+        flex: none;
+        align-items: center;
+        gap: 20px;
+      }
+      .footer-row > div:first-child {
+        flex: 1 1 220px;
+      }
+      .footer-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px 32px;
+      }
+      .funders img {
+        display: block;
+        height: 44px;
+        width: auto;
+        border-radius: 6px;
+      }
+      .funders img.on-white {
+        background: #fff;
       }
       footer {
         padding: 28px 0 40px;
@@ -315,18 +370,33 @@
           <a href="#protocol">How it works</a>
           <a href="#simulations">Simulations</a>
         </div>
-        <a class="gh-link" href="https://github.com/dash-chat/dash-router" title="GitHub" aria-label="GitHub">
-          <svg width="22" height="22" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        <a
+          class="gh-link"
+          href="https://github.com/dash-chat/dash-router"
+          title="GitHub"
+          aria-label="GitHub"
+        >
+          <svg
+            width="22"
+            height="22"
+            viewBox="0 0 16 16"
+            fill="currentColor"
+            aria-hidden="true"
+          >
+            <path
+              d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"
+            />
+          </svg>
         </a>
       </div>
     </nav>
-
 
     <header id="top">
       <div class="container">
         <h1>Dash Router</h1>
         <p class="subtitle">
-          Nearby devices store and forward each other's messages until they reach their recipients.
+          Nearby devices store and forward each other's messages until they
+          reach their recipients.
         </p>
         <figure>
           <img
@@ -335,7 +405,10 @@
             height="1080"
             alt="Alice's encrypted message is passed between nearby phones until it reaches Bob's phone, then a delivery receipt travels back the same way"
           />
-          <figcaption>Alice's message gets to Bob through the phones in between, and his receipt comes back the same way.</figcaption>
+          <figcaption>
+            Alice's message gets to Bob through the phones in between, and his
+            receipt comes back the same way.
+          </figcaption>
         </figure>
       </div>
     </header>
@@ -345,34 +418,35 @@
         <div class="container">
           <h2>Why Dash Router</h2>
           <p>
-            When the internet is not available, we need a way to send messages through a mesh of
-            phones until they reach their recipients.
+            When the internet is not available, we need a way to send messages
+            through a mesh of phones until they reach their recipients.
           </p>
           <p>
-            Dash Router is our prototype of that. So far we've built its first routing protocol. It only works on a LAN, with the phones
-            connected to each other. In the future we'd like to add more protocols and transports.
+            Dash Router is our prototype of that. So far we've built its first
+            routing protocol. It only works on a LAN, with the phones connected
+            to each other. In the future we'd like to add more protocols and
+            transports.
           </p>
           <p>
-            It's integrated in <a href="https://dashchat.org">Dash Chat</a>, a messenger that works
-            without internet and is built on <a href="https://p2panda.org">p2panda</a>.
+            It's integrated in <a href="https://dashchat.org">Dash Chat</a>, a
+            messenger that works without internet, and is built on
+            <a href="https://p2panda.org">p2panda</a>.
           </p>
 
           <div class="callout">
             <b>The phones in between can't read your messages</b>
             <span>
               Dash Chat uses p2panda to encrypt messages with
-              <a href="https://github.com/p2panda/p2panda/tree/main/p2panda-spaces">p2panda spaces</a>
-              before they leave your phone. A phone passing one along only ever holds encrypted
-              data.
+              <a
+                href="https://github.com/p2panda/p2panda/tree/main/p2panda-spaces"
+                >p2panda spaces</a
+              >
+              before they leave your phone. A phone passing one along only ever
+              holds encrypted data.
             </span>
           </div>
         </div>
       </section>
-
-
-
-
-
 
       <section id="try">
         <div class="container">
@@ -384,31 +458,41 @@
               preload="metadata"
               src="https://dashchat.org/demo/dash-router/dash-router-demo.mp4"
             ></video>
-            <figcaption>Bob carries messages from Alice to Carol in Dash Chat.</figcaption>
+            <figcaption>
+              Bob carries messages from Alice to Carol in Dash Chat.
+            </figcaption>
           </figure>
 
           <h3>Try it yourself</h3>
           <p>
-            Dash Router is in Dash Chat from version 0.23.1, but it's experimental and off by
-            default. You need at least three devices on the same Wi-Fi or hotspot. On each one:
+            Dash Router is in Dash Chat from version 0.23.1, but it's
+            experimental and off by default. You need at least three devices on
+            the same Wi-Fi or hotspot. On each one:
           </p>
           <ol class="steps">
-            <li>Install Dash Chat from the <a href="https://dashchat.org/download">download page</a>.</li>
             <li>
-              Go to <strong>Settings › Help</strong> and tap <strong>Version</strong> seven times.
-              A "Developer mode enabled" message shows up.
+              Install Dash Chat from
+              <a href="https://dashchat.org/download">dashchat.org/download</a>.
             </li>
             <li>
-              Back in Settings there is now a <strong>Developer options</strong> entry. Open it
-              and turn on <strong>Enable Dash Router</strong>.
+              Go to <strong>Settings › Help</strong> and tap
+              <strong>Version</strong> seven times. A "Developer mode enabled"
+              message shows up.
+            </li>
+            <li>
+              Back in Settings there is now a
+              <strong>Developer options</strong> entry. Open it and turn on
+              <strong>Enable Dash Router</strong>.
             </li>
           </ol>
 
           <p>
-            You need at least <em>three</em> devices to really see Dash Router in action, because Dash Chat
-            already makes it easy for any two devices to connect peer-to-peer. Dash Router is only useful when
-            there are two devices that can't connect directly (e.g. because they're not connected to the network at the same time)
-            and need one or more intermediaries to relay messages between them.
+            You need at least <em>three</em> devices to really see Dash Router
+            in action, because Dash Chat already makes it easy for any two
+            devices to connect peer-to-peer. Dash Router is only useful when
+            there are two devices that can't connect directly (e.g. because
+            they're not connected to the network at the same time) and need one
+            or more intermediaries to relay messages between them.
           </p>
         </div>
       </section>
@@ -417,65 +501,146 @@
         <div class="container">
           <h2>How it works right now</h2>
           <p>
-            Conversations are append-only logs, one per author, so a device can describe everything
-            it has for a conversation as a few ranges of sequence numbers. The protocol's two
-            messages are built on that:
+            Conversations are append-only logs, one per author, so a device can
+            describe everything it has for a conversation as a few ranges of
+            sequence numbers. The protocol's two messages are built on that:
           </p>
 
           <div class="messages">
             <div class="message want">
               <b class="want-text">Want</b>
-              <span>A list of what the sender already has. Anyone who has more is being asked to send the difference. A Want doesn't say who it came from.</span>
+              <span
+                >A list of what the sender already has. Anyone who has more is
+                being asked to send the difference. A Want doesn't say who it
+                came from.</span
+              >
             </div>
             <div class="message have">
               <b class="have-text">Have</b>
-              <span>Actual messages, sent because somebody's Want showed they were missing.</span>
+              <span
+                >Actual messages, sent because somebody's Want showed they were
+                missing.</span
+              >
             </div>
           </div>
 
           <p>
-            Relaying is deliberately dumb. A device that receives a Want or a Have forwards it to
-            everyone else straight away, so every one of them ends up crossing the whole network.
-            What keeps that from getting out of hand is being careful about when a device decides
-            to create a new Want or Have.
+            Every device runs the same few rules. There are three moments when
+            it does something.
           </p>
-          <ol class="steps">
+
+          <h3>When it receives a message</h3>
+          <ul class="rules">
             <li>
-              <strong>You send a message.</strong> Your phone waits a moment and then sends it out
-              as a Have. Most of the time that's all it takes.
+              <strong>A Want.</strong> Two things happen:
+              <ol>
+                <li>
+                  It repeats the Want to everyone straight away, <em>if</em> it
+                  asks for anything that the Wants the device has seen in the
+                  last <code>WANT_TTL</code> don't already ask for. Otherwise
+                  the Want stops here.
+                </li>
+                <li>
+                  If the device holds something the Want is missing, and isn't
+                  already waiting to answer, it starts a timer of random length.
+                  <ul>
+                    <li>
+                      While the timer runs down, the device keeps listening to
+                      every Want and Have that goes by.
+                    </li>
+                    <li>
+                      When the timer runs out, it works out what is still
+                      unanswered: everything the Wants it has seen ask for that
+                      it holds, minus what the Haves it has seen in the last
+                      <code>HAVE_TTL</code> already carried.
+                    </li>
+                    <li>
+                      If anything is left, it sends that as a Have. As long as a
+                      recent Want still asks for something it holds, it starts
+                      the timer again.
+                    </li>
+                  </ul>
+                </li>
+              </ol>
             </li>
             <li>
-              <strong>Devices ask for what they missed.</strong> Messages get lost, and phones
-              join and leave the network over time. So every device also sends a Want now and then, on a random timer, saying
-              what it has so far. Before it does, it looks at the Wants it has heard recently and
-              leaves out anything that's already been asked for by others.
-              If everything that a device wants has already been recently asked for by others, it doesn't send a Want at all.
-              In practice, one device ends up asking on behalf of everybody who is missing the same thing.
+              <strong>A Have.</strong> Three things happen:
+              <ol>
+                <li>
+                  It stores every message it doesn't have yet: with its own
+                  conversations if it takes part in that one, otherwise in its
+                  relay store, as long as there is room.
+                </li>
+                <li>
+                  It repeats to everyone the part of the Have it hasn't already
+                  repeated in the last <code>HAVE_TTL</code>, whether or not
+                  those messages were new to it.
+                </li>
+                <li>
+                  It remembers what the Have carried for <code>HAVE_TTL</code>,
+                  so that its own pending answer can leave that out.
+                </li>
+              </ol>
+            </li>
+          </ul>
+
+          <h3>On a timer that gets a new random length each time</h3>
+          <ol class="rules">
+            <li>
+              It lists every conversation it cares about, with what it already
+              has for each: the ones it takes part in, the ones it holds
+              messages for, and the ones it has recently heard another holder
+              ask about.
             </li>
             <li>
-              <strong>Someone who has it answers.</strong> A device that hears a Want and has some
-              of what's missing doesn't reply immediately either. It starts another random timer,
-              and when that runs out it sends whatever is still missing. If someone else's Have
-              covered it in the meantime, it sends less, or nothing.
+              It removes every entry that the Wants it has seen in the last
+              <code>WANT_TTL</code>, its own included, already cover, meaning
+              they ask for everything that entry would.
             </li>
             <li>
-              <strong>Old messages make room.</strong> The relay store has a size limit. Once a
-              device hits it, it throws away the oldest message bodies first and keeps their
-              headers, which are small.
+              It sends a Want with the entries that are left. If none are left,
+              it sends nothing.
             </li>
           </ol>
 
-          <h3>Why the timers are random</h3>
+          <h3>When you write a message</h3>
           <p>
-            So that devices don't all answer the same Want at the same moment and fill the network
-            with copies. The one that happens to fire first does the work, and most or all of the others see the
-            answer go by and drop it from their own.
+            Your device stores it, waits a moment, and sends it out as a Have.
+            Everyone else treats it like any other Have.
           </p>
           <p>
-            How long the timers should be depends on how many devices are around and how many
-            messages get lost. We're still tuning that, and it's what the simulations below are
-            for.
-            <a href="https://github.com/dash-chat/dash-router/blob/main/DESIGN.md">DESIGN.md</a>
+            The relay store has a size limit. Once a device hits it, it throws
+            away the oldest message bodies first and keeps their headers, which
+            are small.
+          </p>
+
+          <hr class="divider" />
+
+          <p>This protocol enables the network to have these properties:</p>
+          <ul class="rules">
+            <li>
+              <strong>Multi-hop delivery.</strong> Messages get to devices that
+              can't reach each other directly, without anyone knowing the route.
+            </li>
+            <li>
+              <strong>Delay tolerance.</strong> A device that was away, or
+              missed a message, gets it later from whoever still has it.
+            </li>
+            <li>
+              <strong>Congestion control with less network traffic.</strong> A
+              device doesn't send what it has already seen another device ask
+              for or answer, so a request or a reply goes out once, not once per
+              device.
+            </li>
+          </ul>
+          <p>
+            How long the timers should be depends on how many devices are around
+            and how many messages get lost. We're still tuning that, and it's
+            what the simulations below are for.
+            <a
+              href="https://github.com/dash-chat/dash-router/blob/main/DESIGN.md"
+              >DESIGN.md</a
+            >
             has the full protocol.
           </p>
         </div>
@@ -485,48 +650,71 @@
         <div class="container">
           <h2>Simulations</h2>
           <p>
-            These are recordings of the protocol running in a simulator, in order of difficulty.
-            Hit play or step through with the arrow buttons. Clicking a node shows its state.
+            These are recordings of the protocol running in a simulator, in
+            order of difficulty. Hit play or step through with the arrow
+            buttons. Clicking a node shows its state.
           </p>
 
           <ol class="demos">
             <li>
-              <a class="demo" href="viewer/?recording=../recordings/line-5.json">
+              <a
+                class="demo"
+                href="viewer/?recording=../recordings/line-5.json"
+              >
                 <b>1. A line of five</b>
-                <span>Five devices in a row, one of them writing, nothing lost. Good for following a single message from one end to the other.</span>
+                <span
+                  >Five devices in a row, one of them writing, nothing lost.
+                  Good for following a single message from one end to the
+                  other.</span
+                >
               </a>
             </li>
             <li>
-              <a class="demo" href="viewer/?recording=../recordings/lan-20.json">
-                <b>2. A small network</b>
-                <span>Twenty devices, four of them writing, 2% of messages lost.</span>
+              <a
+                class="demo"
+                href="viewer/?recording=../recordings/line-3-lossy.json"
+              >
+                <b>2. A lossy line of three</b>
+                <span
+                  >A small but unreliable network: three devices in a row, with
+                  30% of messages lost on the way. It heals itself when
+                  messages are lost.</span
+                >
               </a>
             </li>
             <li>
-              <a class="demo" href="viewer/?recording=../recordings/mesh-50-lossy.json">
-                <b>3. A lossy mesh</b>
-                <span>Fifty devices, six of them writing, and 15% of messages lost on the way.</span>
+              <a
+                class="demo"
+                href="viewer/?recording=../recordings/lan-20.json"
+              >
+                <b>3. A lossy network</b>
+                <span
+                  >Twenty devices, four of them writing, and 15% of messages
+                  lost on the way.</span
+                >
               </a>
             </li>
           </ol>
 
-          <h3>What you're looking at</h3>
           <ul class="legend">
             <li>
-              Circles are devices. A device gets greener the more of the written messages it has,
-              and its border flashes bright green when it writes one.
+              Circles are devices. A device gets greener the more of the written
+              messages it has, and its border flashes bright green when it
+              writes one.
             </li>
             <li>
               Each device has up to three small pies around it. The
-              <span class="want-text">amber</span> one is the countdown to its next Want. The
-              <span class="have-text">blue</span> one is the countdown to its next Have, and is
-              only there while the device has something to answer. The
-              <span class="held-text">green</span> one shows how much of everything written so far
-              it holds.
+              <span class="want-text">amber</span> one is the countdown to its
+              next Want. The <span class="have-text">blue</span> one is the
+              countdown to its next Have, and is only there while the device has
+              something to answer. The <span class="held-text">green</span> one
+              shows how much of everything written so far it holds.
             </li>
             <li>
-              A link turns <span class="want-text">amber</span> while a Want is crossing it and
-              <span class="have-text">blue</span> when a Have is.
+              A link turns <span class="want-text">amber</span> while a Want is
+              crossing it and <span class="have-text">blue</span> when a Have
+              is. It flashes <span class="lost-text">red</span> when a message
+              is lost on it.
             </li>
           </ul>
         </div>
@@ -534,10 +722,33 @@
     </main>
 
     <footer>
-      <div class="container">
-        Dash Router is a collaboration project between
-        <a href="https://dashchat.org">Dash Chat</a> and <a href="https://p2panda.org">p2panda</a> ·
-        <a href="https://github.com/dash-chat/dash-router">Source on GitHub</a>
+      <div class="container footer-row">
+        <div>
+          Dash Router is a project by
+          <a href="https://dashchat.org">Dash Chat</a> and
+          <a href="https://p2panda.org">p2panda</a>
+        </div>
+        <div class="funders">
+          <a href="https://www.prototypefund.de/"
+            ><img src="logos/prototype-fund.png" alt="Prototype Fund"
+          /></a>
+          <a href="https://www.bmftr.bund.de/"
+            ><img
+              class="on-white"
+              src="logos/bmftr.svg"
+              alt="Bundesministerium für Forschung, Technologie und Raumfahrt"
+          /></a>
+          <a href="https://okfn.de/"
+            ><picture
+              ><source
+                srcset="logos/okf-white.svg"
+                media="(prefers-color-scheme: dark)" />
+              <img
+                src="logos/okf-black.svg"
+                alt="Open Knowledge Foundation Deutschland"
+            /></picture>
+          </a>
+        </div>
       </div>
     </footer>
   </body>
