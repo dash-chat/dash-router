@@ -249,6 +249,33 @@
         padding-inline-start: 22px;
         margin-bottom: 24px;
       }
+      .install {
+        display: flex;
+        align-items: center;
+        gap: 32px;
+        margin-bottom: 24px;
+      }
+      .install ol.steps {
+        flex: 1;
+        margin-bottom: 0;
+      }
+      .download-qr {
+        flex: none;
+        width: 148px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        overflow: hidden;
+        line-height: 0;
+      }
+      @media (max-width: 640px) {
+        .download-qr {
+          display: none;
+        }
+      }
+      .download-qr img {
+        width: 100%;
+        height: auto;
+      }
       hr.divider {
         border: 0;
         border-top: 1px solid var(--border);
@@ -469,22 +496,32 @@
             experimental and off by default. You need at least three devices on
             the same Wi-Fi or hotspot. On each one:
           </p>
-          <ol class="steps">
-            <li>
-              Install Dash Chat from
-              <a href="https://dashchat.org/download">dashchat.org/download</a>.
-            </li>
-            <li>
-              Go to <strong>Settings › Help</strong> and tap
-              <strong>Version</strong> seven times. A "Developer mode enabled"
-              message shows up.
-            </li>
-            <li>
-              Back in Settings there is now a
-              <strong>Developer options</strong> entry. Open it and turn on
-              <strong>Enable Dash Router</strong>.
-            </li>
-          </ol>
+          <div class="install">
+            <ol class="steps">
+              <li>
+                Install Dash Chat from
+                <a href="https://dashchat.org/download">dashchat.org/download</a>.
+              </li>
+              <li>
+                Go to <strong>Settings › Help</strong> and tap
+                <strong>Version</strong> seven times. A "Developer mode enabled"
+                message shows up.
+              </li>
+              <li>
+                Back in Settings there is now a
+                <strong>Developer options</strong> entry. Open it and turn on
+                <strong>Enable Dash Router</strong>.
+              </li>
+            </ol>
+            <a class="download-qr" href="https://dashchat.org/download">
+              <img
+                src="download-qr.svg"
+                alt="QR code for dashchat.org/download"
+                width="148"
+                height="148"
+              />
+            </a>
+          </div>
 
           <p>
             You need at least <em>three</em> devices to really see Dash Router
