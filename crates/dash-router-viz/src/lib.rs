@@ -17,10 +17,10 @@
 //! - a node that authored during the frame gets a bright green border
 //!   (in coarse time the frame merges a quantum's transitions, and every
 //!   author within it is bordered);
-//! - the transition that produced the frame leaves a one-frame trace: a
+//! - the transitions that produced the frame leave a one-frame trace: a
 //!   dropped flight paints its direction of the link red, a receipt paints
-//!   the receiver's border green if it taught something and red if it was
-//!   redundant.
+//!   the receiver's border green if it taught something (a redundant
+//!   receipt paints nothing).
 //!
 //! The sidebar shows network counters, or the selected node's state with
 //! links to the nodes it is talking to. Everything richer (op tracing)
@@ -36,7 +36,10 @@
 //! `Scenario` reset restores only the model state, so a driver kept
 //! outside it (its event queue, RNG, clocks) would replay a different run.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use anyhow::Context;
 use dash_router_core::{EvictableStorage, NodeState as CoreNodeState, Storage, WireBody};
@@ -78,9 +81,9 @@ impl Machine for RunModel {
         if state.0.quantum().is_some() {
             let frame_end = state.0.now();
             // The meter's one-transition trace resets each transition; the
-            // frame keeps every author it merged, so an append mid-quantum
-            // still shows on the frame.
-            let mut authored = std::mem::take(&mut state.1.1.last.authored);
+            // frame keeps the trace of every transition it merged, so a
+            // drop, receipt or append mid-quantum still shows on the frame.
+            let mut frame_trace = std::mem::take(&mut state.1.1.last);
             while state
                 .0
                 .peek_at()
@@ -89,9 +92,9 @@ impl Machine for RunModel {
                 let (next, more) = self.0.transition(state, ())?;
                 state = next;
                 fx.extend(more);
-                authored.extend(state.1.1.last.authored.iter().copied());
+                frame_trace.absorb(std::mem::take(&mut state.1.1.last));
             }
-            state.1.1.last.authored = authored;
+            state.1.1.last = frame_trace;
         }
         Ok((state, fx))
     }
@@ -293,10 +296,10 @@ impl Presenter for RouterPresenter {
             });
         }
 
-        // The transition that made this frame: a drop paints its direction
-        // of the link, a receipt paints the receiver.
-        if let Some(dropped) = &meter.last.dropped {
-            let (a, b) = flight_edge(dropped);
+        // The transitions that made this frame: each drop paints its
+        // direction of the link, each receipt paints its receiver.
+        let dropped_edges: BTreeSet<_> = meter.last.dropped.iter().map(flight_edge).collect();
+        for (a, b) in dropped_edges {
             events.push(VizEvent::EdgeStyle {
                 source: NodeId(a),
                 target: NodeId(b),
@@ -307,11 +310,15 @@ impl Presenter for RouterPresenter {
                 },
             });
         }
-        let receipt_border = meter
+        // A redundant receipt paints nothing: under flooding it is the
+        // normal case, and red is kept for lost messages.
+        let taught_receivers: BTreeSet<SimNodeId> = meter
             .last
             .received
-            .as_ref()
-            .map(|(f, taught)| (f.to, if *taught { TAUGHT_COLOR } else { BAD_COLOR }));
+            .iter()
+            .filter(|(_, taught)| *taught)
+            .map(|(flight, _)| flight.to)
+            .collect();
 
         // Nodes: coverage as fill, authoring (else the last receipt) as
         // border, timers and the held share as moons. A timer's `remaining`
@@ -325,9 +332,9 @@ impl Presenter for RouterPresenter {
             let border_color = if meter.last.authored.contains(id) {
                 Some(AUTHOR_COLOR.to_string())
             } else {
-                receipt_border
-                    .filter(|(to, _)| to == id)
-                    .map(|(_, c)| c.to_string())
+                taught_receivers
+                    .contains(id)
+                    .then(|| TAUGHT_COLOR.to_string())
             };
             let style = NodeStyle {
                 color: coverage_fill(meter, *id),
@@ -807,20 +814,59 @@ scenarios:
         }
     }
 
+    /// A drop that was not the quantum's last event still paints its link.
+    #[test]
+    fn coarse_frames_keep_every_drop() {
+        let (scenario, presenter) = scenario(&config(), Some("coarse"), 0).unwrap();
+        let mut viewer = Viewer::new(Simulation::new(scenario), presenter);
+        let f = step_until(&mut viewer, 100, |_, (_, (_, meter))| {
+            !meter.last.dropped.is_empty()
+        });
+        let (_, (_, meter)) = viewer.simulation().state();
+        for dropped in &meter.last.dropped {
+            let (a, b) = flight_edge(dropped);
+            let red = f.events.iter().any(|e| {
+                matches!(e,
+                VizEvent::EdgeStyle { source, target, style }
+                    if *source == NodeId(a) && *target == NodeId(b)
+                        && style.color.as_deref() == Some(BAD_COLOR))
+            });
+            assert!(
+                red,
+                "dropped flight {a}->{b} is painted in the coarse frame"
+            );
+        }
+    }
+
     #[test]
     fn receipts_and_drops_leave_a_one_frame_trace() {
         let (scenario, presenter) = scenario(&config(), Some("tiny"), 0).unwrap();
         let mut viewer = Viewer::new(Simulation::new(scenario), presenter);
 
+        let bordered_nodes = |f: &simviz::Frame| {
+            f.events
+                .iter()
+                .filter(|e| {
+                    matches!(e, VizEvent::NodeStyle { style, .. } if style.border_color.is_some())
+                })
+                .count()
+        };
+
+        // A redundant receipt leaves no border.
         let f = step_until(&mut viewer, 2000, |_, (_, (_, meter))| {
-            meter.last.received.is_some()
+            matches!(meter.last.received.first(), Some((_, false)))
+                && meter.last.authored.is_empty()
+        });
+        assert_eq!(bordered_nodes(&f), 0);
+
+        let f = step_until(&mut viewer, 2000, |_, (_, (_, meter))| {
+            matches!(meter.last.received.first(), Some((_, true)))
         });
         let (_, (_, meter)) = viewer.simulation().state();
-        let (flight, taught) = meter.last.received.clone().unwrap();
-        let expected = if taught { TAUGHT_COLOR } else { BAD_COLOR };
+        let (flight, _) = meter.last.received[0].clone();
         assert_eq!(
             node_style(&f, flight.to).and_then(|s| s.border_color.as_deref()),
-            Some(expected)
+            Some(TAUGHT_COLOR)
         );
         // Only the receiver carries a border.
         let bordered = f
@@ -833,10 +879,10 @@ scenarios:
         assert_eq!(bordered, 1);
 
         let f = step_until(&mut viewer, 5000, |_, (_, (_, meter))| {
-            meter.last.dropped.is_some()
+            !meter.last.dropped.is_empty()
         });
         let (_, (_, meter)) = viewer.simulation().state();
-        let dropped = meter.last.dropped.clone().unwrap();
+        let dropped = meter.last.dropped[0].clone();
         let (a, b) = flight_edge(&dropped);
         let red = f.events.iter().any(|e| {
             matches!(e,
@@ -848,7 +894,7 @@ scenarios:
         // The trace is gone on the next frame unless it happens again.
         let next = viewer.handle(Command::StepForward).unwrap();
         let (_, (_, meter)) = viewer.simulation().state();
-        if meter.last.dropped.is_none() {
+        if meter.last.dropped.is_empty() {
             assert!(!next.events.iter().any(|e| matches!(e,
                 VizEvent::EdgeStyle { style, .. } if style.color.as_deref() == Some(BAD_COLOR))));
         }

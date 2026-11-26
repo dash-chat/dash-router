@@ -27,12 +27,13 @@ viz-export SCENARIO="lan-20-coarse" STEPS="50" *ARGS:
     @echo "exported: target/viz-export/{{ SCENARIO }}  (try: python3 -m http.server -d target/viz-export/{{ SCENARIO }})"
 
 # build the static demo site into target/viz-site: the demo.yaml scenarios recorded
-# for STEPS steps each, plus the simviz frontend in replay mode. Servable from any path.
+# for STEPS steps each (as scenario:seed pairs), plus the simviz frontend in replay mode.
+# Servable from any path.
 viz-site STEPS="300":
     rm -rf target/viz-site
     mkdir -p target/viz-site/recordings
     cargo run --release -p dash-router-viz -- --export-ui target/viz-site/viewer
-    for scenario in line-5 lan-20 mesh-50-lossy; do cargo run --release -p dash-router-viz -- crates/dash-router-sim/scenarios/demo.yaml --scenario $scenario --record {{ STEPS }} --out target/viz-site/recordings/$scenario.json; done
+    for run in line-5:0 line-3-lossy:26 lan-20:0; do cargo run --release -p dash-router-viz -- crates/dash-router-sim/scenarios/demo.yaml --scenario ${run%:*} --seed ${run#*:} --record {{ STEPS }} --out target/viz-site/recordings/${run%:*}.json; done
     cp -r site/. target/viz-site/
     touch target/viz-site/.nojekyll
     @echo "built: target/viz-site"

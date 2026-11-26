@@ -82,18 +82,25 @@ impl Meter {
 }
 
 /// The one-step view of a transition: what the network did with a flight,
-/// if it touched one.
+/// if it touched one. Each field holds at most one entry per transition;
+/// they are collections so a consumer that merges transitions into one
+/// frame (the viz in coarse time) can accumulate several with
+/// [`Self::absorb`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LastTransition {
-    /// A flight the network lost.
-    pub dropped: Option<SimFlight>,
-    /// A flight that arrived, and whether the receipt taught the receiver
-    /// anything (`false` is what `Metrics::redundant_receives` counts).
-    pub received: Option<(SimFlight, bool)>,
-    /// Nodes that authored an op. At most one per transition; a set so a
-    /// consumer that merges transitions into one frame (the viz in coarse
-    /// time) can accumulate several.
+    pub dropped: Vec<SimFlight>,
+    /// Each arrival, and whether the receipt taught the receiver anything
+    /// (`false` is what `Metrics::redundant_receives` counts).
+    pub received: Vec<(SimFlight, bool)>,
     pub authored: BTreeSet<NodeId>,
+}
+
+impl LastTransition {
+    pub fn absorb(&mut self, later: Self) {
+        self.dropped.extend(later.dropped);
+        self.received.extend(later.received);
+        self.authored.extend(later.authored);
+    }
 }
 
 /// What a metered transition produced: the flights it put in the air (for
@@ -163,7 +170,7 @@ where
                     });
                 } else {
                     metrics.drops += 1;
-                    last.dropped = Some(flight.clone());
+                    last.dropped.push(flight.clone());
                 }
             }
             SimNetAction::Node(n, node_action) => match node_action {
@@ -218,7 +225,7 @@ where
             } else if receipt.is_have {
                 metrics.backfill_receives += 1;
             }
-            last.received = Some((receipt.flight, taught));
+            last.received.push((receipt.flight, taught));
         }
 
         // And what went out.
